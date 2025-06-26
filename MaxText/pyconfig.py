@@ -833,6 +833,8 @@ def set_and_validate_pipeline_config(raw_keys):
       assert raw_keys["num_pipeline_repeats"] >= 1
       assert raw_keys["num_pipeline_microbatches"] >= 1
       return raw_keys
+    else:
+      assert raw_keys["jaxpp_remote"] == False
 
     if raw_keys["pipeline_parallel_layers"] == -1:
       raw_keys["pipeline_parallel_layers"] = raw_keys["num_decoder_layers"]

@@ -27,6 +27,7 @@ import functools
 import os
 import queue
 import sys
+import subprocess
 import time
 
 from absl import app
@@ -445,6 +446,9 @@ def load_schedule(config):
       schedule = jaxpp.Eager1F1B(num_logical_stages)
   elif config.schedule == "interleaved_1f1b":
       schedule = jaxpp.Interleaved1F1B(num_logical_stages, pipeline_parallel_dim)
+  elif config.schedule == "zero_bubble":
+      assert num_logical_stages <= pipeline_parallel_dim
+      schedule = jaxpp.ZeroBubble(num_logical_stages)
   else:
       raise NotImplementedError(f"Unknown schedule {config.schedule}")
   return schedule
@@ -542,40 +546,51 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng, pa
       (loss, aux), raw_grads = compute_grads(data)
     else:
       def microbatched(a):
-        return a[:config.micro_batch_size_to_train_on, :].reshape(
+        shape = (
           state_mesh_shardings.step.mesh.shape["data"],
           config.num_pipeline_microbatches,
           -1,
           config.max_target_length,
         )
+        if shape[0] == 1:
+          shape = shape[1:]
+        return a.reshape(*shape)
       data = jax.tree.map(microbatched, data)
+
       # Perform data parallelism manually through `vmap`
-      vmapped_compute_grads = jax.vmap(compute_grads, spmd_axis_name="data")
+      vmapped_compute_grads = compute_grads
+      if state_mesh_shardings.step.mesh.shape["data"] > 1:
+        vmapped_compute_grads = jax.vmap(compute_grads, spmd_axis_name="data")
+
       loss_aux_sharding = jax.sharding.NamedSharding(state_mesh_shardings.step.mesh, jax.sharding.PartitionSpec())
       param_operation = {'params': jaxpp.Add}
       if nn.fp8_ops.OVERWRITE_WITH_GRADIENT in params:
         param_operation[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = jaxpp.Max
       assert all(k in param_operation for k in params.keys())
-      loop_result = jaxpp.treduce(
+
+      axis = 1 if state_mesh_shardings.step.mesh.shape["data"] > 1 else 0
+      (loss, aux), raw_grads = jaxpp.treduce(
           vmapped_compute_grads,
           data,
-          axis=1,
+          axis=axis,
           schedule=load_schedule(config),
-          operation=(jaxpp.Concat(axis=1), param_operation)
+          operation=(jaxpp.Concat(axis=axis), param_operation)
       )
-      (loss, aux), raw_grads = jax.lax.with_sharding_constraint(
-          loop_result,
-          jax.tree.map_with_path(
-              functools.partial(add_leading_axis, "data"),
-              (loss_aux_sharding, params_shardings)
-          ),
-      )
-      # reduce-scatter gradients across "data"
-      owg = raw_grads.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
-      raw_grads = jax.tree.map(functools.partial(jax.numpy.sum, axis=0), raw_grads)
-      if owg is not None:
-        owg = jax.tree.map(functools.partial(jax.numpy.max, axis=0), owg)
-        raw_grads[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = owg
+
+      if state_mesh_shardings.step.mesh.shape["data"] > 1:
+        (loss, aux), raw_grads = jax.lax.with_sharding_constraint(
+            ((loss, aux), raw_grads),
+            jax.tree.map_with_path(
+                functools.partial(add_leading_axis, "data"),
+                (loss_aux_sharding, params_shardings)
+            ),
+        )
+        # reduce-scatter gradients across "data"
+        owg = raw_grads.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
+        raw_grads = jax.tree.map(functools.partial(jax.numpy.sum, axis=0), raw_grads)
+        if owg is not None:
+          owg = jax.tree.map(functools.partial(jax.numpy.max, axis=0), owg)
+          raw_grads[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = owg
 
   raw_grads = jax.lax.with_sharding_constraint(raw_grads, state_mesh_shardings.params)
   owg = raw_grads.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
@@ -1030,14 +1045,24 @@ def train_loop(config, state=None):
 
   metric_logger = MetricLogger(writer, config)
   input_data_shardings = maxtext_utils.get_input_data_sharding(config, mesh)
+
+  # NOTE: The dict values are unused when use_jaxpp is False.
+  profiling_process_ids = {pid: "" for pid in jax.process_indices()}
+  if config.use_jaxpp:
+    idx = tuple(slice(None) if i == mpmd_mesh.mpmd_axis else 0 for i in range(len(mpmd_mesh.jax_mesh.shape)))
+    first_device_per_mpmd_rank = mpmd_mesh.jax_mesh.devices[idx]
+    profiling_process_ids = {d.process_index: d for d in first_device_per_mpmd_rank}
+
   for step in np.arange(start_step, config.steps):
     if config.profiler != "" and config.jaxpp_remote and step == first_profiling_step:
       assert config.profiler == "xplane"
       mpmd_mesh.start_trace(config.tensorboard_dir.rstrip('/'))
     elif config.profiler != "" and step == first_profiling_step or prof.should_activate_periodic_profile(step):
       optional_postfix = f"step_{step}" if config.profile_periodically_period > 0 else ""
-      optional_postfix = f"proc_{jax.process_index()}_{optional_postfix}"
-      prof.activate(blocking_object=state, optional_postfix=optional_postfix)
+      if config.use_jaxpp and jax.process_index() in profiling_process_ids:
+        optional_postfix = f"mpmd_{mpmd_mesh.my_mpmd_axis_index:02}_gpu_{profiling_process_ids[jax.process_index()].id:06}_{optional_postfix}"
+      optional_postfix = f"proc_{jax.process_index():06}_{optional_postfix}"
+      prof.activate(blocking_object=state, optional_postfix=optional_postfix, profile=jax.process_index() in profiling_process_ids)
 
     with jax.profiler.StepTraceAnnotation("train", step_num=step):
       record_goodput(recorder, config, recorder.record_data_loading_start_time if recorder else None)
@@ -1140,10 +1165,17 @@ def train_loop(config, state=None):
       jax.tree.leaves(state)[-1]._value
       mpmd_mesh.stop_trace(merge_multihost_xplanes=True)
     elif config.profiler != "" and step == last_profiling_step or prof.should_deactivate_periodic_profile(step):
-      prof.deactivate(blocking_object=state)
+      prof.deactivate(blocking_object=state, profile=jax.process_index() in profiling_process_ids)
 
     if step == start_step:
       max_utils.print_mem_stats("After params initialized")
+
+  if config.use_jaxpp and config.profiler != "":
+    command = """find . -wholename '*proc_*_mpmd*/*.xplane.pb' | sort | awk '{line=$0; sub(/.*mpmd_/, "", line); sub(/_.*/, "", line); printf "%d:%s:0 ", line, $0}'"""
+    subprocess.run(
+      [f"merge_multihost_xplanes $({command})"],
+      shell=True, cwd=config.tensorboard_dir, check=True
+    )
 
   if checkpoint_manager is not None:
     if (int(state.step) - 1) % config.checkpoint_period != 0:

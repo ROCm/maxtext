@@ -49,38 +49,25 @@ fi
 
 The container includes several test suites for different models:
 
-1. **Tiny Llama2 Model Tests**:
+1. **Tiny Llama4 Model Tests**:
 ```bash
 docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864 \
   -e CUDA_VISIBLE_DEVICES=0 --rm --workdir /workdir/maxtext maxtext-jaxpp \
-  "nvidia-smi && bash /workdir/maxtext/scripts/multigpu_jaxpp.sh --max_target_length=64 --model=default \
-   --dp=1 --pp=1 --mp=1 --batch_size_per_device=1 --num_pipeline_microbatches=1 \
-   jaxpp_remote=false base_emb_dim=1024 base_num_query_heads=8 base_num_kv_heads=8 base_mlp_dim=11008 \
-   base_num_decoder_layers=1 head_dim=128 vocab_size=32000 enable_dropout=false \
-   logits_via_embedding=false normalization_layer_epsilon=1.0e-5 decoder_block=llama2"
+  "nvidia-smi && CONFIG_FILE=./scripts/llama4_proxy_config.sh bash scripts/test_1gpu_config.sh"
 ```
 
 2. **Tiny Mixtral Model Tests**:
 ```bash
 docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864 \
   -e CUDA_VISIBLE_DEVICES=0 --rm --workdir /workdir/maxtext maxtext-jaxpp \
-  "nvidia-smi && bash /workdir/maxtext/scripts/multigpu_jaxpp.sh --max_target_length=64 --model=default \
-   --dp=1 --pp=1 --mp=1 --batch_size_per_device=1 --num_pipeline_microbatches=1 \
-   jaxpp_remote=false base_emb_dim=1024 base_num_query_heads=2 base_num_kv_heads=2 base_mlp_dim=896 \
-   base_num_decoder_layers=2 head_dim=16 vocab_size=32000 enable_dropout=false \
-   logits_via_embedding=false normalization_layer_epsilon=1.0e-5 num_experts=8 \
-   num_experts_per_tok=2 decoder_block=mistral"
+  "nvidia-smi && MODEL_CONFIG='model_name=mixtral-8x7b override_model_config=True base_num_decoder_layers=2 base_emb_dim=512 base_mlp_dim=1792' bash scripts/test_1gpu_config.sh"
 ```
 
 3. **Tiny Mistral Model Tests**:
 ```bash
 docker run --gpus=all --shm-size=10.24gb --ulimit memlock=-1 --ulimit stack=67108864 \
   -e CUDA_VISIBLE_DEVICES=0 --rm --workdir /workdir/maxtext maxtext-jaxpp \
-  "nvidia-smi && bash /workdir/maxtext/scripts/multigpu_jaxpp.sh --max_target_length=64 --model=default \
-   --dp=1 --pp=1 --mp=1 --batch_size_per_device=1 --num_pipeline_microbatches=1 \
-   jaxpp_remote=false base_emb_dim=2048 base_num_query_heads=1 base_num_kv_heads=1 base_mlp_dim=896 \
-   base_num_decoder_layers=1 head_dim=8 vocab_size=32000 enable_dropout=false \
-   logits_via_embedding=false normalization_layer_epsilon=1.0e-5 decoder_block=mistral"
+  "nvidia-smi && bash MODEL_CONFIG='model_name=mistral-7b override_model_config=True base_num_decoder_layers=2' bash scripts/test_1gpu_config.sh"
 ```
 
 Note: The tests require GPU access and sufficient GPU memory.

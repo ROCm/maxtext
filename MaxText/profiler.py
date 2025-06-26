@@ -41,12 +41,12 @@ class Profiler:
     self.start_initial_profile_step = self._set_first_profiler_step(config.skip_first_n_steps_for_profiler, offset_step)
     self.finished_initial_profile_step = self._set_last_profiler_step(config.profiler_steps, config.steps)
 
-  def activate(self, blocking_object=None, optional_postfix=""):
+  def activate(self, blocking_object=None, optional_postfix="", profile=True):
     """Start the profiler.
     nsys profiler becomes no-op when libcudart.so is not available on the system."""
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
-    if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    if not (self.upload_all_profiler_results or jax.process_index() == 0) or not profile:
       return
     if self.mode != "":
       self.output_path = os.path.join(self.base_output_dir, optional_postfix)
@@ -60,12 +60,12 @@ class Profiler:
     elif self.mode == "xplane":
       jax.profiler.start_trace(self.output_path)
 
-  def deactivate(self, blocking_object=None):
+  def deactivate(self, blocking_object=None, profile=True):
     """End the profiler.
     The result is uploaded to the output bucket."""
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
-    if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    if not (self.upload_all_profiler_results or jax.process_index() == 0) or not profile:
       return
     if self.mode == "nsys":
       if self.libcudart is not None:

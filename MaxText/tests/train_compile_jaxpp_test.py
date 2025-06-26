@@ -14,7 +14,7 @@
 
 import unittest
 
-from train_compile import main as train_compile_main
+from MaxText.train_compile import main as train_compile_main
 
 
 def get_args(
@@ -25,22 +25,27 @@ def get_args(
     dcn_pp,
     vp,
     ga,
+    per_device_batch_size=2,
+    ici_cp=1,
+    ici_ep=1,
+    dcn_ep=1,
     quantization=None,
     disable_cache: bool = False,
 ):
     res = (
         None,
-        "configs/base.yml",
+        "MaxText/configs/base.yml",
         f"model_name={model_name}",
         "attention=dot_product",
         "remat_policy=minimal",
         "dtype=bfloat16",
         "max_target_length=2048",
-        "per_device_batch_size=2",
+        f"per_device_batch_size={per_device_batch_size}",
         "hardware=gpu",
         # SPMD Parallelism
         f"ici_data_parallelism={ici_dp}",
         f"ici_tensor_parallelism={ici_tp}",
+        f"ici_context_parallelism={ici_cp}",
         # Pipeline
         f"dcn_pipeline_parallelism={dcn_pp}",
         f"num_pipeline_microbatches={ga}",
@@ -52,6 +57,10 @@ def get_args(
         "compile_topology=a3",
         f"compile_topology_num_slices={num_nodes}",
     )
+    if ici_ep > 1:
+        res = res + (f"ici_expert_parallelism={ici_ep}",)
+    if dcn_ep > 1:
+        res = res + (f"dcn_expert_parallelism={dcn_ep}",)
     if quantization is not None:
         res = res + (f"quantization={quantization}",)
     if disable_cache:
@@ -60,6 +69,22 @@ def get_args(
 
 
 class TrainCompile(unittest.TestCase):
+    def test_compile_llama4(self):
+        train_compile_main(
+            get_args(
+                model_name="llama4-17b-16e",
+                num_nodes=32,
+                ici_dp=1,
+                ici_ep=2,
+                ici_tp=4,
+                dcn_ep=8,
+                dcn_pp=4,
+                vp=4,
+                ga=64,
+                per_device_batch_size=4
+            )
+        )
+
     def test_compile_gpt3(self):
         train_compile_main(
             get_args(
@@ -87,15 +112,17 @@ class TrainCompile(unittest.TestCase):
             )
         )
 
-    def test_compile_llama2(self):
+    def test_compile_llama3(self):
         train_compile_main(
             get_args(
-                model_name="llama2-70b",
+                model_name="llama3.3-70b",
                 num_nodes=8,
-                ici_dp=2,
+                ici_dp=1,
+                ici_cp=2,
                 ici_tp=4,
                 dcn_pp=4,
-                vp=10,
-                ga=16,
+                vp=5,
+                ga=64,
+                per_device_batch_size=2
             )
         )
