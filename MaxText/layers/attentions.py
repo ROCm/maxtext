@@ -921,9 +921,13 @@ class AttentionOp(nnx.Module):
       mask_type = "causal"  # SWA and Context Parallelism only work with causal masking
       attn_mask = None
     else:
-      # generate attn_mask
-      mask_type = "padding_causal"  # only padding_causal mask type can take a created mask
-      attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
+        if self.config.dataset_type =="synthetic":
+            mask_type = "causal"
+            attn_mask = None
+        else:
+            # generate attn_mask
+            mask_type = "padding_causal"  # only padding_causal mask type can take a created mask
+            attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
 
     dpa_layer = DotProductAttention(
         head_dim=head_dim,
