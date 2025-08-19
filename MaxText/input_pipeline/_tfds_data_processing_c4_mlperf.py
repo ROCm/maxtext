@@ -18,23 +18,24 @@ limitations under the License.
 """Input pipeline for gpt3 c4 mlperf dataset."""
 
 from typing import Optional
-
 import functools
 
 import numpy as np
 
 import ml_collections
+
 import tensorflow as tf
 import tensorflow_datasets as tfds
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import multihost_utils
 
-import tokenizer
-import multihost_dataloading
-import sequence_packing
-from input_pipeline._input_pipeline_utils import get_tokenizer
-import max_logging
+from MaxText import tokenizer
+from MaxText import multihost_dataloading
+from MaxText import sequence_packing
+from MaxText import max_logging
+from MaxText.input_pipeline._input_pipeline_utils import get_tokenizer
 
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 
@@ -42,7 +43,7 @@ AUTOTUNE = tf.data.experimental.AUTOTUNE
 # data processing functions:
 #   _shift_left_and_pad, rekey, reduce_concat_tokens and split_tokens_to_targets_length
 # Adapted from:
-#   https://github.com/google-research/text-to-text-transfer-transformer/blob/ba171b6f94eafcee60d0714fd6d60749b572d1f2/t5/data/preprocessors.py
+#   https://github.com/google-research/text-to-text-transfer-transformer/blob/ba171b6/t5/data/preprocessors.py
 # -----------------------------------------------------------------------------
 def _shift_left_and_pad(tensor, pad_val):
   """Shift the input to the left with pad_val"""
@@ -253,16 +254,20 @@ def preprocess_train_dataset(
     data_shuffle_seed: int,
 ) -> tf.data.Dataset:
   """Preprocess the training dataset."""
+  if sp_tokenizer.pad_id is not None:
+    pad_id = sp_tokenizer.pad_id
+  elif sp_tokenizer.unk_id is not None:
+    pad_id = sp_tokenizer.unk_id
+  else:
+    pad_id = -1
   train_ds = train_ds.map(
       lambda x: tokenizer.TokenizeOp(tokenizer=sp_tokenizer, features=x, data_keys=("targets",)), num_parallel_calls=AUTOTUNE
   )
-
   train_ds = reduce_concat_tokens(train_ds, feature_key="targets", batch_size=4096)
   train_ds = split_tokens_to_targets_length(train_ds, max_target_length)
   train_ds = train_ds.shuffle(shuffle_buffer_size, seed=data_shuffle_seed)
-  train_ds = sequence_packing.pack_dataset(train_ds, max_target_length)
-
-  train_ds = train_ds.map(format_fn, num_parallel_calls=AUTOTUNE)
+  train_ds = sequence_packing.pack_dataset(train_ds, max_target_length, pad_id=pad_id)
+  train_ds = train_ds.map(lambda x: format_fn(x, pad_id=pad_id), num_parallel_calls=AUTOTUNE)
   train_ds = train_ds.batch(train_global_batch_size_to_load // jax.process_count(), drop_remainder=True)
   train_ds = train_ds.prefetch(AUTOTUNE)
   return train_ds
@@ -270,14 +275,33 @@ def preprocess_train_dataset(
 
 def preprocess_eval_dataset(
     eval_ds: tf.data.Dataset,
+    sp_tokenizer,
     eval_global_batch_size_to_load: int,
     max_target_length: int,
     num_examples: Optional[int] = None,
+    is_tokenized_dataset: bool = True,
 ) -> tf.data.Dataset:
   """Preprocess the evaluation dataset."""
-  eval_ds = sequence_packing.pack_dataset(eval_ds, max_target_length)
+  # group text up to max_target_length if the dataset is not pre-tokenized/pre-processed
+  if not is_tokenized_dataset:
+    eval_ds = eval_ds.map(
+        lambda x: tokenizer.TokenizeOp(tokenizer=sp_tokenizer, features=x, data_keys=("targets",)),
+        num_parallel_calls=AUTOTUNE,
+    )
+    # hardcode batch_sizes 24567 i.e. the exp size in split validation_24567exp
+    #   to avoid padding tokens inserted in group text
+    eval_ds = reduce_concat_tokens(eval_ds, feature_key="targets", batch_size=24567)
+    eval_ds = split_tokens_to_targets_length(eval_ds, max_target_length)
 
-  eval_ds = eval_ds.map(format_fn, num_parallel_calls=AUTOTUNE)
+  if sp_tokenizer.pad_id is not None:
+    pad_id = sp_tokenizer.pad_id
+  elif sp_tokenizer.unk_id is not None:
+    pad_id = sp_tokenizer.unk_id
+  else:
+    pad_id = -1
+  eval_ds = sequence_packing.pack_dataset(eval_ds, max_target_length, pad_id=pad_id)
+
+  eval_ds = eval_ds.map(lambda x: format_fn(x, pad_id=pad_id), num_parallel_calls=AUTOTUNE)
 
   # ensure array split in an equal division for each device
   # pad zeros up to the same batch_size among all processes
@@ -309,7 +333,9 @@ def make_c4_mlperf_train_iterator(
   )
   train_ds = rekey(train_ds, {"inputs": None, "targets": "text"})
 
-  sp_tokenizer = get_tokenizer(config.tokenizer_path, config.add_bos, config.add_eos)
+  sp_tokenizer = get_tokenizer(
+      config.tokenizer_path, config.tokenizer_type, config.add_bos, config.add_eos, config.hf_access_token
+  )
   # A hack that (global_batch_size_to_load * num_process) when using jaxpp
   # because preprocess_train_dataset divides batch sizes with num_process
   # natively, and jaxpp uses only one process
@@ -332,21 +358,49 @@ def make_c4_mlperf_eval_iterator(
     process_indices,
 ):
   """Make eval iterator of customized C4 dataset for mlperf gpt3 training."""
-  eval_ds = get_dataset(
-      dataset_name=config.eval_dataset_name,
-      split="validation_tokenized_5662seqs",
-      dataloading_host_index=process_indices.index(jax.process_index()),
-      dataloading_host_count=len(process_indices),
-      enable_data_shuffling=False,
-  )
-  # note validation_tokenized_5662seqs split is pre tokenized, reduce_concated and split to target_length
-  #   mainly to avoid eval sequences change depending on the number of hosts
-  eval_ds = rekey(eval_ds, {"inputs": None, "targets": "ids"})
+  eval_slit = "None"
+  if config.eval_dataset_name == "c4/en:3.0.5":
+    is_tokenized_dataset = True
+  elif config.eval_dataset_name == "c4/en:3.0.4":
+    is_tokenized_dataset = False
+    eval_slit = "validation_24567exp"
+  elif config.eval_dataset_name in ["c4/en:3.0.1", "c4/en:3.0.8", "c4/en:3.0.9"]:
+    is_tokenized_dataset = False
+    eval_slit = "validation"
+  else:
+    raise ValueError(f"{config.eval_dataset_name=} should be one of ('c4/en:3.0.1', 'c4/en:3.0.4', 'c4/en:3.0.5')")
 
+  if is_tokenized_dataset:
+    eval_ds = get_dataset(
+        dataset_name=config.eval_dataset_name,
+        split="validation_tokenized_5662seqs",
+        dataloading_host_index=process_indices.index(jax.process_index()),
+        dataloading_host_count=len(process_indices),
+        enable_data_shuffling=False,
+    )
+    # note validation_tokenized_5662seqs split is pre tokenized, reduce_concated and split to target_length
+    #   mainly to avoid eval sequences change depending on the number of hosts
+    eval_ds = rekey(eval_ds, {"inputs": None, "targets": "ids"})
+  else:
+    eval_ds = get_dataset(
+        dataset_name=config.eval_dataset_name,
+        split=eval_slit,
+        dataloading_host_index=process_indices.index(jax.process_index()),
+        dataloading_host_count=len(process_indices),
+        enable_data_shuffling=False,
+    )
+
+    eval_ds = rekey(eval_ds, {"inputs": None, "targets": "text"})
+
+  sp_tokenizer = get_tokenizer(
+      config.tokenizer_path, config.tokenizer_type, config.add_bos, config.add_eos, config.hf_access_token
+  )
   eval_ds = preprocess_eval_dataset(
       eval_ds,
+      sp_tokenizer=sp_tokenizer,
       eval_global_batch_size_to_load=config.global_batch_size_to_load_eval,
       max_target_length=config.max_target_length,
+      is_tokenized_dataset=is_tokenized_dataset,
   )
 
   eval_multihost_gen = multihost_dataloading.MultiHostDataLoadIterator(eval_ds, global_mesh)

@@ -14,18 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# pylint: disable=bare-except, consider-using-generator, ungrouped-imports, too-many-positional-arguments
-"""Utils that are only interesting to MaxText. """
+# pylint: disable=bare-except, consider-using-generator, too-many-positional-arguments
+""" Utils that are only interesting to MaxText. """
 
 import jax
-
+import jax.numpy as jnp
 
 import optax
-import jax.numpy as jnp
 
 
 def get_optimizer(config, learning_rate_schedule):
-  """create optimizer"""
+  """Create optimizer."""
   if config.opt_type == "adamw":
     # Create AdamW Optimizer following Llama2's training details, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
     return optax.adamw(
@@ -35,6 +34,7 @@ def get_optimizer(config, learning_rate_schedule):
         eps=config.adam_eps,
         eps_root=config.adam_eps_root,
         weight_decay=config.adam_weight_decay,
+        mu_dtype=config.mu_dtype,
     )
   elif config.opt_type == "adam_pax":
     return adam_pax(

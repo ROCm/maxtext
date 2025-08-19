@@ -22,11 +22,12 @@ sys.path.append(parent_dir)
 
 import maxtext_trillium_model_configs as model_configs
 import maxtext_xpk_runner as mxr
+from xpk_configs import XpkClusterConfig
 
 
 def main() -> int:
   # V6e cluster config
-  cluster_config = mxr.XpkClusterConfig(
+  cluster_config = XpkClusterConfig(
       cluster_name="v6e-256-cluster",
       project="tpu-project",
       zone="us-east5-b",
@@ -47,25 +48,25 @@ def main() -> int:
   user = os.environ["USER"]
   region = "-".join(cluster_config.zone.split("-")[:-1])
   proxy_image = (
-      f"us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/{user}/"
+      f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/gke/{user}/"
       "proxy_server:latest"
   )
   server_image = (
-      f"us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/{user}/"
+      f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/gke/{user}/"
       "server:latest"
   )
-  remote_python_image = f"gcr.io/{cluster_config.project}/{user}/remote_python_sidecar_latest:latest"
+  colocated_python_image = f"gcr.io/{cluster_config.project}/{user}/colocated_python_sidecar_latest:latest"
   runner = f"gcr.io/{cluster_config.project}/{user}_latest:latest"
   base_output_directory = f"gs://{user}-{region}/{user}"
 
   list_of_models = [
-      model_configs.default_basic_1_pw,
+      model_configs.default_basic_1,
   ]
   pathways_config = mxr.PathwaysConfig(
       server_image=server_image,
-      proxy_image=proxy_image,
+      proxy_server_image=proxy_image,
       runner_image=runner,
-      remote_python_sidecar_image=remote_python_image,
+      colocated_python_sidecar_image=colocated_python_image,
   )
   num_slices_list = [1]
 

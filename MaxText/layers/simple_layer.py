@@ -13,12 +13,15 @@ limitations under the License.
 
 """ Simple decoder layers for testing and debugging purposes."""
 
-from jax import numpy as jnp
-from flax import linen as nn
-from jax.sharding import Mesh
 from typing import Optional
-from layers import quantizations
-import common_types
+
+from jax import numpy as jnp
+from jax.sharding import Mesh
+
+from flax import linen as nn
+
+from MaxText.common_types import Config
+from MaxText.layers import quantizations
 
 # pytype: disable=attribute-error
 
@@ -26,7 +29,7 @@ import common_types
 class SimpleDecoderLayer(nn.Module):
   """Decoder layer consisting of a single [embed, embed] weight matrix."""
 
-  config: common_types.Config
+  config: Config
   mesh: Mesh
   quant: Optional[quantizations.AqtQuantization] = None
 
@@ -37,7 +40,9 @@ class SimpleDecoderLayer(nn.Module):
         (self.config.emb_dim, self.config.emb_dim),
     )
 
-  def __call__(self, inputs: jnp.ndarray, positions, segmentation, deterministic, model_mode):
+  def __call__(
+      self, inputs: jnp.ndarray, positions, segmentation, deterministic, model_mode, previous_chunk=None, page_state=None
+  ):
     if self.config.scan_layers:
       return inputs @ self.weight_mat.astype(inputs.dtype), None
     else:
@@ -47,7 +52,7 @@ class SimpleDecoderLayer(nn.Module):
 class SimpleMlpDecoderLayer(nn.Module):
   """Decoder layer consisting of [embed,mlp] followed by an [mlp,embed] matmul."""
 
-  config: common_types.Config
+  config: Config
   mesh: Mesh
   quant: Optional[quantizations.AqtQuantization] = None
 
@@ -63,7 +68,17 @@ class SimpleMlpDecoderLayer(nn.Module):
         (self.config.mlp_dim, self.config.emb_dim),
     )
 
-  def __call__(self, inputs: jnp.ndarray, positions, segmentation, deterministic, model_mode):
+  def __call__(
+      self,
+      inputs: jnp.ndarray,
+      positions,
+      segmentation,
+      deterministic,
+      model_mode,
+      previous_chunk=None,
+      page_state=None,
+      slot=0,
+  ):
     intermediate = inputs @ self.ff_1.astype(inputs.dtype)
     output = intermediate @ self.ff_2.astype(inputs.dtype)
     if self.config.scan_layers:

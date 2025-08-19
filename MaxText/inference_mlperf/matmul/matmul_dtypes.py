@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""matrix multiplication data types"""
+
 
 import jax
 
-import timing_util
+from MaxText.inference_mlperf.matmul import timing_util
 
 _PROFILE = False
 MATMUL_SIZES = [(250, 2048)]

@@ -13,7 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Usage: python3 MaxText/scratch_code/golden_llama3_1_export.py --model-id meta-llama/Meta-Llama-3-70B --output-path llama3-70b/golden_logits/golden_data_llama3-70b.jsonl
+Usage: python3 -m MaxText.scratch_code.golden_llama3_1_export --model-id meta-llama/Meta-Llama-3-70B \
+  --output-path llama3-70b/golden_logits/golden_data_llama3-70b.jsonl
 """
 
 import os
@@ -36,6 +37,7 @@ def upload_blob(bucket_name, source_file_name, destination_blob_name):
 
 
 def save_golden_logits(model_id, output_path):
+  """save golden logits"""
   tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
   model = AutoModelForCausalLM.from_pretrained(
       model_id,
@@ -69,8 +71,8 @@ def save_golden_logits(model_id, output_path):
   with jsonlines.open(output_path, "w") as f:
     f.write_all(all_data_to_save)
 
-  upload_blob("maxtext-llama", output_path, "Llama3_1_8B/golden-logits/" + output_path)
-  print("File {} uploaded to {}.".format(output_path, "Llama3_1_8B/golden-logits/" + output_path))
+  upload_blob("maxtext-llama", output_path, f"Llama3_1_8B/golden-logits/{output_path}")
+  print(f"File {output_path} uploaded to Llama3_1_8B/golden-logits/{output_path}.")
   os.remove(output_path)
 
 

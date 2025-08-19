@@ -19,7 +19,7 @@ Get LLaMA pytorch_vars from Meta
 
 Example cmd:
 To save a ckpt
-python3 MaxText/llama_or_mistral_ckpt.py --base-model-path <path/to/meta/ckpt> \
+python3 -m MaxText.llama_or_mistral_ckpt --base-model-path <path/to/meta/ckpt> \
     --maxtext-model-path <GCS/path/to/save/new/maxtext/ckpt> --model-size llama2-7b
 
 For large size model (e.g. 70B model), this script requires large memory VM.
@@ -29,19 +29,23 @@ Each pass, load and save partial weights (subset of all weight variables).
 """
 # pylint: disable=g-line-too-long
 import argparse
+import sys
+import os
 import pathlib
 
 import numpy as np
 
-import checkpointing
 import jax
+
 from flax.training import train_state
-import max_logging
-from train import save_checkpoint
+
 import torch
-import sys
-import os
+
 import psutil
+
+from MaxText import checkpointing
+from MaxText import max_logging
+from MaxText.train import save_checkpoint
 
 jax.config.update("jax_platform_name", "cpu")
 
@@ -52,11 +56,17 @@ def permute_to_match_maxtext_rope(arr):
   return jax.numpy.concatenate((evens, odds), axis=arr.ndim - 1)
 
 
+# Model params can be found in the config.json on HuggingFace of these models
+# num_layers -> num_hidden_layers
+# num_heads -> num_attention_heads
+# num_kv_heads -> num_key_value_heads
+# dims_per_head -> hidden_size / num_attention_heads
+# vocab -> vocab_size
 MODEL_PARAMS_DICT = {
-    "llama2-70b": {
-        "num_layers": 80,
-        "num_heads": 64,
-        "num_kv_heads": 8,
+    "llama2-7b": {
+        "num_layers": 32,
+        "num_heads": 32,
+        "num_kv_heads": 32,
         "dims_per_head": 128,
         "vocab": 32000,
     },
@@ -67,10 +77,10 @@ MODEL_PARAMS_DICT = {
         "dims_per_head": 128,
         "vocab": 32000,
     },
-    "llama2-7b": {
-        "num_layers": 32,
-        "num_heads": 32,
-        "num_kv_heads": 32,
+    "llama2-70b": {
+        "num_layers": 80,
+        "num_heads": 64,
+        "num_kv_heads": 8,
         "dims_per_head": 128,
         "vocab": 32000,
     },
@@ -88,9 +98,30 @@ MODEL_PARAMS_DICT = {
         "dims_per_head": 128,
         "vocab": 128256,
     },
-    "llama3-405b": {
+    "llama3.1-8b": {
+        "num_layers": 32,
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "dims_per_head": 128,
+        "vocab": 128256,
+    },
+    "llama3.1-70b": {
+        "num_layers": 80,
+        "num_heads": 64,
+        "num_kv_heads": 8,
+        "dims_per_head": 128,
+        "vocab": 128256,
+    },
+    "llama3.1-405b": {
         "num_layers": 126,
         "num_heads": 128,
+        "num_kv_heads": 8,
+        "dims_per_head": 128,
+        "vocab": 128256,
+    },
+    "llama3.3-70b": {
+        "num_layers": 80,
+        "num_heads": 64,
         "num_kv_heads": 8,
         "dims_per_head": 128,
         "vocab": 128256,
@@ -170,8 +201,8 @@ def convert(base_model_path, maxtext_model_path, model_size):
         },
     }
 
-  # llama3-405b kv weight is replicated within every two files.
-  wkv_step = 1 if model_size != "llama3-405b" else 2
+  # llama3.1-405b kv weight is replicated within every two files.
+  wkv_step = 1 if model_size != "llama3.1-405b" else 2
 
   for layer_idx in range(base_num_decoder_layers):
     print("layer idx: ", layer_idx)

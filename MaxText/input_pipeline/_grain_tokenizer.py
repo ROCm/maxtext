@@ -20,9 +20,9 @@ from collections.abc import Sequence
 import dataclasses
 import threading
 from typing import Any
-from sentencepiece import SentencePieceProcessor
 import grain.python as grain
 import numpy as np
+from MaxText import tokenizer
 
 
 @dataclasses.dataclass
@@ -32,9 +32,9 @@ class TokenizeAndTrim(grain.MapTransform):
   # pylint: disable=attribute-defined-outside-init
   feature_names: str | Sequence[str]
   sequence_length: int | Sequence[int]
-  model_path: str
   add_bos: bool
   add_eos: bool
+  tokenizer: tokenizer.SentencePieceTokenizerGrain | tokenizer.HFTokenizer
 
   def __post_init__(self):
     self._processor = None
@@ -44,27 +44,17 @@ class TokenizeAndTrim(grain.MapTransform):
     if isinstance(self.sequence_length, int):
       self.sequence_length = [self.sequence_length] * len(self.feature_names)
 
-  def map(self, features: dict[str, Any]) -> dict[str, Any]:
+  def map(self, element: dict[str, Any]) -> dict[str, Any]:
     """Maps to each element."""
     if self._processor is None:
       with self._initialize_processor_lock:
         if self._processor is None:  # Ensures only one thread initializes SPP.
-          self._processor = SentencePieceProcessor()
-          self._processor.Load(self.model_path)
+          self._processor = self.tokenizer
     for feature_name, sequence_length in zip(self.feature_names, self.sequence_length, strict=True):
-      text = features[feature_name]
-      token_ids = self._processor.EncodeAsIds(text)
-      if self.add_bos:
-        token_ids = [self._processor.bos_id()] + token_ids
-
-      if self.add_eos:
-        token_ids = token_ids[: sequence_length - 1]
-        token_ids = token_ids + [self._processor.eos_id()]
-      else:
-        token_ids = token_ids[:sequence_length]
-
-      features[feature_name] = np.asarray(token_ids, dtype=np.int32)
-    return features
+      text = element[feature_name]
+      token_ids = self._processor.encode(text)[:sequence_length]
+      element[feature_name] = np.asarray(token_ids, dtype=np.int32)
+    return element
 
   def __getstate__(self):
     state = self.__dict__.copy()

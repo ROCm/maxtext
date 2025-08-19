@@ -18,6 +18,7 @@
 run_name: ""
 
 model_name: "default" # override config settings to match a specific model. other than the override, nothing should use this!
+override_model_config: False # When set to true allows overriding model parameters via CLI for the purpose of debugging/testing.
 normalization_layer_epsilon: 1.e-05
 
 ################################## CHECKPOINTING ##################################
@@ -32,6 +33,10 @@ normalization_layer_epsilon: 1.e-05
 # Loads a just parameters from a specific directory
 # e.g. gs://my-base-output-directory/my-previous-run-name/checkpoints/items/NUMBER or NUMBER/items
 load_parameters_path: ""
+
+# LoRA adapter support configs
+lora_input_adapters_path: ""    # Input GCS path for a parent directory which has all the LoRA adapters (lora_id as subdir)
+
 # Loads a full checkpoint including optimizer state and step count from a specific directory
 # e.g. gs://my-base-output-directory/my-previous-run-name/checkpoints/items/NUMBER or NUMBER/items
 load_full_state_path: ""
@@ -55,10 +60,14 @@ force_unroll: False # during generate_param_only_checkpoint should we unroll the
 checkpoint_storage_target_data_file_size_bytes: 2147483648
 checkpoint_storage_use_ocdbt: True
 checkpoint_storage_use_zarr3: True
+# larger models requires higher concurrent GB for I/O
+# default concurrent gb for PytreeCheckpointHandler is 96GB
+checkpoint_storage_concurrent_gb: 96
 ############################### END CHECKPOINTING ##################################
 
 
 reuse_example_batch: 0 # for testing TPU performance, this options repeated uses the same batch.
+
 
 metrics_file: "" # for testing, local file that stores scalar metrics. If empty, no metrics are written.
 # If true save metrics such as loss and TFLOPS to GCS in {base_output_directory}/{run_name}/metrics/
@@ -74,6 +83,7 @@ dtype: "bfloat16"
 # 'int8' for dynamic range quantization using 8-bits
 # 'intmp' for mixed precision quantization for inference as described here: MaxText/configs/quantization/README.md
 # 'fp8' for 8-bit floating-point GeMMs on NVIDIA GPUs.
+# 'nanoo_fp8' for 8-bit floating-point GeMMs on AMD MI300/MI325 GPUs.
 quantization: ""
 # Choose one of default, high, and highest.
 # https://kolonist26-jax-kr.readthedocs.io/en/latest/jax.lax.html#jax.lax.Precision
@@ -107,7 +117,7 @@ decoder_block: "llama2" # which style of DecoderBlock to use.
 # Global parameter scale needs to be a power of 2. If you want finer grained control of the model sizes
 # then you should explicitly set base_embed_dim, base_num_query_heads, base_num_kv_heads,
 # base_mlp_dim, base_num_decoder_layers and/or head_dim.
-weight_dtype: float32
+weight_dtype: "float32"
 global_parameter_scale: 1
 base_emb_dim: 2048
 base_num_query_heads: 16
@@ -121,32 +131,69 @@ logits_via_embedding: False
 normalize_embedding_logits: True  # whether to normlize pre-softmax logits if logits_via_embedding is true
 logits_dot_in_fp32: False  # whether to use fp32 in logits_dense or shared_embedding dot product for stability
 cast_logits_to_fp32: True # whether to cast the logits to fp32. The higher precision is generally beneficial, but it can vary slightly.
+float32_qk_product: False # in dot_product attention, whether to cast to fp32 the inputs to qk product
+float32_logits: False # in dot_product attention, whether to cast to fp32 the inputs to softmax
 
 # mixture of experts (moe)
 num_experts: 1
 num_experts_per_tok: 1
-megablox: True # Only used when sparse_matmul=True
+megablox: False # Only used when sparse_matmul=True
 sparse_matmul: False
 capacity_factor: -1.0 # a factor to decide expert capacity for token dropping, and no dropping by default
 load_balance_loss_weight: 0.01 # weight for the load balance loss
+use_random_routing: False # whether to use random routing for debug/test purpose
+# Tunable tiling dimensions used for Megablox
+tile_batch_seq: 512
+tile_activation_dim: 1024
+tile_weight_dim: 1024
+
+# deepseek moe
+base_moe_mlp_dim: 7168 # intermediate dimension at MoE layer (use base_mlp_dim if not DeepSeek style)
+first_num_dense_layers: 0 # number of initial dense layers in the model
+shared_experts: 1
+routed_scaling_factor: 1.0 # scaling factor for routing scores
+routed_score_func: "" # scoring function for routing
+routed_bias: False # a flag if a bias term is added for routing
+n_routing_groups: -1 # number of groups for routing, disabled by default
+topk_routing_group: -1 # number of top groups to route inputs. For EP,
+# sending activations to a maximum of topk_routing_group distinct devices can yield performance benefits.
+
+# For complex architectures like llama4 there are repeated sets of
+# inhomogeneous layers. E.g. maverick uses [dense+rope, moe+rope, dense+rope, moe+nope]
+# which can only be scanned together in one large block of inhomogeneous_layer_cycle_interval=4 layers.
+inhomogeneous_layer_cycle_interval: 1 
 
 # pipeline parallelism
 # The number of decoder layers is equal to the product of num_stages, num_layers_per_pipeline_stage and num_pipeline_repeats.
 # There is a tradeoff between the num_layers_per_pipeline_stage and num_pipeline_repeats: The more layers per stage the easier
 # it is to hide the pipeline communication behind the compute since there is more compute per stage, however there will be a larger bubble
-# since there are fewer repeats. Similarly there is tradeoff for num_pipeline_microbatches - more microbatches leads to a smaller bubble,
-# but a smaller size per microbatch which may hurt per-stage performance. Additionally note when microbatches > num_stages we have the opportunity to
+# since there are fewer repeats. Similarly, there is tradeoff for num_pipeline_microbatches - more microbatches leads to a smaller bubble,
+# but a smaller size per microbatch which may hurt per-stage performance. Additionally, note when microbatches > num_stages we have the opportunity to
 # perform the circular transfer (last stage to first) asynchronously.
 # The bubble fraction is (num_stages - 1) / (num_pipeline_repeats * num_pipeline_microbatches + num_stages - 1)
 num_layers_per_pipeline_stage: 1 # NOTE(jaxpp) unused in JaxPP
 # The number of repeats will be set to num_decoder_layers / (num_pipeline_stages * num_layers_per_pipeline_stage)
 num_pipeline_repeats: -1
+pipeline_parallel_layers: -1 # Pipeline only this number of layers - for the remaining layers the "stage" mesh axes will act like data parallelism.
+# This option helps when the number of layers does not have friendly divisors since SPMD pipelining requires that the
+# PP degree divides the number of layers.
+# By default (when set to -1) we pipeline all of the decoder layers.
+
+
 # num_pipeline_microbatches must be a multiple of the number of pipeline stages. By default it is set to the number of stages.
 # Note the microbatch_size is given by global_batch_size / num_pipeline_microbatches, where global_batch_size = per_device_batch_size * num_devices
 num_pipeline_microbatches: -1
 pipeline_delay_activation_forwarding: False # This delays the activation forwarding one loop iteration simplifying XLA's task of overlapping since
 # the communication and compute in each iteration are now independent. However this comes at the cost of doubling the pipeline bubble,
 # and you must set the number of microbatches to at least 2 * num_stages (the minimum 2 * num_stages is set by default with this delay).
+
+pipeline_fsdp_ag_once: False # If set to true then all gather all of the weights over FSDP before the first pipeline iteration.
+# This is a memory/time tradeoff - we now have to store the FSDP gathered weights and gradients (typically in bf16), as opposed
+# to only one stage's worth, however we only execute one all-gather and reduce across per repeat, as opposed
+# to every microbatch. This is similar to zero-1 sharding, since we also don't need to all gather the FSDP weights in the backward pass.
+# An alternative to setting this to true may be to replace any FSDP with DP and use optimizer offloading if necessary.
+# A more optimal behavior is to all-gather at the start of each repeat, which would ideally get the best of both worlds -
+# a small amount of memory and time, however this has proven hard to implement in SPMD, see b/364386697 for more.
 
 # There are two loops for PP:
 #  1)  Outer loop over microbatches (pipeline iterations)
@@ -156,7 +203,7 @@ pipeline_delay_activation_forwarding: False # This delays the activation forward
 # It may be useful to do the reverse when the layers_per_stage is very large.
 # The below settings only have effect when using pipeline parallelism.
 scan_pipeline_iterations: True
-# The layers per stage scanning option is set by scan_layers, we recommend setting scan_layers=False
+scan_layers_per_stage: False
 set_remat_policy_on_pipeline_iterations: True
 set_remat_policy_on_layers_per_stage: False
 
@@ -180,19 +227,28 @@ qkv_proj: 'remat'
 out_proj: 'remat'
 
 optimizer_memory_host_offload: False
+parameter_memory_host_offload: False
 scan_layers: False # We recommend setting this to false when using pipeline parallelism, instead scanning the PP iterations.
 param_scan_axis: 0  # NOTE(jaxpp) we set to 0 instead of 1 to avoid flax transposes
 
 # The attention parameter dictates the specific algorithm/methodology used to compute the attention scores
 # The attention_type parameter determines the variants of attention, e.g. global or local_sliding
 attention: 'cudnn_flash_te' # Supported attention: autoselected, dot_product, flash, cudnn_flash_te
-attention_type: 'global' # Supported attention_type: global, local_sliding
+attention_type: 'global' # Supported attention_type: global, local_sliding, chunk, mla
 sliding_window_size: 0
+chunk_attn_window_size: 0
 attn_logits_soft_cap: 0.0
 final_logits_soft_cap: 0.0
 use_post_attn_norm: False
 use_post_ffw_norm: False
+mla_naive_kvcache: True
 
+# MLA parameters
+q_lora_rank: 0
+kv_lora_rank: 512
+qk_nope_head_dim: 128
+qk_rope_head_dim: 64
+v_head_dim: 128
 
 # Combine matmuls for QKV and MLP
 fused_qkv: False
@@ -204,7 +260,7 @@ record_internal_nn_metrics: 0
 # Create a GCS bucket, e.g. my-maxtext-outputs and set this to "gs://my-maxtext-outputs/"
 base_output_directory: ""
 
-# Whether or not to enable emergency checkpoint. If True, `local_checkpoint_directory` and a non-zero `local_checkpoint_period` must also be specified.
+# Whether to enable emergency checkpoint. If True, `local_checkpoint_directory` and a non-zero `local_checkpoint_period` must also be specified.
 # Emergency checkpoint is an experimental Orbax feature that: periodically saves to persistent storage and, with a larger invertal, saves to a local directory.
 # During restore, if a local copy is available in any slice, it will be broadcast to other slices without having to fetch from persistent storage.
 # See more details on https://github.com/google/orbax/tree/main/checkpoint/orbax/checkpoint/experimental/emergency.
@@ -216,7 +272,7 @@ local_checkpoint_directory: ""
 # It should be a positive number when and only when `enable_emergency_checkpoint` is True.
 local_checkpoint_period: 0
 
-# Whether or not to use emergency checkpoint with the replicator service.
+# Whether to use emergency checkpoint with the replicator service.
 use_replicator_service: False
 
 # The interval to backup local checkpoints to the persistent storage.
@@ -229,49 +285,73 @@ jax_cache_dir: "~/jax_cache"
 hardware: 'tpu' # Supported hardware types are 'tpu', 'gpu', 'gpu_multiprocess' and 'cpu'
 
 # Parallelism
-mesh_axes: ['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'tensor', 'tensor_sequence', 'expert', 'autoregressive']
+mesh_axes: ['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'context_autoregressive', 'tensor', 'tensor_transpose', 'tensor_sequence', 'expert', 'autoregressive']
 logical_axis_rules: [
                       ['activation_batch', ['fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_batch_no_exp', ['data', 'fsdp', 'fsdp_transpose']],
-                      ['activation_embed_and_logits_batch', ['stage', 'fsdp', 'fsdp_transpose', 'expert']],
-                      ['activation_heads', ['tensor','sequence','tensor_sequence']],
-                      ['activation_kv_heads', ['tensor','sequence','tensor_sequence']],
-                      ['activation_length', ['sequence']],
-                      ['activation_norm_length', ['tensor_sequence', 'sequence']],
-                      ['activation_embed', 'tensor'],
-                      ['activation_mlp', ['tensor', 'tensor_sequence']],
-                      ['activation_kv', ['tensor', 'tensor_sequence']],
+                      ['activation_embed_and_logits_batch', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert']],
+                      ['activation_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence','autoregressive']],
+                      ['activation_kv_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence']],
+                      ['activation_length', ['sequence', 'context']],
+                      ['activation_length', ['context']],
+                      ['activation_norm_length', ['tensor_sequence', 'context', 'sequence']],
+                      ['activation_q_length', ['context']],
+                      ['activation_kv_length', []],
+                      ['activation_embed', ['tensor', 'tensor_transpose']],
+                      ['activation_mlp', ['tensor', 'tensor_transpose', 'tensor_sequence']],
+                      ['activation_kv', ['tensor', 'tensor_transpose', 'tensor_sequence']],
                       ['activation_prefill_kv_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_kv_batch', ['fsdp', 'fsdp_transpose', 'expert']],
-                      ['activation_kv_head_dim', ['tensor', 'tensor_sequence']],
-                      ['activation_vocab', ['tensor', 'sequence', 'tensor_sequence']],
-                      ['activation_vocab', 'tensor'],
+                      ['activation_kv_head_dim', ['tensor', 'tensor_transpose', 'tensor_sequence']],
+                      ['activation_vocab', ['tensor', 'tensor_transpose', 'sequence', 'tensor_sequence']],
+                      ['activation_vocab', ['tensor', 'tensor_transpose']],
                       ['activation_vocab', 'tensor_sequence'],
-                      ['activation_vocab', 'sequence'],
+                      ['activation_vocab', ['sequence','context']],
                       ['activation_stage', 'stage'],
-                      ['activation_exp', 'expert'],
+                      ['activation_exp', ['expert']],
+                      ['decode_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
+                      ['decode_length', ['sequence']],
                       ['mlp', ['fsdp_transpose', 'tensor', 'tensor_sequence', 'autoregressive']],
-                      ['vocab', ['tensor', 'tensor_sequence', 'autoregressive']],
-                      ['embed', ['fsdp', 'fsdp_transpose', 'sequence', 'expert']],
-                      ['embed', ['fsdp', 'sequence', 'expert']],
-                      ['embed_no_exp', ['fsdp', 'fsdp_transpose', 'sequence']],
-                      ['embed_no_exp', ['fsdp', 'sequence']],
-                      ['norm', ['tensor', 'tensor_sequence']],
-                      ['q_heads', ['tensor', 'tensor_sequence', 'autoregressive']],
-                      ['heads', ['tensor', 'tensor_sequence', 'autoregressive']],
+                      ['vocab', ['tensor', 'tensor_transpose', 'tensor_sequence', 'autoregressive']],
+                      ['heads', ['tensor', 'tensor_transpose', 'tensor_sequence', 'autoregressive']],
+                      ['q_heads', ['tensor', 'tensor_transpose', 'tensor_sequence', 'autoregressive']],
+                      ['kv_heads', ['tensor', 'tensor_transpose', 'tensor_sequence', 'autoregressive']],
+                      ['embed', ['fsdp', 'fsdp_transpose', 'sequence', 'tensor_transpose', 'context', 'expert']],
+                      ['embed', ['fsdp', 'sequence', 'tensor_transpose', 'context' , 'expert']],
+                      ['embed', ['fsdp', 'fsdp_transpose', 'sequence', 'context', 'expert']],
+                      ['embed', ['fsdp', 'sequence', 'context', 'expert']],
+                      ['embed_no_exp', ['fsdp', 'fsdp_transpose', 'sequence', 'tensor_transpose', 'context']],
+                      ['embed_no_exp', ['fsdp', 'sequence', 'tensor_transpose', 'context']],
+                      ['embed_no_exp', ['fsdp', 'fsdp_transpose', 'sequence', 'context']],
+                      ['embed_no_exp', ['fsdp', 'sequence', 'context']],
+                      ['q_lora', ['fsdp', 'fsdp_transpose', 'sequence', 'context', 'tensor_transpose', 'expert']],
+                      ['q_lora', ['fsdp', 'sequence', 'context', 'tensor_transpose', 'expert']],
+                      ['q_lora', ['fsdp', 'fsdp_transpose', 'sequence', 'context', 'expert']],
+                      ['q_lora', ['fsdp', 'sequence', 'context', 'expert']],
+                      ['kv_lora', ['fsdp', 'fsdp_transpose', 'sequence', 'context', 'tensor_transpose', 'expert']],
+                      ['kv_lora', ['fsdp', 'sequence', 'context', 'tensor_transpose', 'expert']],
+                      ['kv_lora', ['fsdp', 'fsdp_transpose', 'sequence', 'context', 'expert']],
+                      ['kv_lora', ['fsdp', 'sequence', 'context', 'expert']],
+                      ['norm', ['tensor', 'tensor_transpose', 'tensor_sequence']],
                       ['layers', 'stage'],
                       ['kv', []],
-                      ['kv_heads', ['tensor', 'tensor_sequence', 'autoregressive']],
                       ['kv_head_dim', []],
                       ['cache_batch_prefill', []],
                       ['cache_batch', []],
+                      ['cache_heads_none', []],
+                      ['cache_heads', ['autoregressive', 'tensor', 'tensor_transpose', 'tensor_sequence']],
                       ['cache_heads', ['autoregressive', 'tensor', 'tensor_sequence']],
                       ['cache_kv', []],
                       ['cache_sequence', []],
                       ['exp', 'expert'],
+                      ['paged_kv_heads', ['tensor']],
+                      ['num_pages', []],
+                      ['tokens_per_page', []],
+                      ['paged_kv_head_dim_size', []],
                     ]
 # Axes used for DCN must be earlier in this list than ICI, see (b/339009148) for details
-data_sharding: [['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'tensor', 'tensor_sequence', 'expert', 'autoregressive']]
+data_sharding: [['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'context_autoregressive', 'tensor', 'tensor_transpose', 'tensor_sequence', 'expert', 'autoregressive']]
+input_data_sharding_logical_axes: ['activation_embed_and_logits_batch', 'activation_norm_length']
 
 # sharding tolerance: float between 0.0 and 1.0 representing the allowed percentage of non-sharded parameters.
 sharding_tolerance: 0.02
@@ -284,7 +364,10 @@ dcn_data_parallelism: -1  # recommended DCN axis to be auto-sharded
 dcn_fsdp_parallelism: 1
 dcn_fsdp_transpose_parallelism: 1
 dcn_sequence_parallelism: 1  # never recommended
+dcn_context_parallelism: 1
+dcn_context_autoregressive_parallelism: 1
 dcn_tensor_parallelism: 1 # never recommended
+dcn_tensor_transpose_parallelism: 1
 dcn_tensor_sequence_parallelism: 1 # never recommended
 dcn_pipeline_parallelism: 1
 dcn_expert_parallelism: 1
@@ -293,7 +376,10 @@ ici_data_parallelism: 1
 ici_fsdp_parallelism: 1 # recommended ICI axis to be auto-sharded
 ici_fsdp_transpose_parallelism: 1
 ici_sequence_parallelism: 1
+ici_context_parallelism: 1
+ici_context_autoregressive_parallelism: 1
 ici_tensor_parallelism: 1
+ici_tensor_transpose_parallelism: 1
 ici_tensor_sequence_parallelism: 1
 ici_autoregressive_parallelism: 1
 ici_pipeline_parallelism: 1
@@ -306,6 +392,11 @@ num_slices: -1
 # Tokenizer
 vocab_size: 32_000 # powers of 2 for sharding
 tokenizer_path: "assets/tokenizer.llama2"
+# tfds pipeline supports tokenizer_type: sentencepiece, huggingface, tiktoken
+# grain pipeline supports tokenizer_type: sentencepiece, huggingface
+# hf pipeline only supports huggingface type, and will ignore tokenizer_type flag
+tokenizer_type: "sentencepiece" # Currently supporting: "tiktoken", "sentencepiece", "huggingface"
+use_chat_template: False
 tokenize_train_data: True  # False if the dataset is pre-tokenized
 tokenize_eval_data: True  # False if the dataset is pre-tokenized
 add_bos: True
@@ -318,11 +409,18 @@ eval_per_device_batch_size: 0.0
 max_corpus_chars: 10_000_000
 train_data_columns: ['text'] # for DPO dataset containing "chosen" and "rejected"
 eval_data_columns: ['text'] # for DPO dataset containing "chosen" and "rejected"
+packing: True
+num_epoch: 1  # only grain and tfds pipeline supports num_epoch > 1
 
 # direct preference optimization (DPO)
 use_dpo: False
 dpo_label_smoothing: 0.0
 dpo_beta: 0.1
+
+# Supervised Fine-Tuning (SFT)
+use_sft: False
+# sft_train_on_completion_only=False trains on both prompt and completion tokens; trains only on completion tokens otherwise
+sft_train_on_completion_only: False
 
 # dataset_type must be synthetic, hf, grain, tfds
 # details in: https://github.com/google/maxtext/blob/main/getting_started/Data_Input_Pipeline.md
@@ -331,6 +429,7 @@ dataset_type: tfds
 dataset_path: "" # your path given as argument in download_dataset.sh, e.g. "gs://my-maxtext-dataset/"
 dataset_name: 'c4/en:3.0.1'
 eval_dataset_name: 'c4/en:3.0.1'
+train_split: 'train'
 eval_split: 'validation'
 # for HuggingFace input pipeline (dataset_type=hf)
 hf_path: ''
@@ -342,7 +441,11 @@ hf_access_token: ''
 # for Grain input pipeline (dataset_type=grain)
 grain_train_files: ''
 grain_eval_files: ''
+grain_file_type: 'arrayrecord' # arrayrecord or parquet
 grain_worker_count: 1
+grain_worker_count_eval: 1
+# for using pathways
+colocated_python_data_input: False  # experimental feature, under testing
 
 # Training loop
 steps: 150_001 # If set to -1 then will inherit value from learning_rate_schedule_steps
@@ -394,6 +497,7 @@ profile_periodically_period: -1 # If set to a positive integer, profile every pr
 
 # Dump HLO options
 dump_hlo: False
+dump_step: -1 # Dump modules at the given step if set to a positive integer.
 dump_hlo_local_dir: "/tmp/xla_dump/"
 dump_hlo_delete_local_after: True # Cleans local directory after its uploaded
 dump_hlo_gcs_dir: "" # Defaults to {base_output_directory}/{run_name}/xla_dump
@@ -417,14 +521,18 @@ gradient_clipping_threshold: 1.
 # batch by accumulating the gradient over a set of steps.
 gradient_accumulation_steps: 1
 
+opt_type: "adamw"  # one of "adamw", "adam_pax" or "sgd"
+
 # AdamW optimizer parameters
 # We use AdamW following Llama2's training details, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
-opt_type: "adamw"  # one of "adam_pax" or "adamw"
 adam_b1: 0.9 # Exponential decay rate to track the first moment of past gradients.
 adam_b2: 0.95 # Exponential decay rate to track the second moment of past gradients.
 adam_eps: 1.e-8 # A small constant applied to denominator outside of the square root.
 adam_eps_root: 0. # A small constant applied to denominator inside the square root.
 adam_weight_decay: 0.1 # AdamW Weight decay
+mu_dtype: "" # data type to store "mu" of AdamW tracking the first moment. Inherits from  weight_dtype if unset.
+# Setting nu_dtype is not yet supported by optax, instead nu_dtype is always inherited from weights.
+# See b/399961932 for more.
 
 # Stack trace parameters
 collect_stack_trace: False
@@ -436,9 +544,20 @@ use_iota_embed: False
 # use positional embedding
 use_untrainable_positional_embedding: False
 trainable_position_size: -1  # enable gpt3 position embedding with a positive trainable_position_size
-# Rope parameters
+# RoPE parameters
+rope_type: "default" # one of "default", "llama3.1" or "yarn"
+rope_use_scale: True # apply rope scaling for llama3.1 (see class `LLaMARotaryEmbedding` for more)
 rope_min_timescale: 1
-rope_max_timescale: 10_000
+rope_max_timescale: 10_000 # Timescale For global Attention
+local_rope_max_timescale: -1 # If positive used for local window Attention, otherwise `rope_max_timescale` is used for both local and global
+
+# yarn RoPE parameters
+max_position_embeddings: 163840
+original_max_position_embeddings: 4096
+rope_factor: 40
+beta_fast: 32
+beta_slow: 1
+mscale: 1.0
 
 # Ahead of time Compilation (aka AOT)
 # Only set these arguments if you are running train_compile or loading a compiled train step.
@@ -452,7 +571,7 @@ decode_sampling_top_k: 0 # set if you're doing top-k
 decode_sampling_temperature: 1.
 
 eval_interval: -1  # the specific number of train step between eval_step
-eval_steps: -1  # only run this number of batches for eval, for debugging use
+eval_steps: -1  # run this number of steps for eval, recommend setting this to prevent error due to running out of evel data
 target_eval_loss: 0.  # early stop once reaching target eval_loss
 
 # NOTE(jaxpp): begin parameters
@@ -467,13 +586,19 @@ grad_dtype: "bfloat16"
 # Goodput parameters
 enable_goodput_recording: False
 monitor_goodput: False
-goodput_upload_interval_seconds: 60
+goodput_upload_interval_seconds: 30
 enable_pathways_goodput: False
+monitor_step_time_deviation: True
+step_deviation_interval_seconds: 30
+enable_gcp_goodput_metrics: True
+enable_gcp_step_deviation_metrics: True
 
 # GCP workload monitoring
 report_heartbeat_metric_for_gcp_monitoring: False
 heartbeat_reporting_interval_in_seconds: 5
 report_performance_metric_for_gcp_monitoring: False
+
+enable_tensorboard: True
 
 # Vertex AI Tensorboard Configurations - https://github.com/google/maxtext/tree/main/getting_started/Use_Vertex_AI_Tensorboard.md
 # Set to True for GCE, False if running via XPK
@@ -493,10 +618,16 @@ inference_microbenchmark_prefill_lengths: "64,128,256,512,1024"
 inference_microbenchmark_stages: "prefill,generate"
 inference_microbenchmark_loop_iters: 10
 inference_microbenchmark_log_file_path: ""
+inference_microbenchmark_num_samples: [1, 2, 3, 4, 5]
 inference_metadata_file: "" # path to a json file
 inference_server: "MaxtextInterleavedServer"  # inference server to start
+prefill_slice: "v5e-16" # slice to use for prefill in disaggregation mode
+generate_slice: "v5e-16" # slice to use for generatation in disaggregation mode
 inference_benchmark_test: False
 enable_model_warmup: False
+enable_llm_inference_pool: False          # Bool to launch inference server for llm_inference_gateway with their specified APIs
+multi_sampling: False
+return_log_prob: False
 
 # Stack prefill cache across the layer to reduce the
 # Python layer latency.
@@ -533,6 +664,8 @@ enable_single_controller: False
 custom_mesh: "" # Available options: ['hybrid_ring_64x4', 'hybrid_ring_32x8']
 # Split physical axes for https://jax.readthedocs.io/en/latest/_autosummary/jax.experimental.mesh_utils.create_device_mesh.html
 allow_split_physical_axes: False
+# Apply transformations to the mesh to optimize for TPU v6e
+optimize_mesh_for_tpu_v6e: False
 
 use_ragged_attention: False
 ragged_block_size: 256
@@ -552,3 +685,65 @@ sa_use_fused_bwd_kernel: False
 sa_q_layout: "HEAD_DIM_MINOR"
 sa_k_layout: "HEAD_DIM_MINOR"
 sa_v_layout: "HEAD_DIM_MINOR"
+
+### Determine if we want to use load balance for context parallelism
+context_parallel_load_balance: True
+
+### Paged Attention ###
+# These settings take effect only when `attention=paged`.
+# They should be adjusted based on the available HBM and model config.
+# Note: one page group corresponds to one request/slot
+pagedattn_num_pages: 64  # total number of pages to allocate
+pagedattn_tokens_per_page: 32  # number of tokens each page can hold
+pagedattn_pages_per_compute_block: 4  # number of pages processed together in pallas kernels
+pagedattn_max_pages_per_group: -1  # defaults to number of pages needed to reach max_target_length
+
+
+# Chunked Prefill Parameters
+prefill_chunk_size: 256
+use_chunked_prefill: False
+
+# Prefix Caching parameters in jetstream
+enable_prefix_caching: False
+prefix_caching_hbm_byte: 10_000_000_000 # 10 GB
+prefix_caching_dram_byte: 100_000_000_000 # 100 GB
+
+# This is a temporary flag that will removed soon after the fix lands in TE
+enable_padding_causal_mask: True
+
+# Llama4-specific
+# Whether to apply Query/Key normalization.
+# NOTE: non-Llama4 models use RMSNorm before RoPE
+# whereas Llama4 models use L2Norm after RoPE
+use_qk_norm: False
+# Every `X` layers will NOT use RoPE
+nope_layer_interval: -1
+# Every `X` layers is MoE layer
+interleave_moe_layer_step: 1
+# dynamically scale the attention temperature for each query token based on sequence length
+# Recommended for long sequences (e.g., >32k tokens) to maintain stable output results
+# See (https://arxiv.org/abs/2501.19399) for more details
+temperature_tuning: False
+
+# Multimodal flags
+use_multimodal: False
+freeze_vision_encoder_params: True
+dtype_mm: "float32"  # Data type for multimodal model's vision encoder
+remat_policy_for_vit: "minimal"  # Remat policy for multimodal model's vision encoder. Check `remat_policy` for options.
+image_size_for_vit: 896 # Default for Gemma3, and should be overwritten by model's config
+image_path: "" # Local image path used for decoding
+
+
+### llama4 multi modal configs
+hidden_size_for_vit: 1408 
+intermediate_size_for_vit: 5632
+num_attention_heads_for_vit: 16
+num_channels_for_vit: 3
+patch_size_for_vit: 14
+num_hidden_layers_for_vit: 34
+projector_input_dim_for_vit: 4096
+projector_output_dim_for_vit: 4096
+rope_theta_for_vit: 10000
+vision_output_dim_for_vit: 4096
+pixel_shuffle_ratio_for_vit: 0.5
+projector_dropout_for_vit: 0.0

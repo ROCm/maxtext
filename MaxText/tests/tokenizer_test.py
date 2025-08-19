@@ -18,11 +18,14 @@ limitations under the License.
 """
 
 import numpy as np
-import train_tokenizer
-from input_pipeline import _input_pipeline_utils
+from MaxText import train_tokenizer
+from MaxText.input_pipeline import _input_pipeline_utils
+from MaxText.globals import PKG_DIR
+
 import unittest
 import pytest
 import tensorflow_datasets as tfds
+import subprocess
 import os
 
 
@@ -38,7 +41,9 @@ class TokenizerTest(unittest.TestCase):
     assets_path = "tests"
     vocab_model_name = "test_tokenizer"
     cls.tokenizer_path = os.path.join(assets_path, vocab_model_name)
-    cls.source_tokenizer = _input_pipeline_utils.get_tokenizer("../assets/tokenizer", add_bos=False, add_eos=False)
+    cls.source_tokenizer = _input_pipeline_utils.get_tokenizer(
+        os.path.join(os.path.dirname(PKG_DIR), "assets", "tokenizer"), "sentencepiece", add_bos=False, add_eos=False
+    )
     os.environ["TFDS_DATA_DIR"] = dataset_path
     read_config = tfds.ReadConfig(
         shuffle_seed=0,
@@ -51,7 +56,9 @@ class TokenizerTest(unittest.TestCase):
         vocab_size=cls.vocab_size,
         max_corpus_chars=cls.max_corpus_chars,
     )
-    cls.test_tokenizer = _input_pipeline_utils.get_tokenizer(cls.tokenizer_path, add_bos=False, add_eos=False)
+    cls.test_tokenizer = _input_pipeline_utils.get_tokenizer(
+        cls.tokenizer_path, "sentencepiece", add_bos=False, add_eos=False
+    )
 
   @classmethod
   def tearDownClass(cls):
@@ -77,7 +84,10 @@ class TikTokenTest(unittest.TestCase):
     dataset_name = "c4/en:3.0.1"
     dataset_path = "gs://maxtext-dataset"
     cls.source_tokenizer = _input_pipeline_utils.get_tokenizer(
-        "../assets/tokenizer_llama3.tiktoken", add_bos=False, add_eos=False
+        os.path.join(os.path.dirname(PKG_DIR), "assets", "tokenizer_llama3.tiktoken"),
+        "tiktoken",
+        add_bos=False,
+        add_eos=False,
     )
     os.environ["TFDS_DATA_DIR"] = dataset_path
     read_config = tfds.ReadConfig(
@@ -97,6 +107,30 @@ class TikTokenTest(unittest.TestCase):
     tokens = [2028, 374, 264, 1296]
     text = "This is a test"
     self.assertEqual(np.asarray(self.source_tokenizer.decode(tokens)), np.asarray(text))
+
+
+class HFTokenizerTest(unittest.TestCase):
+  """Tests for HFTokenizer"""
+
+  @classmethod
+  def setUpClass(cls):
+    source = "gs://maxtext-gemma/huggingface/gemma2-2b"
+    destination = os.path.join(os.path.dirname(PKG_DIR), "assets")
+    subprocess.run(
+        ["gcloud", "storage", "cp", "-R", source, destination],
+        check=True,
+    )
+    cls.hf_tokenizer = _input_pipeline_utils.get_tokenizer(
+        os.path.join(os.path.dirname(PKG_DIR), "assets", "gemma2-2b"), "huggingface", add_bos=False, add_eos=False
+    )
+    cls.sp_tokenizer = _input_pipeline_utils.get_tokenizer(
+        os.path.join(os.path.dirname(PKG_DIR), "assets", "tokenizer.gemma"), "sentencepiece", add_bos=False, add_eos=False
+    )
+
+  @pytest.mark.tpu_only
+  def test_tokenize(self):
+    text = "This is a test"
+    self.assertTrue(np.array_equal(self.hf_tokenizer.encode(text), self.sp_tokenizer.encode(text)))
 
 
 if __name__ == "__main__":

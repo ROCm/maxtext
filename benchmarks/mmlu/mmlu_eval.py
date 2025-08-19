@@ -14,28 +14,29 @@
 
 """This is a simple script for MMLU benchmark for a trained checkpoint.
 
-To get optimal performace the prompt template needs to be adjusted (e.g. CoT or 5-shot prompt) per model.
+To get optimal performance the prompt template needs to be adjusted (e.g. CoT or 5-shot prompt) per model.
 
 
 To run the MMLU benchmark:
-python3  MaxText/benchmarks/mmlu/mmlu_eval.py  MaxText/configs/base.yml \
-tokenizer_path=assets/tokenizer_llama3.tiktoken \
-load_parameters_path=check_point_path model_name=llama3.1-8b \
-max_prefill_predict_length=1024 max_target_length=2048 ici_tensor_parallelism=4  per_device_batch_size=1
+python3 -m MaxText.benchmarks.mmlu.mmlu_eval MaxText/configs/base.yml \
+  tokenizer_path=assets/tokenizer_llama3.tiktoken \
+  load_parameters_path=check_point_path model_name=llama3.1-8b \
+  max_prefill_predict_length=1024 max_target_length=2048 ici_tensor_parallelism=4  per_device_batch_size=1
 
 # Example of using the prompt_template flag for Chain-of-Thought (CoT) prompting:
-python3 MaxText/benchmarks/mmlu/mmlu_eval.py MaxText/configs/base.yml \
-tokenizer_path=assets/tokenizer_llama3.tiktoken \
-load_parameters_path=check_point_path model_name=llama3.1-8b \
-max_prefill_predict_length=1024 max_target_length=2048 ici_tensor_parallelism=4 per_device_batch_size=1 \
-prompt_template="The following are multiple choice questions (with answers) about {subject}.\n\n{question}\n{choices}\nAnswer: Let's think step by step."
+python3 -m MaxText.benchmarks.mmlu.mmlu_eval MaxText/configs/base.yml \
+  tokenizer_path=assets/tokenizer_llama3.tiktoken \
+  load_parameters_path=check_point_path model_name=llama3.1-8b \
+  max_prefill_predict_length=1024 max_target_length=2048 ici_tensor_parallelism=4 per_device_batch_size=1 \
+  prompt_template="The following are multiple choice questions (with answers) about {subject}.\n\n{question}\n
+  {choices}\nAnswer: Let's think step by step."
 
 # Example of using the prompt_template flag for 5-shot prompting (replace with actual examples):
-python3 MaxText/benchmarks/mmlu/mmlu_eval.py MaxText/configs/base.yml \
-tokenizer_path=assets/tokenizer_llama3.tiktoken \
-load_parameters_path=check_point_path model_name=llama3.1-8b \
-max_prefill_predict_length=1024 max_target_length=2048 ici_tensor_parallelism=4 per_device_batch_size=1 \
-prompt_template='Example 1:\nQuestion: What is the capital of France?\nChoices:\nA. London\nB. Paris\nC. Rome\nD. Berlin\nAnswer: B\n\nExample 2:\nQuestion: What is the highest mountain in the world?\nChoices:\nA. K2\nB. Kangchenjunga\nC. Mount Everest\nD. Lhotse\nAnswer: C\n\nExample 3:\nQuestion: What is the chemical symbol for water?\nChoices:\nA. H2O\nB. CO2\nC. O2\nD. NaCl\nAnswer: A\n\nExample 4:\nQuestion: Who painted the Mona Lisa?\nChoices:\nA. Michelangelo\nB. Leonardo da Vinci\nC. Raphael\nD. Donatello\nAnswer: B\n\nExample 5:\nQuestion: Which planet is known as the Red Planet?\nChoices:\nA. Venus\nB. Mars\nC. Jupiter\nD. Saturn\nAnswer: B\n\nThe following are multiple choice questions (with answers) about {subject}.\n\n{question}\n{choices}\nAnswer:'
+python3 -m MaxText.benchmarks.mmlu.mmlu_eval MaxText/configs/base.yml \
+  tokenizer_path=assets/tokenizer_llama3.tiktoken \
+  load_parameters_path=check_point_path model_name=llama3.1-8b \
+  max_prefill_predict_length=1024 max_target_length=2048 ici_tensor_parallelism=4 per_device_batch_size=1 \
+  prompt_template='Example 1:\nQuestion: What is the capital of France?\nChoices:\nA. London\nB. Paris\nC. Rome\nD. Berlin\nAnswer: B\n\nExample 2:\nQuestion: What is the highest mountain in the world?\nChoices:\nA. K2\nB. Kangchenjunga\nC. Mount Everest\nD. Lhotse\nAnswer: C\n\nExample 3:\nQuestion: What is the chemical symbol for water?\nChoices:\nA. H2O\nB. CO2\nC. O2\nD. NaCl\nAnswer: A\n\nExample 4:\nQuestion: Who painted the Mona Lisa?\nChoices:\nA. Michelangelo\nB. Leonardo da Vinci\nC. Raphael\nD. Donatello\nAnswer: B\n\nExample 5:\nQuestion: Which planet is known as the Red Planet?\nChoices:\nA. Venus\nB. Mars\nC. Jupiter\nD. Saturn\nAnswer: B\n\nThe following are multiple choice questions (with answers) about {subject}.\n\n{question}\n{choices}\nAnswer:'   # pylint: disable=line-too-long
 """
 
 import collections
@@ -43,16 +44,20 @@ import re
 import sys
 
 from absl import flags
+
 import datasets
+
 import jax
-import max_logging
-import max_utils
-import maxengine
+
 from mmlu_categories import categories
 from mmlu_categories import subcategories
-import pyconfig
+
 from tqdm import tqdm
 
+from MaxText import pyconfig
+from MaxText import max_logging
+from MaxText import max_utils
+from MaxText import maxengine
 
 ASCII_UPPERCASE_A = ord("A")  # ASCII value for uppercase 'A'
 
@@ -118,6 +123,7 @@ def main(config):
       tokens = tokens[:max_prefill_predict_length]
       true_length = max_prefill_predict_length
     assert config.quantization != "fp8", "fp8 on NVIDIA GPUs is not supported in decode.py yet"
+    assert config.quantization != "nanoo_fp8", "NANOO fp8 on AMD MI300/MI325 GPUs is not supported in decode.py yet"
 
     # Perform prefill
     prefill_result, first_token = engine.prefill(params=params, padded_tokens=tokens, true_length=true_length)
@@ -217,8 +223,7 @@ def validate_config(config):
 if __name__ == "__main__":
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
   flags.FLAGS(sys.argv)
-  pyconfig.initialize(sys.argv)
-  cfg = pyconfig.config
+  cfg = pyconfig.initialize(sys.argv)
   validate_config(cfg)
   max_utils.print_system_information()
   main(cfg)

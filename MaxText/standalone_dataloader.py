@@ -11,23 +11,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# pylint: disable=g-bad-todo, abstract-method, consider-using-with, ungrouped-imports
+# pylint: disable=g-bad-todo, abstract-method, consider-using-with
 """ Standalone data loader - only loads data for each training step, accesses storage needs."""
 
 # Calling jax.device_count here prevents a "TPU platform already registered" error.
 # See github.com/google/maxtext/issues/20 for more
-import jax
 import os
-
-import max_logging
-
 from typing import Sequence
 import datetime
+
 from absl import app
+
 import numpy as np
 
-import pyconfig
-from train import validate_train_config, get_first_step, load_next_batch, setup_train_loop
+import jax
+
+from MaxText import max_logging
+from MaxText import pyconfig
+from MaxText.train import validate_train_config, get_first_step, load_next_batch, setup_train_loop
 
 
 def data_load_loop(config, state=None):
@@ -60,8 +61,7 @@ def data_load_loop(config, state=None):
 def main(argv: Sequence[str]) -> None:
   jax.config.update("jax_cpu_enable_gloo_collectives", True)
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
-  pyconfig.initialize(argv)
-  config = pyconfig.config
+  config = pyconfig.initialize(argv)
   validate_train_config(config)
   max_logging.log(f"Found {jax.device_count()} devices.")
   max_logging.log(f"Found {jax.process_count()} processes.")

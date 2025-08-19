@@ -15,16 +15,21 @@ limitations under the License.
 """
 
 """ Tests for the quantizations """
+import unittest
+import os.path
+
+import numpy as np
+
 from jax import numpy as jnp
 from jax import random, lax
+
 from flax import linen as nn
-import functools
-import numpy as np
-import pyconfig
-from layers import quantizations
-import unittest
+
 from aqt.jax.v2 import aqt_tensor
-from aqt.jax.v2 import calibration
+
+from MaxText.globals import PKG_DIR
+from MaxText import pyconfig
+from MaxText.layers import quantizations
 
 _QUERY_REGEX = ".*/query"
 _VALUE_REGEX = ".*/value"
@@ -50,14 +55,13 @@ class QuantTestModule(nn.Module):
 
 
 def _configure_quantization(quant_str="", quant_cfg_path="", mode_str="train", replicate_scale=False):
-  pyconfig.initialize(
-      [None, "configs/base.yml"],
+  config = pyconfig.initialize(
+      [None, os.path.join(PKG_DIR, "configs", "base.yml")],
       enable_checkpointing=False,
       quantization=quant_str,
       quant_cfg_path=quant_cfg_path,
       replicate_quant_scale=replicate_scale,
   )
-  config = pyconfig.config
   quant = quantizations.configure_quantization(config, mode_str)
   return quant
 
@@ -115,29 +119,37 @@ class QuantizationTest(unittest.TestCase):
     # self.assertEqual(res_dg.dtype, np.dtype(np.float32))
 
   def test_mixed_precision_config_int8w(self):
-    quant = _configure_quantization(quant_str="intmp", quant_cfg_path="configs/quantization/int8_weight_only.json")
+    quant = _configure_quantization(
+        quant_str="intmp", quant_cfg_path=os.path.join(PKG_DIR, "configs", "quantization", "int8_weight_only.json")
+    )
     self.assertTrue(isinstance(quant.quant_dg, dict) and len(quant.quant_dg) == 1)
+    # pylint: disable=unsupported-membership-test
     self.assertTrue(quantizations.DEFAULT in quant.quant_dg)
-    quant_cfg, tile_size = quant.quant_dg[quantizations.DEFAULT]
+    quant_cfg, _ = quant.quant_dg[quantizations.DEFAULT]
     self.assertEqual(quant_cfg.fwd.dg_quantizer.lhs.numerics.dtype, None)
     self.assertEqual(quant_cfg.fwd.dg_quantizer.rhs.numerics.bits, 8)
 
   def test_mixed_precision_config_scale(self):
     quant = _configure_quantization(
-        quant_str="intmp", quant_cfg_path="configs/quantization/dense_llm_weight_only_scale.json"
+        quant_str="intmp",
+        quant_cfg_path=os.path.join(PKG_DIR, "configs", "quantization", "dense_llm_weight_only_scale.json"),
     )
     self.assertTrue(isinstance(quant.quant_dg, dict) and len(quant.quant_dg) == 7)
+    # pylint: disable=unsupported-membership-test
     self.assertTrue(quantizations.DEFAULT in quant.quant_dg)
-    quant_cfg, tile_size = quant.quant_dg[quantizations.DEFAULT]
+    quant_cfg, _ = quant.quant_dg[quantizations.DEFAULT]
     self.assertEqual(quant_cfg.fwd.dg_quantizer.lhs.numerics.dtype, None)
     self.assertEqual(quant_cfg.fwd.dg_quantizer.rhs.numerics.bits, 8)
-    quant_cfg, tile_size = quant.quant_dg[_QUERY_REGEX]
+    quant_cfg, _ = quant.quant_dg[_QUERY_REGEX]
     self.assertEqual(quant_cfg.fwd.dg_quantizer.lhs.numerics.dtype, None)
     self.assertEqual(quant_cfg.fwd.dg_quantizer.rhs.numerics.bits, 4)
 
   def test_mixed_precision_config_subchannel(self):
-    quant = _configure_quantization(quant_str="intmp", quant_cfg_path="configs/quantization/dense_llm_subchannel.json")
+    quant = _configure_quantization(
+        quant_str="intmp", quant_cfg_path=os.path.join(PKG_DIR, "configs", "quantization", "dense_llm_subchannel.json")
+    )
     self.assertTrue(isinstance(quant.quant_dg, dict) and len(quant.quant_dg) == 7)
+    # pylint: disable=unsupported-membership-test
     self.assertTrue(quantizations.DEFAULT in quant.quant_dg)
     quant_cfg, tile_size = quant.quant_dg[quantizations.DEFAULT]
     self.assertEqual(quant_cfg.fwd.dg_quantizer.lhs.numerics.bits, 8)

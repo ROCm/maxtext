@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Evaluate accuracy… fast!"""
+
 import argparse
 import evaluate
 import json
@@ -59,6 +61,7 @@ def aggregate_rouge_scores(chunk_results: List[Dict]) -> Dict:
 
 
 def get_args():
+  """Parse command line arguments, returning argparse.Namespace from it"""
   parser = argparse.ArgumentParser()
   parser.add_argument("--mlperf-accuracy-file", required=True, help="path to mlperf_log_accuracy.json")
   parser.add_argument("--dataset-file", required=True, help="path to processed openorca validation set")
@@ -149,7 +152,7 @@ def main():
   eval_dtype = {"int32": np.int32, "int64": np.int64, "float": np.float32}[args.dtype]
 
   print(f"Loading accuracy log from {args.mlperf_accuracy_file}")
-  with open(args.mlperf_accuracy_file, "r") as f:
+  with open(args.mlperf_accuracy_file, "rt", encoding="utf8") as f:
     results = json.load(f)
 
   # Split results into chunks for parallel processing

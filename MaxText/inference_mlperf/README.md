@@ -6,9 +6,11 @@ Follow these [instructions](https://cloud.google.com/tpu/docs/v5e-inference#tpu-
 
 
 ### Setup a virtual env
+```
 sudo apt install python3.10-venv
-python -m venv .env
+python3 -m venv .env
 source .env/bin/activate
+```
 
 ### Install loadgen
 ```
@@ -16,7 +18,7 @@ sudo apt-get install python3-dev
 sudo apt-get install build-essential -y
 git clone git@github.com:mlcommons/inference.git
 cd inference/
-cd loadgen/ && pip install .
+cd loadgen/ && python3 -m pip install .
 ```
 
 ### Download datasets
@@ -52,7 +54,7 @@ cd ~
 git clone git@github.com:google/maxtext.git
 cd maxtext
 bash setup.sh
-pip install -r MaxText/inference_mlperf/requirements.txt
+python3 -m pip install -r MaxText/inference_mlperf/requirements.txt
 ```
 
 ### Generate quantized checkpoint
@@ -88,13 +90,35 @@ export SAVE_QUANT_PARAMS_PATH=gs://${USER}-bkt/quantized/llama2-70b-chat
 # other tokenizers under maxtext/assets/ directory.
 export TOKENIZER_PATH=maxtext/assets/tokenizer.llama2
 cd maxtext && \
-python MaxText/decode.py MaxText/configs/base.yml tokenizer_path=${TOKENIZER_PATH} load_parameters_path=${LOAD_PARAMS_PATH} max_prefill_predict_length=1024 max_target_length=2048 model_name=llama2-70b ici_fsdp_parallelism=1 ici_autoregressive_parallelism=1 ici_tensor_parallelism=-1 scan_layers=false weight_dtype=bfloat16 per_device_batch_size=11 attention=dot_product quantization=int8 save_quantized_params_path=${SAVE_QUANT_PARAMS_PATH}
+python3 -m MaxText.decode MaxText/configs/base.yml tokenizer_path=${TOKENIZER_PATH} load_parameters_path=${LOAD_PARAMS_PATH} max_prefill_predict_length=1024 max_target_length=2048 model_name=llama2-70b ici_fsdp_parallelism=1 ici_autoregressive_parallelism=1 ici_tensor_parallelism=-1 scan_layers=false weight_dtype=bfloat16 per_device_batch_size=11 attention=dot_product quantization=int8 save_quantized_params_path=${SAVE_QUANT_PARAMS_PATH}
 ```
 
-
-
-
 Your checkpoint is generated at `$SAVE_QUANT_PARAMS_PATH`. This is used to set `load_parameters_path` param below in `MAXENGINE_ARGS` env variable.
+
+#### CPU based quantization with Llama3.1-405b:
+
+The llama3.1-405b model takes about 800GB of memory. This does not fit in TPU machines and must be downloaded onto a large CPU machine (such as `m1-ultramem-160`) and quantized to a smaller quantized checkpoint (~400GB) to be loaded to TPUs for serving. After obtaining a llama3.1-405b checkpoint and converting it to a maxtext inference checkpoint, you can convert the checkpoint to a quantized checkpoint:
+
+1. Define paths to load maxtext checkpoint from and save quantized checkpoint to
+
+```
+export LOAD_PARAMS_PATH=gs://${USER}-bkt/llama3.1-405b/param-only-decode-ckpt-maxtext/checkpoints/0/items
+
+export SAVE_QUANT_PARAMS_PATH=gs://${USER}-bkt/quantized/llama3.1-405b
+```
+
+2. Run the following maxtext script to generate and save an int8 quantized checkpoint
+
+```
+export TOKENIZER_PATH=assets/tokenizer_llama3.tiktoken
+export MODEL_SIZE=llama3.1-405b
+export QUANTIZE_TYPE=int8
+
+cd maxtext && \
+python3 -m MaxText.load_and_quantize_checkpoint MaxText/configs/base.yml tokenizer_path=${TOKENIZER} load_parameters_path=${LOAD_PARAMS_PATH} max_prefill_predict_length=1024 max_target_length=2048 model_name=${MODEL_SIZE} ici_fsdp_parallelism=1 ici_autoregressive_parallelism=1 ici_tensor_parallelism=-1 scan_layers=false weight_dtype=bfloat16 per_device_batch_size=1 attention=dot_product quantization=${QUANTIZE_TYPE} save_quantized_params_path=${SAVE_QUANT_PARAMS_PATH} async_checkpointing=false
+```
+
+The quantized checkpoint is saved at `${SAVE_QUANT_PARAMS_PATH}`
 
 ### HuggingFace login
 ```
@@ -102,82 +126,71 @@ export HUGGING_FACE_TOKEN=<your_hugging_face_token>
 huggingface-cli login --token $HUGGING_FACE_TOKEN
 ```
 
-### Offline Server - Test Run
+### Run Offline Benchmarks
+
+#### For trillium
 #### LLama2-70b:
 ```
-cd ~/maxtext/MaxText/inference_mlperf
-export TOKENIZER_PATH="/home/${USER}/maxtext/assets/tokenizer.llama2
-export BATCH_AND_PREFILL_LEN="1024,20"
-export MAXENGINE_ARGS="model_name=llama2-70b tokenizer_path=${TOKENIZER_PATH}  quantization=int8 quantize_kvcache=True load_parameters_path=${SAVE_QUANT_PARAMS_PATH} checkpoint_is_quantized=True"
-
-bash ./llama_offline_run.sh -p -t
+cd ~/maxtext/MaxText/inference_mlperf/trillium
 ```
+
+##### Test Run
+```
+bash benchmarks_llama2-70b-trillium_2x4.sh -b=performance -t
+```
+
+##### Performance Only:
+```
+bash benchmarks_llama2-70b-trillium_2x4.sh -b=performance
+```
+
+##### Accuracy Only:
+```
+bash benchmarks_llama2-70b-trillium_2x4.sh -b=accuracy
+```
+
+##### Audit Only:
+```
+bash benchmarks_llama2-70b-trillium_2x4.sh -b=audit
+```
+
+##### Run all benchmarks:
+```
+bash benchmarks_llama2-70b-trillium_2x4.sh -b=all
+```
+
 #### Mixtral-8x7b:
 ```
-cd ~/maxtext/MaxText/inference_mlperf
-export TOKENIZER_PATH="/home/${USER}/maxtext/assets/tokenizer.mistral-v1
-export BATCH_AND_PREFILL_LEN="2048,18"
-export MAXENGINE_ARGS="model_name=mixtral-8x7b tokenizer_path=${TOKENIZER_PATH}  quantization=int8 quantize_kvcache=True load_parameters_path=${SAVE_QUANT_PARAMS_PATH} checkpoint_is_quantized=True megablox=False sparse_matmul=False capacity_factor=1 model_call_mode=inference"
-
-bash ./mixtral_offline_run.sh -p -t
-```
-
-### Offline Benchmarks
-
-#### For v5e
-```
-export BATCH_AND_PREFILL_LEN="256,80|512,40|1024,20"
-export MAXENGINE_ARGS="model_name=llama2-70b tokenizer_path=${TOKENIZER_PATH}  quantization=int8 quantize_kvcache=True load_parameters_path=${SAVE_QUANT_PARAMS_PATH} checkpoint_is_quantized=True compute_axis_order=0,1,2,3 ar_cache_axis_order=0,1,2,3"
-```
-
-#### For v6
-#### LLama2-70b:
-```
-export BATCH_AND_PREFILL_LEN=“256,216|512,108|1024,54”
-export MAXENGINE_ARGS="model_name=llama2-70b tokenizer_path=${TOKENIZER_PATH}  quantization=int8 quantize_kvcache=True load_parameters_path=${SAVE_QUANT_PARAMS_PATH} checkpoint_is_quantized=True compute_axis_order=0,2,1,3 ar_cache_axis_order=0,2,1,3"
-```
-#### Mixtral-8x7b:
-export BATCH_AND_PREFILL_LEN="256,144|512,72|2048,18"
+export PREFILL_LENS_AND_PER_DEVICE_BATCH_SIZES="256,144|512,72|2048,18"
 export MAXENGINE_ARGS="model_name=mixtral-8x7b tokenizer_path=${TOKENIZER_PATH}  quantization=int8 quantize_kvcache=True load_parameters_path=${SAVE_QUANT_PARAMS_PATH} checkpoint_is_quantized=True megablox=False sparse_matmul=False capacity_factor=1 model_call_mode=inference compute_axis_order=0,2,1,3 ar_cache_axis_order=0,2,1,3"
-
-#### Run offline performance benchmark
-#### LLama2-70b:
-```
-bash ./llama_offline_run.sh -p
-```
-#### Mixtral-8x7b:
-```
-bash ./mixtral_offline_run.sh -p
 ```
 
-#### Run offline accuracy benchmark
-#### LLama2-70b:
+##### Test Run
 ```
-bash ./llama_offline_run.sh -a
+bash ./mixtral_offline_run.sh -t
 ```
-#### Mixtral-8x7b:
+
+##### Performance Only:
+```
+bash ./mixtral_offline_run.sh
+```
+
+##### Accuracy Only:
 ```
 bash ./mixtral_offline_run.sh -a
 ```
 
-#### Run offline audit benchmark
-#### LLama2-70b:
-```
-bash ./llama_offline_run.sh -d
-
-```
-#### Mixtral-8x7b:
+##### Audit Only:
 ```
 bash ./mixtral_offline_run.sh -d
 ```
-
 
 ### Profiling
 
 ```
 # Capture profile
 bash ./llama_offline_run.sh -p -e
-python -m jax.collect_profile 9999 2000 --log_dir /tmp/profiles --no_perfetto_link
+python3 -m jax.collect_profile 9999 2000 --log_dir /tmp/profiles --no_perfetto_link
 
 # View profile
 tensorboard --logdir /tmp/profiles

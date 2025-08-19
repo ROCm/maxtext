@@ -14,40 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from flax import linen as nn
-import common_types
-import jax.numpy as jnp
-from jax.ad_checkpoint import checkpoint_name
-
-from layers import normalizations
-from layers import attentions
-from layers import initializers
-from layers import embeddings
-from layers import linears
-from layers import quantizations
-
 from typing import Optional
 
-Embed = embeddings.Embed
-RMSNorm = normalizations.RMSNorm
-NdInitializer = initializers.NdInitializer
-Attention = attentions.Attention
-MlpBlock = linears.MlpBlock
-Config = common_types.Config
-AxisNames = common_types.AxisNames
-Mesh = common_types.Mesh
-ScanIn = common_types.ScanIn
-DType = common_types.DType
-Array = common_types.Array
-BATCH = common_types.BATCH
-LENGTH = common_types.LENGTH
-HEAD = common_types.HEAD
-D_KV = common_types.D_KV
+from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import Mesh
+import jax.numpy as jnp
 
+from flax import linen as nn
 
-nd_dense_init = initializers.nd_dense_init
-Quant = quantizations.AqtQuantization
-KVQuant = quantizations.KVQuant
+from MaxText.common_types import Config
+from MaxText.layers import quantizations
+from MaxText.layers.attentions import Attention
+from MaxText.layers.linears import MlpBlock
+from MaxText.layers.normalizations import RMSNorm
+from MaxText.layers.quantizations import AqtQuantization as Quant
 
 
 # Decoder and Model definitions
@@ -66,6 +46,10 @@ class GemmaDecoderLayer(nn.Module):
       decoder_positions,
       deterministic,
       model_mode,
+      previous_chunk=None,
+      page_manager=None,
+      page_state=None,
+      slot=None,
   ):
     cfg = self.config
     mesh = self.mesh
@@ -91,8 +75,8 @@ class GemmaDecoderLayer(nn.Module):
         weight_dtype=cfg.weight_dtype,
         dropout_rate=cfg.dropout_rate,
         name="self_attention",
-        float32_qk_product=True,
-        float32_logits=True,
+        float32_qk_product=cfg.float32_qk_product,
+        float32_logits=cfg.float32_logits,
         quant=self.quant,
         kv_quant=quantizations.configure_kv_quant(cfg),
         use_ragged_attention=cfg.use_ragged_attention,

@@ -16,23 +16,30 @@ limitations under the License.
 """
 
 """Input pipeline"""
+from collections.abc import Callable
+from typing import Any
 import functools
-import itertools as it
+
 import numpy as np
+
 import tensorflow as tf
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from input_pipeline._tfds_data_processing import make_tfds_train_iterator, make_tfds_eval_iterator
-from input_pipeline._grain_data_processing import make_grain_train_iterator, make_grain_eval_iterator
-from input_pipeline._tfds_data_processing_c4_mlperf import make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator
-from input_pipeline._hf_data_processing import make_hf_train_iterator, make_hf_eval_iterator
-import multihost_dataloading
-import max_logging
+from MaxText import multihost_dataloading
+from MaxText import pyconfig
+from MaxText.input_pipeline._grain_data_processing import make_grain_train_iterator, make_grain_eval_iterator
+from MaxText.input_pipeline._hf_data_processing import make_hf_train_iterator, make_hf_eval_iterator
+from MaxText.input_pipeline._tfds_data_processing import make_tfds_train_iterator, make_tfds_eval_iterator
+from MaxText.input_pipeline._tfds_data_processing_c4_mlperf import make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator
+
 
 class SyntheticDataIterator:
   """Creates a synthetic data iterator for performance testing work"""
+
+  data_generator: Callable[[pyconfig.HyperParameters, tuple[Any, ...]], dict]
 
   def __init__(self, config, mesh):
     self.mesh = mesh
@@ -61,10 +68,10 @@ class SyntheticDataIterator:
 
   def __next__(self):
     with self.mesh:
-      return self.data_generator(self.config, self.data)
+      return self.data_generator(self.config, self.data)  # pylint: disable=not-callable
 
   @staticmethod
-  def raw_generate_synthetic_data(config, data):
+  def raw_generate_synthetic_data(config: pyconfig.HyperParameters, data):
     """Generates a single batch of synthetic data"""
     tokens, positions, segmentation = data
 
@@ -81,7 +88,7 @@ class SyntheticDataIterator:
 class BadSyntheticDataIterator:
   """Creates a Bad synthetic data iterator for loading on subset of hosts"""
 
-  def __init__(self, config, mesh):
+  def __init__(self, config: pyconfig.HyperParameters, mesh):
     self.mesh = mesh
     dataset = BadSyntheticDataIterator.get_bad_synthetic_data(config)
     self.data_generator = multihost_dataloading.MultiHostDataLoadIterator(dataset, self.mesh)
@@ -93,7 +100,7 @@ class BadSyntheticDataIterator:
     return next(self.data_generator)
 
   @staticmethod
-  def get_bad_synthetic_data(config):
+  def get_bad_synthetic_data(config: pyconfig.HyperParameters):
     """fill negative value in synthetic data"""
     output = {}
     output["inputs"] = tf.data.Dataset.from_tensor_slices(np.full((1, config.max_target_length), -1, dtype=jax.numpy.int32))
@@ -133,9 +140,10 @@ def get_process_loading_real_data(
   return list(process_loading_real_data)
 
 
-def make_mixed_iterator(config, mesh, process_indices_train, process_indices_eval, train_iterator_fn, eval_iterator_fn):
+def make_mixed_iterator(
+    config: pyconfig.HyperParameters, mesh, process_indices_train, process_indices_eval, train_iterator_fn, eval_iterator_fn
+):
   """Return iterators according to dataset_type"""
-  # train_iterator, eval_iterator = make_tfds_iterator(config, mesh, process_indices_train, process_indices_eval)
   if jax.process_index() in process_indices_train:
     train_iterator = train_iterator_fn()
   else:
@@ -154,7 +162,8 @@ def make_mixed_iterator(config, mesh, process_indices_train, process_indices_eva
   return train_iterator, eval_iterator
 
 
-def create_data_iterator(config, mesh):
+def create_data_iterator(config: pyconfig.HyperParameters, mesh):
+  """create data iterator"""
   if config.use_jaxpp and config.jaxpp_remote:
     mesh = jax.sharding.Mesh(np.array(jax.devices('cpu')).reshape((1,) * mesh.devices.ndim), mesh.axis_names)
 
@@ -195,22 +204,9 @@ def create_data_iterator(config, mesh):
     train_iterator_fn = functools.partial(make_hf_train_iterator, config, mesh, process_indices_train)
     eval_iterator_fn = functools.partial(make_hf_eval_iterator, config, mesh, process_indices_eval)
   elif config.dataset_type == "c4_mlperf":
+    assert config.packing, "c4_mlperf dataloader only works with packing. For padded version, use tfds dataloader"
     train_iterator_fn = functools.partial(make_c4_mlperf_train_iterator, config, mesh, process_indices_train)
     eval_iterator_fn = functools.partial(make_c4_mlperf_eval_iterator, config, mesh, process_indices_eval)
   else:
     assert False, f"Unknown dataset_type {config.dataset_type}, dataset_type must be synthetic, tfds, grain, hf or c4_mlperf"
   return make_mixed_iterator(config, mesh, process_indices_train, process_indices_eval, train_iterator_fn, eval_iterator_fn)
-
-
-def get_shaped_batch(config):
-  """Return the shape of the batch - this is what eval_shape would return for the
-  output of create_data_iterator, but eval_shape doesn't work, see b/306901078."""
-  batch_shape = (config.global_batch_size_to_load, config.max_target_length)
-  shaped_batch = {}
-  shaped_batch["inputs"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["inputs_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["inputs_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["targets"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["targets_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  shaped_batch["targets_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
-  return shaped_batch

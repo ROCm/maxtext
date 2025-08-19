@@ -48,7 +48,7 @@ gcloud auth login
 
 * Run this command to configure docker to use docker-credential-gcloud for GCR registries:
 ```
-gcloud auth configure-docker us-docker.pkg.dev
+gcloud auth configure-docker
 ```
 
 * Test the installation by running
@@ -79,21 +79,32 @@ after which log out and log back in to the machine.
     bash docker_build_dependency_image.sh
     ```
 
-    #### New: Build Maxtext Docker Image with JAX Stable Stack
-    We're excited to announce that you can build the Maxtext Docker image using the JAX Stable Stack base image. This provides a more reliable and consistent build environment.
+    #### Build Maxtext Docker Image with JAX Stable Stack (Preview)
+    We're excited to announce the preview of building Maxtext Docker images using the JAX Stable Stack base image, available for both TPUs and GPUs. This provides a more reliable and consistent build environment.
 
     ###### What is JAX Stable Stack?
     JAX Stable Stack provides a consistent environment for Maxtext by bundling JAX with core packages like `orbax`, `flax`, and `optax`, along with Google Cloud utilities and other essential tools. These libraries are tested to ensure compatibility, providing a stable foundation for building and running Maxtext and eliminating potential conflicts due to incompatible package versions.
 
     ###### How to Use It
-    To build the Maxtext Docker image with JAX Stable Stack, simply set the MODE to `stable_stack` and specify the desired `BASEIMAGE` in the `docker_build_dependency_image.sh` script:
+    Use the `docker_build_dependency_image.sh` script to build your Maxtext Docker image with JAX Stable Stack. Set MODE to `stable_stack` and specify the desired `BASEIMAGE`. The `DEVICE` variable determines whether to build for TPUs or GPUs.
+
+    ###### For TPUs:
     
     ```
-    # Example bash docker_build_dependency_image.sh MODE=stable_stack BASEIMAGE=us-docker.pkg.dev/cloud-tpu-images/jax-stable-stack/tpu:jax0.4.33-rev1
-    bash docker_build_dependency_image.sh MODE=stable_stack BASEIMAGE={{JAX_STABLE_STACK_BASEIMAGE}}
+    # Example: bash docker_build_dependency_image.sh DEVICE=tpu MODE=stable_stack BASEIMAGE=us-docker.pkg.dev/cloud-tpu-images/jax-stable-stack/tpu:jax0.4.37-rev1
+    bash docker_build_dependency_image.sh DEVICE=tpu MODE=stable_stack BASEIMAGE={{JAX_STABLE_STACK_TPU_BASEIMAGE}}
     ```
 
     You can find a list of available JAX Stable Stack base images [here](https://us-docker.pkg.dev/cloud-tpu-images/jax-stable-stack/tpu).
+
+    ###### [New] For GPUs:
+
+    ```
+    # Example bash docker_build_dependency_image.sh DEVICE=gpu MODE=stable_stack BASEIMAGE=us-central1-docker.pkg.dev/deeplearning-images/jax-stable-stack/gpu:jax0.4.37-cuda_dl24.10-rev1
+    bash docker_build_dependency_image.sh MODE=stable_stack BASEIMAGE={{JAX_STABLE_STACK_BASEIMAGE}}
+    ```
+
+    You can find a list of available JAX Stable Stack base images [here](https://us-central1-docker.pkg.dev/deeplearning-images/jax-stable-stack/gpu).
 
     **Important Note:** The JAX Stable Stack is currently in the experimental phase. We encourage you to try it out and provide feedback.
 
@@ -112,7 +123,7 @@ after which log out and log back in to the machine.
       DATASET_PATH=gs://dataset_bucket/
 
       # Install xpk
-      pip install xpk
+      python3 -m pip install xpk
 
       # Make sure you are still in the maxtext github root directory when running this command
       xpk workload create \
@@ -121,7 +132,7 @@ after which log out and log back in to the machine.
       --workload ${USER}-first-job \
       --tpu-type=v5litepod-256 \
       --num-slices=1  \
-      --command "python3 MaxText/train.py MaxText/configs/base.yml base_output_directory=${BASE_OUTPUT_DIR} dataset_path=${DATASET_PATH} steps=100 per_device_batch_size=1"
+      --command "python3 -m MaxText.train MaxText/configs/base.yml base_output_directory=${BASE_OUTPUT_DIR} dataset_path=${DATASET_PATH} steps=100 per_device_batch_size=1"
       ```
 
       __Using [xpk github repo](https://github.com/google/xpk.git)__
@@ -136,5 +147,5 @@ after which log out and log back in to the machine.
       --workload ${USER}-first-job \
       --tpu-type=v5litepod-256 \
       --num-slices=1  \
-      --command "python3 MaxText/train.py MaxText/configs/base.yml base_output_directory=${BASE_OUTPUT_DIR} dataset_path=${DATASET_PATH} steps=100 per_device_batch_size=1"
+      --command "python3 -m MaxText.train MaxText/configs/base.yml base_output_directory=${BASE_OUTPUT_DIR} dataset_path=${DATASET_PATH} steps=100 per_device_batch_size=1"
       ```

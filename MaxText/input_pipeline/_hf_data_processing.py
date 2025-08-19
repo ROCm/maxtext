@@ -15,17 +15,21 @@ limitations under the License.
 """
 
 """Input pipeline using Huggingface datasets."""
-import functools
 
 import ml_collections
+
 import jax
+
 import datasets
+
 import transformers
+
 import grain.python as grain
+
 import numpy as np
 
-from input_pipeline import _input_pipeline_utils
-import multihost_dataloading
+from MaxText.input_pipeline import _input_pipeline_utils
+from MaxText import multihost_dataloading
 
 
 def preprocessing_pipeline(
@@ -49,6 +53,9 @@ def preprocessing_pipeline(
     drop_remainder=False,
     generate_padding_example=False,
     use_dpo=None,
+    use_sft=None,
+    sft_train_on_completion_only=True,
+    grain_worker_count=1,  # only support 0 or 1
 ):
   """pipeline for preprocessing HF dataset"""
 
@@ -57,22 +64,63 @@ def preprocessing_pipeline(
   if shuffle:
     dataset = dataset.shuffle(seed=data_shuffle_seed)
 
-  if tokenize:
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        tokenizer_path,
-        add_bos_token=add_bos,
-        add_eos_token=add_eos,
-        model_max_length=max_target_length,
-        legacy=False,
-        token=hf_access_token,
-    )
+  tokenizer = transformers.AutoTokenizer.from_pretrained(
+      tokenizer_path,
+      add_bos_token=add_bos if not use_sft else False,
+      add_eos_token=add_eos if not use_sft else False,
+      legacy=False,
+      token=hf_access_token,
+  )
 
+  if use_sft:
+    dataset = dataset.select_columns(data_column_names)
+
+    supported_columns = [["prompt", "completion"], ["messages"]]
+    assert any(
+        set(data_column_names) == set(supported) for supported in supported_columns
+    ), f"Dataset column names mismatch. Expected columns to match one of {supported_columns}, but got {data_column_names}"
+    assert _input_pipeline_utils.is_conversational(
+        dataset.features, data_column_names
+    ), "Dataset is not in conversational format."
+
+    if len(data_column_names) > 1:
+      combined_column_name = "messages"
+      dataset_features = datasets.Features(
+          {combined_column_name: [{"content": datasets.Value(dtype="string"), "role": datasets.Value(dtype="string")}]}
+      )
+      dataset = dataset.map(
+          _input_pipeline_utils.combine_columns,
+          fn_kwargs={"columns": data_column_names, "data_column": combined_column_name},
+          remove_columns=data_column_names,
+          features=dataset_features,
+      )
+
+    data_column_names = list(dataset.features.keys())
+    dataset = dataset.map(
+        _input_pipeline_utils.apply_chat_template,
+        fn_kwargs={"tokenizer_model": tokenizer, "data_column_name": data_column_names[0]},
+    )
+  else:
+    dataset = dataset.select_columns(data_column_names)
+
+  if tokenizer.pad_token_id is not None:
+    pad_id = tokenizer.pad_token_id
+  elif tokenizer.unk_token_id is not None:
+    pad_id = tokenizer.unk_token_id
+  else:
+    pad_id = -1
+
+  if tokenize:
     dataset = dataset.map(
         _input_pipeline_utils.tokenization,
         batched=True,
-        fn_kwargs={"hf_tokenizer": tokenizer, "max_length": max_target_length - 1, "column_names": data_column_names},
+        fn_kwargs={
+            "hf_tokenizer": tokenizer,
+            "truncation": not use_sft,
+            "max_length": max_target_length,
+            "column_names": data_column_names,
+        },
     )
-  dataset = dataset.select_columns(data_column_names)
 
   dataset = _input_pipeline_utils.HFDataSource(
       dataset,
@@ -84,13 +132,27 @@ def preprocessing_pipeline(
       data_column_names,
   )
   operations = []
-  if not use_dpo:
+  if use_sft:
+    operations.append(
+        _input_pipeline_utils.SFTPromptMasking(
+            text_column_name=data_column_names[0],
+            completion_only=sft_train_on_completion_only,
+            max_target_length=max_target_length,
+            unk_id=pad_id,
+        )
+    )
+    data_column_names = ("inputs", "targets")
+  elif use_dpo:
+
+    def lists2array(x):
+      """Convert lists/tuples to array"""
+      return jax.tree.map(np.asarray, x, is_leaf=lambda y: isinstance(y, (list, tuple)))
+
+    operations.append(grain.MapOperation(lists2array))
+  else:
     assert len(data_column_names) == 1
     operations.append(_input_pipeline_utils.HFNormalizeFeatures(data_column_names[0]))
     data_column_names = ("inputs", "targets")
-  else:
-    lists2array = lambda x: jax.tree.map(np.asarray, x, is_leaf=lambda x: isinstance(x, (list, tuple)))
-    operations.append(grain.MapOperation(lists2array))
 
   if packing and not use_dpo:
     length_struct = {col: max_target_length for col in data_column_names}
@@ -102,11 +164,11 @@ def preprocessing_pipeline(
     )
     operations.append(_input_pipeline_utils.ReformatPacking(data_column_names))
   else:
-    operations.append(_input_pipeline_utils.PadToMaxLength(max_target_length))
+    operations.append(_input_pipeline_utils.PadToMaxLength(max_target_length, pad_id))
     operations.append(grain.Batch(batch_size=global_batch_size // jax.process_count(), drop_remainder=drop_remainder))
 
   if shift and not use_dpo:
-    operations.append(_input_pipeline_utils.ShiftData(axis=1))
+    operations.append(_input_pipeline_utils.ShiftData(ignored_ids=[pad_id, tokenizer.bos_token_id], axis=1))
 
   # Since HuggingFace IterableDataset does not support access through index
   # Indexes generated by dummy_index_sampler is not used.
@@ -125,7 +187,7 @@ def preprocessing_pipeline(
       data_source=dataset,
       operations=operations,
       sampler=dummy_index_sampler,
-      worker_count=1,  # only supports one worker for now, more workers results in duplicated data
+      worker_count=grain_worker_count,  # only supports <=1 for now, more workers results in duplicated data
       worker_buffer_size=1,
       read_options=grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=128),
   )
@@ -146,7 +208,7 @@ def make_hf_train_iterator(
       config.hf_path,
       data_dir=config.hf_data_dir,
       data_files=config.hf_train_files,
-      split="train",
+      split=config.train_split,
       streaming=True,
       token=config.hf_access_token,
   )
@@ -165,8 +227,11 @@ def make_hf_train_iterator(
       data_shuffle_seed=config.data_shuffle_seed,
       add_bos=config.add_bos,
       add_eos=config.add_eos,
-      generate_padding_example=True,
+      packing=config.packing,
+      generate_padding_example=False,
       use_dpo=config.use_dpo,
+      use_sft=config.use_sft,
+      sft_train_on_completion_only=config.sft_train_on_completion_only,
   )
   return train_iter
 
@@ -176,6 +241,7 @@ def make_hf_eval_iterator(
     global_mesh,
     process_indices_eval,
 ):
+  """Make Hugging Face evaluation iterator. Load and preprocess eval dataset: and return iterator."""
   eval_ds = datasets.load_dataset(
       config.hf_path,
       data_dir=config.hf_data_dir,
@@ -185,10 +251,7 @@ def make_hf_eval_iterator(
       token=config.hf_access_token,
   )
 
-  if config.eval_steps > 0:
-    eval_generate_padding_example = True
-  else:
-    eval_generate_padding_example = False
+  eval_generate_padding_example = config.eval_steps > 0
   eval_iter = preprocessing_pipeline(
       dataloading_host_index=process_indices_eval.index(jax.process_index()),
       dataloading_host_count=len(process_indices_eval),
@@ -204,7 +267,10 @@ def make_hf_eval_iterator(
       data_shuffle_seed=config.data_shuffle_seed,
       add_bos=config.add_bos,
       add_eos=config.add_eos,
+      packing=config.packing,
       generate_padding_example=eval_generate_padding_example,
       use_dpo=config.use_dpo,
+      use_sft=config.use_sft,
+      sft_train_on_completion_only=config.sft_train_on_completion_only,
   )
   return eval_iter

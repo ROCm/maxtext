@@ -18,41 +18,23 @@ limitations under the License.
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
-from flax import linen as nn
-from jax.sharding import Mesh
-import jax.numpy as jnp
-from jax.ad_checkpoint import checkpoint_name
-# from jax.experimental.pallas.ops.tpu import flash_attention
-from layers import attentions
-from layers import embeddings
-from layers import linears
-from layers import normalizations
-from layers import models
-from layers import quantizations
-
-import common_types
 from typing import Optional
 
-Array = common_types.Array
-Config = common_types.Config
-DType = common_types.DType
-Mesh = common_types.Mesh
-ScanIn = common_types.ScanIn
+import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import Mesh
+# from jax.experimental.pallas.ops.tpu import flash_attention
 
-AxisNames = common_types.AxisNames
-BATCH = common_types.BATCH
-KV_BATCH = common_types.KV_BATCH
-LENGTH = common_types.LENGTH
-HEAD = common_types.HEAD
-KV_HEAD = common_types.KV_HEAD
-D_KV = common_types.D_KV
-KV_HEAD_DIM = common_types.KV_HEAD_DIM
+from flax import linen as nn
 
+from MaxText.inference import page_manager
+from MaxText.layers import linears
+from MaxText.layers import models
+from MaxText.layers import quantizations
+from MaxText.layers.attentions import Attention
+from MaxText.layers.quantizations import AqtQuantization as Quant
+from MaxText.layers.normalizations import RMSNorm
 
-Embed = embeddings.Embed
-Attention = attentions.Attention
-RMSNorm = normalizations.RMSNorm
-Quant = quantizations.AqtQuantization
 
 # -----------------------------------------
 # The Decoder Layer specific for Llama2
@@ -74,13 +56,16 @@ class LlamaDecoderLayer(nn.Module):
       decoder_positions,
       deterministic,
       model_mode,
+      slot: Optional[int] = None,
+      page_state: Optional[page_manager.PageState] = None,
+      previous_chunk=None,
   ):
     cfg = self.config
     mesh = self.mesh
 
     inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_norm_length", "activation_embed"))
     inputs = checkpoint_name(inputs, "decoder_layer_input")
-    lnx_rms = models.RMSNorm(
+    lnx_rms = RMSNorm(
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         name="pre_self_attention_layer_norm",
@@ -105,11 +90,13 @@ class LlamaDecoderLayer(nn.Module):
         weight_dtype=cfg.weight_dtype,
         dropout_rate=cfg.dropout_rate,
         name="self_attention",
+        float32_qk_product=cfg.float32_qk_product,
+        float32_logits=cfg.float32_logits,
         quant=self.quant,
         kv_quant=quantizations.configure_kv_quant(cfg),
-        prefill_cache_axis_order=tuple([int(i) for i in cfg.prefill_cache_axis_order.split(",")]),
-        ar_cache_axis_order=tuple([int(i) for i in cfg.ar_cache_axis_order.split(",")]),
-        compute_axis_order=tuple([int(i) for i in cfg.compute_axis_order.split(",")]),
+        prefill_cache_axis_order=tuple(map(int, cfg.prefill_cache_axis_order.split(","))),
+        ar_cache_axis_order=tuple(map(int, cfg.ar_cache_axis_order.split(","))),
+        compute_axis_order=tuple(map(int, cfg.compute_axis_order.split(","))),
         reshape_q=cfg.reshape_q,
         use_ragged_attention=cfg.use_ragged_attention,
         ragged_block_size=cfg.ragged_block_size,
@@ -122,6 +109,9 @@ class LlamaDecoderLayer(nn.Module):
         decoder_segment_ids=decoder_segment_ids,
         deterministic=deterministic,
         model_mode=model_mode,
+        slot=slot,
+        page_state=page_state,
+        previous_chunk=previous_chunk,
     )
 
     attention_lnx = nn.with_logical_constraint(

@@ -13,13 +13,12 @@
 #  limitations under the License.
 
 """Common types."""
-
+import enum
 from typing import Any, Sequence
 
-from flax.linen import partitioning
-import jax
-import jax.numpy as jnp
 import numpy as np
+
+import jax.numpy as jnp
 
 Config = Any
 
@@ -28,14 +27,13 @@ PRNGKey = jnp.ndarray
 DType = jnp.dtype
 Shape = Sequence[int]
 
-Mesh = jax.sharding.Mesh
-ScanIn = partitioning.ScanIn
-
 AxisNames = tuple[str, ...]
 AxisIdxes = tuple[int, ...]
 
 BATCH = "activation_batch"
 LENGTH = "activation_length"
+Q_LENGTH = "activation_q_length"
+KV_LENGTH = "activation_kv_length"
 EMBED = "activation_embed"
 HEAD = "activation_heads"
 PREFILL_KV_BATCH = "activation_prefill_kv_batch"
@@ -43,10 +41,13 @@ KV_BATCH = "activation_kv_batch"
 KV_HEAD = "activation_kv_heads"
 KV_HEAD_DIM = "activation_kv_head_dim"
 D_KV = "activation_kv"
+DECODE_BATCH = "decode_batch"
+DECODE_LENGTH = "decode_length"
 CACHE_BATCH_PREFILL = "cache_batch_prefill"
 CACHE_BATCH = "cache_batch"
 CACHE_SEQUENCE = "cache_sequence"
 CACHE_HEADS = "cache_heads"
+CACHE_HEADS_NONE = "cache_heads_none"
 CACHE_KV = "cache_kv"
 CACHE_SCALE_BATCH = "cache_scale_batch"
 CACHE_SCALE_SEQUENCE = "cache_scale_sequence"
@@ -56,9 +57,27 @@ CACHE_SCALE_KV = "cache_scale_kv"
 MODEL_MODE_AUTOREGRESSIVE = "autoregressive"
 MODEL_MODE_PREFILL = "prefill"
 MODEL_MODE_TRAIN = "train"
+MODEL_MODE_INSERT = "insert"
 
 DECODING_ACTIVE_SEQUENCE_INDICATOR = 1
 
 # A large negative mask value is used for masking to ensure that the
 # softmax function assigns an extremely low probability to the masked positions.
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
+
+
+class DecoderBlockType(enum.Enum):
+  """Decoder block types."""
+
+  DEFAULT = "default"
+  LLAMA2 = "llama2"
+  MISTRAL = "mistral"
+  MIXTRAL = "mixtral"
+  DEEPSEEK = "deepseek"
+  GEMMA = "gemma"
+  GEMMA2 = "gemma2"
+  GEMMA3 = "gemma3"
+  GPT3 = "gpt3"
+  SIMPLE = "simple"
+  SIMPLE_MLP = "simple_mlp"
+  LLAMA4 = "llama4"
