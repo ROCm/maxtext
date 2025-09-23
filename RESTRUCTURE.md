@@ -6,7 +6,6 @@ We welcome feedback on this proposed structure. Please provide any thoughts,
 comments, or questions by creating a new 
 [issue](https://github.com/AI-Hypercomputer/maxtext/issues) in MaxText.
 
-
 ```
 .
 ├── .dockerignore
@@ -17,6 +16,14 @@ comments, or questions by creating a new
 ├── AUTHORS
 ├── CONTRIBUTING.md
 ├── LICENSE
+├── src/
+│   └── MaxText/
+│       ├── decode.py
+│       ├── sft.py
+│       ├── decode.py
+│       ├── train.py
+│       ├── decode.py
+│       └── train_compile.py
 ├── README.md
 ├── dependencies/
 │   ├── dockerfiles/
@@ -30,7 +37,6 @@ comments, or questions by creating a new
 │   │   ├── maxtext_libtpu_path.Dockerfile
 │   │   └── maxtext_runner.Dockerfile
 │   ├── requirements/
-│   │   ├── constraints_gpu.txt
 │   │   └── requirements.txt
 │   │   └── ...
 │   └── scripts/
@@ -93,8 +99,8 @@ comments, or questions by creating a new
 │   │   │   ├── to_hf/
 │   │   │   │   └── llama_mistral_mixtral_orbax_to_hf.py
 │   │   │   ├── to_maxtext/
-│   │   │   │   ├── convert_deepseek_ckpt.py
-│   │   │   │   ├── convert_deepseek_ckpt_unscanned.py
+│   │   │   │   ├── convert_deepseek_family_ckpt.py
+│   │   │   │   ├── convert_deepseek_family_ckpt_unscanned.py
 │   │   │   │   ├── convert_gemma2_ckpt.py
 │   │   │   │   ├── convert_gemma_ckpt.py
 │   │   │   │   ├── llama4_ckpt_unscanned.py
