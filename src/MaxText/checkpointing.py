@@ -117,6 +117,7 @@ def create_orbax_checkpoint_manager(
     orbax_logger: Any = None,  # pytype: disable=attribute-error
     use_ocdbt: bool = True,
     use_zarr3: bool = True,
+    max_to_keep: int = 5,
 ):
   """Returns specified Orbax (async or not) CheckpointManager or None if checkpointing is disabled."""
   if not enable_checkpointing:
@@ -144,6 +145,7 @@ def create_orbax_checkpoint_manager(
           create=True,
           save_interval_steps=save_interval_steps,
           enable_async_checkpointing=use_async,
+          max_to_keep = max_to_keep,
       ),
       logger=orbax_logger,
   )
@@ -321,7 +323,7 @@ def load_state_if_possible(
     checkpoint_storage_concurrent_gb: concurrent GB for checkpoint byte I/O.
     enable_orbax_v1: bool flag for enabling Orbax v1.
     checkpoint_conversion_fn: function for converting checkpoint to Orbax v1.
-    source_checkpoint_layout: Optional checkpoint context to use for loading, 
+    source_checkpoint_layout: Optional checkpoint context to use for loading,
     provided in string format with the default being "orbax".
 
   Returns:

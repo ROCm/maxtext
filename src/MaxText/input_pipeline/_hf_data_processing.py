@@ -26,6 +26,7 @@ import grain.python as grain
 
 import numpy as np
 
+from .CustomPackAndBatchOperation import CustomPackAndBatchOperation
 from MaxText.input_pipeline import _input_pipeline_utils
 from MaxText import multihost_dataloading
 
@@ -50,7 +51,7 @@ def vision_sft_preprocessing_pipeline(
   dataset = dataset.select_columns(text_columns + [image_column])
   if image_column != "images":
     dataset = dataset.rename_column(image_column, "images")
-  
+
   dataset = dataset.map(
       _input_pipeline_utils.reformat_prompt,
       fn_kwargs={
@@ -176,6 +177,7 @@ def preprocessing_pipeline(
     use_sft=None,
     sft_train_on_completion_only=True,
     grain_worker_count=1,  # only support 0 or 1
+    max_segments = 1, # max segments per sequence
 ):
   """pipeline for preprocessing HF dataset"""
 
@@ -274,12 +276,14 @@ def preprocessing_pipeline(
     data_column_names = ("inputs", "targets")
 
   if packing and not use_dpo:
+    # monkey patch the splitter to handle TE's maximum segment limitation
     length_struct = {col: max_target_length for col in data_column_names}
     operations.append(
-        grain.experimental.PackAndBatchOperation(
-            batch_size=global_batch_size // jax.process_count(),
-            length_struct=length_struct,
-        )
+      CustomPackAndBatchOperation(
+        batch_size=global_batch_size // jax.process_count(),
+        length_struct=length_struct,
+        max_segments=max_segments,
+      )
     )
     operations.append(_input_pipeline_utils.ReformatPacking(data_column_names))
   else:
@@ -363,6 +367,7 @@ def make_hf_train_iterator(
         use_dpo=config.use_dpo,
         use_sft=config.use_sft,
         sft_train_on_completion_only=config.sft_train_on_completion_only,
+        max_segments=config.max_segments,
     )
   return train_iter
 
@@ -413,5 +418,6 @@ def make_hf_eval_iterator(
         use_dpo=config.use_dpo,
         use_sft=config.use_sft,
         sft_train_on_completion_only=config.sft_train_on_completion_only,
+        max_segments=config.max_segments,
     )
   return eval_iter
