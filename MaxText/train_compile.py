@@ -48,7 +48,7 @@ from MaxText.layers import quantizations
 from MaxText.utils import gcs_utils
 
 import jaxpp.api as jaxpp
-from jaxpp.mesh import MpmdMesh
+from jaxpp.api import MpmdMesh
 
 # pylint: disable=too-many-positional-arguments
 

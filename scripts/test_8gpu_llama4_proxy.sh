@@ -10,7 +10,6 @@ export PARALLELISM_CONFIG="
 
 export JAXPP_CONFIG="
     scan_layers=False
-    jaxpp_remote=False
     use_jaxpp=True
     schedule=interleaved_1f1b
     num_pipeline_microbatches=4

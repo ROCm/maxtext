@@ -89,10 +89,9 @@ JaxPP related imports
 from statistics import mean
 
 # jaxpp
+from jaxpp import __version__ as jaxpp_version
+from packaging.version import Version
 import jaxpp.api as jaxpp
-from jaxpp.mesh import RemoteMpmdMesh, MpmdMesh
-from jaxpp.core import DistributedSharding
-from jaxpp.arrayref import ArrayRef
 
 
 def validate_train_config(config):
@@ -121,9 +120,9 @@ def validate_train_config(config):
         "With synthetic data, the format is not important as packing is not applied."
     )
 
-def maybe_unwrap(a: ArrayRef | jax.Array):
-  if isinstance(a, ArrayRef):
-    return a._value
+def maybe_unwrap(a: jaxpp.MpmdArray | jax.Array):
+  if isinstance(a, jaxpp.MpmdArray):
+    return v if (v := a.first_mpmd_replica) is not None else 0
   return a
 
 def get_first_step(state):
@@ -445,10 +444,15 @@ def load_schedule(config):
       assert num_logical_stages <= pipeline_parallel_dim
       schedule = jaxpp.Eager1F1B(num_logical_stages)
   elif config.schedule == "interleaved_1f1b":
-      schedule = jaxpp.Interleaved1F1B(num_logical_stages, pipeline_parallel_dim)
+      if Version(jaxpp_version) > Version("0.6.1"):
+        schedule = jaxpp.Interleaved1F1B(num_logical_stages, pipeline_parallel_dim, config.fuse_steady_state)
+      else:
+        schedule = jaxpp.Interleaved1F1B(num_logical_stages, pipeline_parallel_dim)
   elif config.schedule == "zero_bubble":
       assert num_logical_stages <= pipeline_parallel_dim
       schedule = jaxpp.ZeroBubble(num_logical_stages)
+  elif config.schedule == "dualpipev":
+      schedule = jaxpp.DualPipeV(num_logical_stages, pipeline_parallel_dim)
   else:
       raise NotImplementedError(f"Unknown schedule {config.schedule}")
   return schedule
@@ -755,11 +759,8 @@ def setup_mesh_and_model(config, devices=None):
     devices_array = maxtext_utils.create_device_mesh(config, devices)
     mesh = Mesh(devices_array, config.mesh_axes)
   else:
-    if config.jaxpp_remote:
-      mesh = RemoteMpmdMesh._pop_current_worker_mesh()
-    else:
-      devices_array = maxtext_utils.create_device_mesh(config, devices)
-      mesh = MpmdMesh(Mesh(devices_array, config.mesh_axes), 'stage')
+    devices_array = maxtext_utils.create_device_mesh(config, devices)
+    mesh = jaxpp.MpmdMesh(Mesh(devices_array, config.mesh_axes), 'stage')
 
   # Model and Optimizer definition
   quant = quantizations.configure_quantization(config)
@@ -856,7 +857,7 @@ def setup_train_loop(config):
   )
 
   def make_line(keypath, array_or_array_ref):
-    sharding = array_or_array_ref.sharding.sharding if isinstance(array_or_array_ref, ArrayRef) else array_or_array_ref.sharding
+    sharding = array_or_array_ref.sharding
     return (f"{jax.tree_util.keystr(keypath):<120}, {str(array_or_array_ref.dtype):<10}, "
             f"{str(array_or_array_ref.shape):<26}, {sharding._to_xla_hlo_sharding(array_or_array_ref.ndim)}")
 
@@ -996,7 +997,6 @@ def train_loop(config, state=None):
         donate_argnums=donate_argnums_train,
         in_shardings=in_shard_train,
         out_shardings=out_shard_train,
-        use_pgle=config.use_pgle
       )
 
     if eval_data_iterator:
@@ -1054,12 +1054,9 @@ def train_loop(config, state=None):
     profiling_process_ids = {d.process_index: d for d in first_device_per_mpmd_rank}
 
   for step in np.arange(start_step, config.steps):
-    if config.profiler != "" and config.jaxpp_remote and step == first_profiling_step:
-      assert config.profiler == "xplane"
-      mpmd_mesh.start_trace(config.tensorboard_dir.rstrip('/'))
-    elif config.profiler != "" and step == first_profiling_step or prof.should_activate_periodic_profile(step):
+    if config.profiler != "" and step == first_profiling_step or prof.should_activate_periodic_profile(step):
       optional_postfix = f"step_{step}" if config.profile_periodically_period > 0 else ""
-      if config.use_jaxpp and jax.process_index() in profiling_process_ids:
+      if config.use_jaxpp and mpmd_mesh.jax_mesh.is_multi_process and jax.process_index() in profiling_process_ids:
         optional_postfix = f"mpmd_{mpmd_mesh.my_mpmd_axis_index:02}_gpu_{profiling_process_ids[jax.process_index()].id:06}_{optional_postfix}"
       optional_postfix = f"proc_{jax.process_index():06}_{optional_postfix}"
       prof.activate(blocking_object=state, optional_postfix=optional_postfix, profile=jax.process_index() in profiling_process_ids)
@@ -1068,9 +1065,8 @@ def train_loop(config, state=None):
       record_goodput(recorder, config, recorder.record_data_loading_start_time if recorder else None)
       try:
         example_batch = load_next_batch(data_iterator, example_batch, config)
-        if not config.jaxpp_remote:
-          # Reshard data from loaded sharding to performant activation sharding
-          example_batch = jax.lax.with_sharding_constraint(example_batch, input_data_shardings)
+        # Reshard data from loaded sharding to performant activation sharding
+        example_batch = jax.lax.with_sharding_constraint(example_batch, input_data_shardings)
       except Exception as e:  # pylint: disable=broad-except
         max_logging.log(f"load_next_batch failed, you may have run out of data. Error message: {e}")
         break
@@ -1129,6 +1125,7 @@ def train_loop(config, state=None):
         if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
           break
         with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          eval_batch = jax.tree_util.tree_map(lambda a: a[:2], eval_batch)
           eval_metrics = p_eval_step(state, eval_batch, nextrng)
         cumulative_eval_metrics["scalar"]["eval/total_loss"] += float(maybe_unwrap(eval_metrics["scalar"]["evaluation/total_loss"]))
         cumulative_eval_metrics["scalar"]["eval/total_weights"] += float(maybe_unwrap(eval_metrics["scalar"]["evaluation/total_weights"]))
@@ -1155,16 +1152,7 @@ def train_loop(config, state=None):
         prof.deactivate()
         break
 
-    if config.profiler != "" and config.jaxpp_remote and step == last_profiling_step:
-      assert config.profiler == "xplane"
-      # FIXME: properly block on all `state`.
-      #   avoid `jax.block_until_ready(state)` since it would pull each array onto the
-      #   driver, being incredibly slow.
-      # Block on these two values
-      jax.tree.leaves(state)[0]._value
-      jax.tree.leaves(state)[-1]._value
-      mpmd_mesh.stop_trace(merge_multihost_xplanes=True)
-    elif config.profiler != "" and step == last_profiling_step or prof.should_deactivate_periodic_profile(step):
+    if config.profiler != "" and step == last_profiling_step or prof.should_deactivate_periodic_profile(step):
       prof.deactivate(blocking_object=state, profile=jax.process_index() in profiling_process_ids)
 
     if step == start_step:

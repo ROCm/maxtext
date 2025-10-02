@@ -571,7 +571,7 @@ def setup_initial_state(
   """
 
   mesh = maybe_mpmd_mesh
-  if isinstance(maybe_mpmd_mesh, (jaxpp.RemoteMpmdMesh, jaxpp.MpmdMesh)):
+  if isinstance(maybe_mpmd_mesh, jaxpp.MpmdMesh):
     mesh = maybe_mpmd_mesh.lowering_mesh()
 
   unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
@@ -632,16 +632,15 @@ def setup_initial_state(
           donate_argnums=donate_argnums_train,
           in_shardings=in_shard_train,
           out_shardings=out_shard_train,
-          use_pgle=config.use_pgle
         )
         with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
           global_mpmd_train_step = p_train_step.trace_and_place(
             unboxed_abstract_state, next(data_iterator), rng
           )
-        unboxed_abstract_state_placements = global_mpmd_train_step.in_shardings[0]
+        unboxed_abstract_state_placements = global_mpmd_train_step.in_shardings[0][0]
         def attach_right_mesh(shaped: jax.ShapeDtypeStruct, dist_sharding):
           sharding: jax.sharding.NamedSharding = shaped.sharding
-          jax_mesh = maybe_mpmd_mesh.as_mpmd_mesh.mpmd_submesh(sorted(dist_sharding.mesh_ids)).jax_mesh
+          jax_mesh = maybe_mpmd_mesh.mpmd_submesh(sorted(dist_sharding.mesh_ids)).jax_mesh
           mpmd_sharding = jax.sharding.NamedSharding(jax_mesh, sharding.spec)
           return jax.ShapeDtypeStruct(shaped.shape, shaped.dtype, sharding=mpmd_sharding, weak_type=shaped.weak_type)
 
@@ -692,7 +691,7 @@ def add_data_to_sharding(mesh, path, aval, sharding):
     if size % mesh.shape['data'] == 0 and (partition is None or 'tensor' not in partition):
       added_component = ('data',) + partition
       new_pspec = jax.sharding.PartitionSpec(*(pspec[:idx] + (added_component,) + pspec[idx+1:]))
-      return sharding.with_spec(new_pspec)
+      return sharding.update(spec=new_pspec)
   return sharding
 
 

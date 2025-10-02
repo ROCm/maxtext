@@ -124,12 +124,9 @@ class BadSyntheticDataIterator:
 
 
 def get_process_loading_real_data(
-    data_sharding, global_batch_size_to_load, global_batch_size_to_train_on, max_target_length, mesh, jaxpp_remote=False,
+    data_sharding, global_batch_size_to_load, global_batch_size_to_train_on, max_target_length, mesh
 ):
   """Get list of processes loading data from GCS when expansion_factor_real_data != -1"""
-  if jaxpp_remote:
-    return [0] # only the driver process
-
   sharding = jax.sharding.NamedSharding(mesh, P(*data_sharding))
   devices_indices_map = sharding.devices_indices_map((global_batch_size_to_load, max_target_length))
   batch_cutoff = global_batch_size_to_train_on
@@ -164,11 +161,8 @@ def make_mixed_iterator(
 
 def create_data_iterator(config: pyconfig.HyperParameters, mesh):
   """create data iterator"""
-  if config.use_jaxpp and config.jaxpp_remote:
-    mesh = jax.sharding.Mesh(np.array(jax.devices('cpu')).reshape((1,) * mesh.devices.ndim), mesh.axis_names)
-
   if config.dataset_type == "synthetic":
-    return SyntheticDataIterator(config, mesh), None
+    return SyntheticDataIterator(config, mesh), SyntheticDataIterator(config, mesh)
 
   process_indices_train = get_process_loading_real_data(
       config.data_sharding,
@@ -176,7 +170,6 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
       config.global_batch_size_to_train_on,
       config.max_target_length,
       mesh,
-      jaxpp_remote=config.jaxpp_remote,
   )
   if config.eval_interval > 0:
     process_indices_eval = get_process_loading_real_data(
@@ -185,7 +178,6 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
         config.global_batch_size_to_eval_on,
         config.max_target_length,
         mesh,
-        jaxpp_remote=config.jaxpp_remote,
     )
   else:
     process_indices_eval = []

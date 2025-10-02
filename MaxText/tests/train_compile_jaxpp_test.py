@@ -52,7 +52,6 @@ def get_args(
         f"num_pipeline_repeats={vp}",
         # JaxPP
         "use_jaxpp=True",
-        "jaxpp_remote=False",
         "schedule=interleaved_1f1b",
         "compile_topology=a3",
         f"compile_topology_num_slices={num_nodes}",

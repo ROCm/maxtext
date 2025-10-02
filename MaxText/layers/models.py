@@ -41,7 +41,8 @@ from MaxText.layers.normalizations import RMSNorm
 from MaxText.layers.embeddings import PositionalEmbedding, Embed
 from MaxText.layers.quantizations import AqtQuantization as Quant
 
-import jaxpp.api as jaxpp
+import jaxpp
+from packaging.version import Version
 
 # ------------------------------------------------------------------------------
 # The network: Decoder & Transformer Definitions
@@ -565,7 +566,7 @@ class Decoder(nn.Module):
         if cfg.use_jaxpp:
           num_logical_stages = cfg.dcn_pipeline_parallelism * cfg.ici_pipeline_parallelism * cfg.num_pipeline_repeats
           layers_per_stage, rem = divmod(cfg.num_decoder_layers, num_logical_stages)
-          assert layers_per_stage > 0
+          assert layers_per_stage > 0, (cfg.num_decoder_layers, num_logical_stages)
           cutoffs = []
           tot = 0
           for stage in range(num_logical_stages):
@@ -574,6 +575,7 @@ class Decoder(nn.Module):
             cutoffs.append(tot - 1)
 
         stage_id = 0
+        add_last_enter_stage = Version(jaxpp.__version__) > Version("0.6.1")
         if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
           assert len(RemattedBlockLayers) == 2, "Unscanned layers must have a length of 2 using deepseek."
 
@@ -589,8 +591,8 @@ class Decoder(nn.Module):
                 page_state=page_state,
                 slot=slot,
             )
-            if index != cfg.first_num_dense_layers - 1 and cutoffs[stage_id] == index:
-              y = jaxpp.pipeline_enter_stage(y, f"stage_{stage_id}")
+            if index != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == index:
+              y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
               stage_id += 1
 
           for index in range(cfg.first_num_dense_layers, cfg.num_decoder_layers):
@@ -606,7 +608,7 @@ class Decoder(nn.Module):
                 slot=slot,
             )
             if index != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == index:
-              y = jaxpp.pipeline_enter_stage(y, f"stage_{stage_id}")
+              y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
               stage_id += 1
 
         else:
@@ -640,7 +642,7 @@ class Decoder(nn.Module):
                 **layer_call_kwargs,
             )
             if lyr != cfg.num_decoder_layers - 1 and cutoffs[stage_id] == lyr:
-              y = jaxpp.pipeline_enter_stage(y, f"stage_{stage_id}")
+              y = jaxpp.api.pipeline_enter_stage(y, f"stage_{stage_id}")
               stage_id += 1
 
     y = self.get_norm_layer()(
@@ -685,6 +687,8 @@ class Decoder(nn.Module):
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
+    if add_last_enter_stage:
+      logits = jaxpp.api.pipeline_enter_stage(logits, f"stage_{stage_id}")
     return logits
 
 

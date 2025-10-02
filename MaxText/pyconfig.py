@@ -833,8 +833,6 @@ def set_and_validate_pipeline_config(raw_keys):
       assert raw_keys["num_pipeline_repeats"] >= 1
       assert raw_keys["num_pipeline_microbatches"] >= 1
       return raw_keys
-    else:
-      assert raw_keys["jaxpp_remote"] == False
 
     if raw_keys["pipeline_parallel_layers"] == -1:
       raw_keys["pipeline_parallel_layers"] = raw_keys["num_decoder_layers"]
@@ -898,7 +896,7 @@ def validate_deepseek_moe(raw_keys):
 
 
 def validate_sparse_matmul_parallelism(raw_keys):
-  if raw_keys["sparse_matmul"] and (using_sequence_parallelism(raw_keys) or using_pipeline_parallelism(raw_keys)):
+  if raw_keys["sparse_matmul"] and (using_sequence_parallelism(raw_keys) or (not raw_keys["use_jaxpp"] and using_pipeline_parallelism(raw_keys))):
     raise ValueError("Currently we only support Megablox and Ragged dot with data, tensor, and expert parallelism.")
   tensor_parallelism = (
       raw_keys["ici_tensor_parallelism"]
@@ -1008,9 +1006,6 @@ def calculate_global_batch_sizes(
 
 
 def get_num_target_devices(raw_keys):
-  if raw_keys["jaxpp_remote"] and raw_keys["use_jaxpp"]:
-    from jaxpp.mesh import RemoteMpmdMesh
-    return RemoteMpmdMesh.current_worker_mesh().remote_mesh.size
   # In AOT case compile_topology is set (e.g. is not the empty string), and we determine the
   # number of devices from the compile_topology. In non-AOT settings we simply can use jax.devices().
   if raw_keys.get("compile_topology"):

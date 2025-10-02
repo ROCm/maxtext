@@ -150,38 +150,9 @@ def maybe_initialize_jax_distributed_system(raw_keys):
     # Don't initialize jax distributed with AOT compilation
     return
   if is_gpu_backend(raw_keys):
-    if raw_keys["jaxpp_remote"] and raw_keys["use_jaxpp"]:
-      def get_mesh_shape_by_names(axis_names):
-        mesh_axes_map = {
-          "data": "ici_data_parallelism",
-          "stage": None,
-          "fsdp": "ici_fsdp_parallelism",
-          "fsdp_transpose": "ici_fsdp_transpose_parallelism",
-          "sequence": "ici_sequence_parallelism",
-          "tensor": "ici_tensor_parallelism",
-          "expert": "ici_expert_parallelism",
-          "autoregressive": "ici_autoregressive_parallelism",
-        }
-        return tuple(raw_keys[mesh_axes_map.get(name)] if mesh_axes_map.get(name) is not None else 1 for name in axis_names)
-      if raw_keys["ici_pipeline_parallelism"] > 0 and raw_keys["jaxpp_remote"]:
-        max_logging.log(
-          "WARNING: JaxPP with remote execution does not ensure proper pipeline rank"
-          "colocation yet"
-        )
-      # Need to clear all backends as pyconfig has initialized once
-      jaxpp.RemoteMpmdMesh._push_current_worker_mesh(jaxpp.RemoteMpmdMesh(
-        raw_keys["dcn_pipeline_parallelism"] * raw_keys["ici_pipeline_parallelism"],
-        get_mesh_shape_by_names(raw_keys["mesh_axes"]),
-        raw_keys["mesh_axes"],
-        import_modules=["transformer_engine.jax.cpp_extensions"],
-      ))
-      tf.config.set_visible_devices([], "GPU")
-      jax.config.update("jax_default_prng_impl", "unsafe_rbg")
-      jax.config.update("jax_default_device", jax.local_devices(backend="cpu")[0])
-    else:
-      max_logging.log("Attempting to initialize the jax distributed system for GPU backend...")
-      initialize_jax_for_gpu(raw_keys)
-      max_logging.log("Jax distributed system initialized on GPU!")
+    max_logging.log("Attempting to initialize the jax distributed system for GPU backend...")
+    initialize_jax_for_gpu(raw_keys)
+    max_logging.log("Jax distributed system initialized on GPU!")
   elif is_cpu_backend(raw_keys):
     max_logging.log("Attempting to initialize the jax distributed system for CPU backend...")
     initialize_jax_for_cpu(raw_keys)
@@ -371,8 +342,6 @@ def _retrieve_jax_init_info(raw_keys):
 
 def get_num_slices(raw_keys):
   """Calculate num_slices based on number of devices."""
-  if raw_keys["jaxpp_remote"]:
-      return 1
   if raw_keys["hardware"] == "cpu":
     max_logging.log(" Setting num_slices=1 for CPU hardware type")
     return 1

@@ -6,7 +6,7 @@ array-record
 aqtp
 cloud-accelerator-diagnostics
 cloud-tpu-diagnostics
-datasets
+datasets>=4.0.0
 gcsfs
 google-cloud-aiplatform==1.61.0
 google-cloud-storage
@@ -17,7 +17,7 @@ grain[parquet]>=0.2.6
 flax>=v0.10.6
 jaxtyping
 ml-collections
-ml-goodput-measurement==0.0.10
+ml-goodput-measurement
 numpy
 optax
 protobuf==3.20.3
@@ -27,7 +27,7 @@ pyink
 pre-commit
 pytype
 pillow>=11.1.0
-sentencepiece==0.1.97
+sentencepiece==0.2.0
 tensorflow-text>=2.13.0
 tensorflow>=2.13.0
 tensorflow-datasets

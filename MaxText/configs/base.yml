@@ -575,11 +575,10 @@ eval_steps: -1  # run this number of steps for eval, recommend setting this to p
 target_eval_loss: 0.  # early stop once reaching target eval_loss
 
 # NOTE(jaxpp): begin parameters
-jaxpp_remote: True
 shard_optimizer_over_data: True # Similar to upstream `pipeline_fsdp_ag_once`
 use_jaxpp: False
 schedule: "eager_1f1b"
-use_pgle: True
+fuse_steady_state: False
 grad_dtype: "bfloat16"
 # NOTE(jaxpp): end parameters
 
