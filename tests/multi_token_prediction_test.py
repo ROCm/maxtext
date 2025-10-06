@@ -136,6 +136,7 @@ class MTPBlockTestModel(nn.Module):
   def setup(self):
     """Initializes the MTP block and its dependencies for the test."""
     self.shared_embedding = embeddings.embed_as_linen(
+        mesh=self.mesh,
         num_embeddings=self.config.vocab_size,
         num_features=self.config.base_emb_dim,
         config=self.config,
