@@ -15,7 +15,12 @@ import logging
 import triton
 import jax
 import jax.numpy as jnp
-from MaxText.kernels.megablox_jt.common import is_power_of_2, check_tiling
+from MaxText.kernels.megablox_jt.common import (
+#from common import (
+        is_power_of_2, 
+        check_tiling,
+        num_sms,
+        )
 #from common import is_power_of_2, check_tiling
 # Types module
 #from dtypes import SUPPORTED_DTYPES, DTYPE
@@ -23,7 +28,7 @@ from MaxText.kernels.megablox_jt.common import is_power_of_2, check_tiling
 # Kernel configuration classes.
 # ------------------------------------------------------------------------------
 
-
+NUM_SMS = num_sms ()
 @dataclass(frozen=True, eq=True)
 class ConfigKey:
     M: int
@@ -56,7 +61,7 @@ class Config:
     block_size_k: int = 128
     block_size_n: int = 128
     group_size: int = 4
-    grid_dim: int | None = 304 #ToDo get cu number from hip_python or jax num_sms()
+    grid_dim: int | None = NUM_SMS
     num_warps: int = 8
     num_stages: int = 2
 
@@ -92,33 +97,82 @@ class Config:
 OUTER_BLOCK_SIZE: int = 256
 INNER_BLOCK_SIZE: int = 64
 
-DEFAULT_GMM_CONFIG: Config = Config(
-    block_size_m=OUTER_BLOCK_SIZE,
-    block_size_k=INNER_BLOCK_SIZE,
-    block_size_n=OUTER_BLOCK_SIZE,
-)
+#DEFAULT_GMM_CONFIG: Config = Config(
+#    block_size_m=OUTER_BLOCK_SIZE,
+#    block_size_k=INNER_BLOCK_SIZE,
+#    block_size_n=OUTER_BLOCK_SIZE,    
+#)
 
-DEFAULT_PERSISTENT_TGMM_CONFIG: Config = Config(
-    block_size_m=INNER_BLOCK_SIZE,
-    block_size_k=OUTER_BLOCK_SIZE,
-    block_size_n=OUTER_BLOCK_SIZE,
-)
+if NUM_SMS== 256:
+    DEFAULT_GMM_CONFIG: Config = Config(
+        block_size_m = 256,
+        block_size_k = 64,
+        block_size_n = 256,
+        group_size = 1,
+        num_warps = 8,
+        num_stages = 1,
+      )
 
-DEFAULT_NON_PERSISTENT_TGMM_CONFIG: Config = Config(
-    block_size_m=INNER_BLOCK_SIZE,
-    block_size_k=OUTER_BLOCK_SIZE,
-    block_size_n=OUTER_BLOCK_SIZE,
-    grid_dim=None,
-)
+    DEFAULT_PERSISTENT_TGMM_CONFIG: Config = Config(
+        block_size_m = 64,
+        block_size_k = 256,
+        block_size_n = 256,
+        group_size = 1,
+        num_warps = 8,
+        num_stages = 1,
+      )
+
+    DEFAULT_NON_PERSISTENT_TGMM_CONFIG: Config = Config(
+        block_size_m = 64,
+        block_size_k = 256,
+        block_size_n = 256,
+        group_size = 1,
+        num_warps = 8,
+        num_stages = 1,
+      )
+
+else:
+    DEFAULT_GMM_CONFIG: Config = Config(
+        block_size_m = 256,
+        block_size_k = 64,
+        block_size_n = 256,
+        group_size = 1,
+        num_warps = 8,
+        num_stages = 1,
+
+     )
+
+    DEFAULT_PERSISTENT_TGMM_CONFIG: Config = Config(
+        block_size_m = 64,
+        block_size_k = 256,
+        block_size_n = 256,
+        group_size = 1,
+        num_warps = 8,
+        num_stages = 1,
 
 
+      )
+
+    DEFAULT_NON_PERSISTENT_TGMM_CONFIG: Config = Config(
+        block_size_m = 64,
+        block_size_k = 256,
+        block_size_n = 256,
+        group_size = 1,
+        num_warps = 8,
+        num_stages = 1,
+ 
+    )  
+
+
+# Database of best kernel configurations.
 # Database of best kernel configurations.
 # ------------------------------------------------------------------------------
 
 
 # GMM tuning database for gfx942.
 # fmt: off
-BEST_GMM_CONFIGS: dict[ConfigKey, Config] = {
+if NUM_SMS == 304:
+    BEST_GMM_CONFIGS: dict[ConfigKey, Config] = {
     # NN
     ConfigKey(M=  49152, K= 1408, N= 2048, G=64): Config(block_size_m=128, block_size_k=64, block_size_n=128, group_size=4, grid_dim=1216, num_warps=8, num_stages=2),
     ConfigKey(M=3145728, K= 2048, N= 1408, G= 8): Config(block_size_m=256, block_size_k=32, block_size_n=256, group_size=1, grid_dim= 304, num_warps=8, num_stages=2),
@@ -150,13 +204,13 @@ BEST_GMM_CONFIGS: dict[ConfigKey, Config] = {
 #
     ConfigKey(M=  32768, K= 6144, N=16384, G= 8, trans_rhs=True): Config(block_size_m=256, block_size_k= 64, block_size_n=256, group_size=8, grid_dim=1216, num_warps=8, num_stages=2),
     ConfigKey(M=  32768, K=16384, N= 6144, G= 8, trans_rhs=True): Config(block_size_m=256, block_size_k= 64, block_size_n=256, group_size=4, grid_dim=1216, num_warps=8, num_stages=2),
-}
+  }
 # fmt: on
 
 
 # Persistent TGMM tuning database for gfx942.
 # fmt: off
-BEST_PERSISTENT_TGMM_CONFIGS: dict[ConfigKey, Config] = {
+    BEST_PERSISTENT_TGMM_CONFIGS: dict[ConfigKey, Config] = {
     # NN
     ConfigKey(M=  49152, K= 1408, N= 2048, G=64): Config(block_size_m=32, block_size_k=128, block_size_n=256, group_size=4, grid_dim=304, num_warps=8, num_stages=2),
     ConfigKey(M=3145728, K= 2048, N= 1408, G= 8): Config(block_size_m=64, block_size_k=128, block_size_n=256, group_size=4, grid_dim=912, num_warps=4, num_stages=1),
@@ -178,13 +232,13 @@ BEST_PERSISTENT_TGMM_CONFIGS: dict[ConfigKey, Config] = {
 #
     ConfigKey(M=  32768, K= 6144, N=16384, G= 8, trans_lhs=True): Config(block_size_m=32, block_size_k=256, block_size_n=256, group_size=4, grid_dim=912, num_warps=8, num_stages=2),
     ConfigKey(M=  32768, K=16384, N= 6144, G= 8, trans_lhs=True): Config(block_size_m=32, block_size_k=256, block_size_n=256, group_size=4, grid_dim=304, num_warps=8, num_stages=2),
-}
+  }
 # fmt: on
 
 
 # Non-persistent TGMM tuning database for gfx942.
 # fmt: off
-BEST_NON_PERSISTENT_TGMM_CONFIGS: dict[ConfigKey, Config] = {
+    BEST_NON_PERSISTENT_TGMM_CONFIGS: dict[ConfigKey, Config] = {
     # NN
     ConfigKey(M=  49152, K= 1408, N= 2048, G=64): Config(grid_dim=None, block_size_m=32, block_size_k=128, block_size_n=256, group_size=2, num_warps=8, num_stages=2),
     ConfigKey(M=3145728, K= 2048, N= 1408, G= 8): Config(grid_dim=None, block_size_m=64, block_size_k=128, block_size_n=256, group_size=1, num_warps=8, num_stages=1),
@@ -197,7 +251,53 @@ BEST_NON_PERSISTENT_TGMM_CONFIGS: dict[ConfigKey, Config] = {
     ConfigKey(M= 393216, K= 2048, N= 1408, G=64, trans_lhs=True): Config(grid_dim=None, block_size_m= 32, block_size_k=256, block_size_n=256, group_size=2, num_warps=8, num_stages=2),
     ConfigKey(M=  32768, K= 6144, N=16384, G= 8, trans_lhs=True): Config(grid_dim=None, block_size_m= 32, block_size_k=256, block_size_n=256, group_size=1, num_warps=8, num_stages=2),
     ConfigKey(M=  32768, K=16384, N= 6144, G= 8, trans_lhs=True): Config(grid_dim=None, block_size_m= 32, block_size_k=256, block_size_n=256, group_size=1, num_warps=8, num_stages=2),
-}
+  }
+else:
+    BEST_GMM_CONFIGS: dict[ConfigKey, Config] = {
+    # NN
+    ConfigKey(M= 3145728, K= 1408, N= 2048, G = 64): Config(block_size_m=256, block_size_k=64, block_size_n=256, group_size=1, grid_dim=256, num_warps=8
+, num_stages=3),
+    ConfigKey(M= 3145728, K= 2048, N= 1408, G = 64): Config(block_size_m=256, block_size_k=64, block_size_n=256, group_size=1, grid_dim= 512, num_warps=
+8, num_stages=3),
+      # NT
+    ConfigKey(M = 3145728, K= 1408, N= 2048, G= 64, trans_rhs=True): Config(block_size_m=256, block_size_k= 64, block_size_n=256, group_size=8, grid_dim
+= 256, num_warps=8, num_stages=2),
+    ConfigKey(M = 3145728, K= 2048, N= 1408, G= 64, trans_rhs=True): Config(block_size_m=256, block_size_k= 64, block_size_n=256, group_size=2, grid_dim
+= 512, num_warps=8, num_stages=2),
+       # NN
+    ConfigKey(M= 540672, K= 1408, N= 2048, G = 64): Config(block_size_m=256, block_size_k=64, block_size_n=256, group_size=4, grid_dim=256, num_warps=8,
+ num_stages=3),
+    ConfigKey(M= 540672, K= 2048, N= 1408, G = 64): Config(block_size_m=256, block_size_k=64, block_size_n=256, group_size=1, grid_dim= 256, num_warps=8
+, num_stages=3),
+      # NT
+    ConfigKey(M = 540672, K= 1408, N= 2048, G= 64, trans_rhs=True): Config(block_size_m=256, block_size_k= 64, block_size_n=256, group_size=4, grid_dim=
+ 256, num_warps=8, num_stages=3),
+    ConfigKey(M = 540672, K= 2048, N= 1408, G= 64, trans_rhs=True): Config(block_size_m=256, block_size_k= 64, block_size_n=256, group_size=2, grid_dim=
+ 256, num_warps=8, num_stages=2),
+
+  }
+
+# Persistent TGMM tuning database for gfx950
+# fmt: off
+    BEST_PERSISTENT_TGMM_CONFIGS: dict[ConfigKey, Config] = {
+    # TN
+      ConfigKey(M=3145728, K= 1408, N= 2048, G= 64, trans_lhs=True): Config(block_size_m=64, block_size_k=256, block_size_n=256, group_size=8, 
+        grid_dim=256, num_warps=8, num_stages=3),
+      ConfigKey(M=3145728, K= 2048, N= 1408, G= 64, trans_lhs=True): Config(block_size_m=64, block_size_k=256, block_size_n=256, group_size=2, 
+        grid_dim=256, num_warps=8, num_stages=3),
+      ConfigKey(M=540672, K= 1408, N= 2048, G= 64, trans_lhs=True): Config(block_size_m=64, block_size_k=256, block_size_n=256, group_size=8, 
+        grid_dim=256, num_warps=8, num_stages=3),
+      ConfigKey(M=540672, K= 2048, N= 1408, G= 64, trans_lhs=True): Config(block_size_m=64, block_size_k=256, block_size_n=256, group_size=2, 
+        grid_dim=256, num_warps=8, num_stages=3),
+
+     } 
+    BEST_NON_PERSISTENT_TGMM_CONFIGS: dict[ConfigKey, Config] = {
+    # NN
+      ConfigKey(M=  49152, K= 1408, N= 2048, G=64): Config(grid_dim=None, block_size_m=32, block_size_k=128, block_size_n=256, group_size=2, 
+          num_warps=8, num_stages=2),
+      ConfigKey(M=  49152, K= 1408, N= 2048, G=64, trans_lhs=True): Config(grid_dim=None, block_size_m= 32, block_size_k=256, block_size_n=256, 
+           group_size=8, num_warps=8, num_stages=2),
+    }
 # fmt: on
 
 
@@ -245,6 +345,9 @@ def _pick_best_config(
             block_size_k=block_size_k,
             block_size_n=block_size_n,
             grid_dim=default_config.grid_dim,
+            num_warps = default_config.num_warps,
+            num_stages = default_config.num_stages,
+
         )
     logging.debug("Best %s config for %s is %s.", desc, config_key, best_config)
     return best_config
@@ -425,4 +528,3 @@ if __name__ == "__main__":
 #        output_type = jnp.bfloat16,
 #        trans_lhs = True,
 #     )
-#  )
