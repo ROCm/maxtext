@@ -19,6 +19,7 @@ import re
 import jax
 import jax.numpy as jnp
 import triton
+from jax._src.lib import gpu_triton as triton_kernel_call_lib
 
 #def is_tpu() -> bool:
 #  return "TPU" in jax.devices()[0].device_kind
@@ -97,3 +98,35 @@ def select_input_dtype(lhs: jnp.ndarray, rhs: jnp.ndarray) -> jnp.dtype:
     return jnp.bfloat16
   else:
     return jnp.float32
+def get_arch():
+    arch = triton_kernel_call_lib.get_arch_details("0")
+    arch = arch.split(":")[0]
+    return arch
+
+def num_sms( ) -> int:
+    """
+    #    available_devices = jax.devices()
+    # Filter for GPU devices and extract information.
+    #    gpu_devices = [d for d in available_devices if d.platform == 'gpu']
+    #    num_sms = -1;
+    #    if not gpu_devices:
+    #        print("No GPU devices found.")
+    #    else:
+    #        gpu_name = gpu_devices[0].device_kind
+    #        if "MI35" in gpu_name:
+    #            print("AMD MI35X GPU")
+    #            num_sms = 256
+    #        if "MI300X" in gpu_name or "MI325X" in gpu_name:
+    #            print("AMD MI300X or MI325 GPU")
+    #            num_sms = 304
+    #    assert num_sms, f"Number of SMs must be positive (it's {num_sms}).
+    """
+    arch = get_arch()
+    match arch:
+        case "gfx950":
+            num_sms = 256
+        case  "gfx942":
+            num_sms = 304
+        case _:
+            num_sms = -1   
+    return num_sms
