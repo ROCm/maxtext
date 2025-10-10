@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+"""
+This script outputs the minimal versions of the c4/en dataset to be able to decouple the 
+maxtext repository from Google Cloud dependencies. Using this script, we are also pushing
+a minimal version of the 3.0.1 version of the c4/en dataset. The minimal version that is 
+generated has similar sharding with original dataset, and train and validation 
+array_records.
+
+Technical Details:
+-Connects to MinIO
+-Chooses the smallest shard per split (train/validation) for each c4/en version
+-Range-downloads TFRecord shards to avoid large downloads
+-Writes multiple ArrayRecord shards locally with strict per-shard byte caps (to keep files small)
+-The script uses per-shard byte caps to ensure no output file exceeds your target. Tune MAX_OUTPUT_SHARD_BYTES for stricter limits.
+-Range downloads are only used for TFRecord shards; ArrayRecord readers expect full files, so we always download the smallest full ArrayRecord shard if available.
+-If you need even smaller totals, reduce EXACT_TRAIN_RECORDS and EXACT_VAL_RECORDS and/or shard counts.
+-Uses round-robin distribution across shards to simulate real behavior
+
+Note: Replace the MINIO_ACCESS_KEY and MINIO_SECRET_KEY with your keys.
+"""
+
 import os
 import glob
 import sys
@@ -18,8 +38,8 @@ import tensorflow as tf
 
 # MinIO connection
 MINIO_ENDPOINT = "minio-frameworks.amd.com"
-MINIO_ACCESS_KEY = "oMqjz9N0TAfNEpGpLWe3"
-MINIO_SECRET_KEY = "N5b0DFI12HKmGtupWpAtWMRZl8z9XWBdE1vDPaVL"
+MINIO_ACCESS_KEY = "hidden"
+MINIO_SECRET_KEY = "hidden"
 MINIO_SECURE = True
 BUCKET = "datasets.dl"
 
