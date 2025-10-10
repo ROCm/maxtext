@@ -39,7 +39,6 @@ from typing import Sequence
 
 from absl import app
 import os
-
 import jax
 
 from flax.linen import partitioning as nn_partitioning
@@ -161,6 +160,8 @@ def train(mt_config, goodput_recorder=None):
 
   with mesh, nn_partitioning.axis_rules(mt_config.logical_axis_rules):
     trainer.train(data_hooks.train_data_iterator, data_hooks.eval_data_iterator)
+
+  return trainer, mesh
 
 
 def main(argv: Sequence[str]) -> None:

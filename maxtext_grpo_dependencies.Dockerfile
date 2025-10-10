@@ -1,5 +1,3 @@
-# !/bin/bash
-
 # Copyright 2023–2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,22 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This script installs the dependencies for running GRPO with MaxText+Tunix+vLLM on TPUs
+ARG BASEIMAGE
+FROM ${BASEIMAGE}
+ARG MODE
 
-set -e
-set -x
+ENV MODE=$MODE
 
-python -m ensurepip --default-pip
+RUN echo "Installing GRPO dependencies (vLLM, tpu-common, tunix) with MODE=${MODE}"
 
-pip uninstall -y jax jaxlib libtpu
 
-pip install aiohttp==3.12.15
+# Uninstall existing jax to avoid conflicts
+RUN pip uninstall -y jax jaxlib libtpu
+
+RUN pip install aiohttp==3.12.15
 
 # Install Python packages that enable pip to authenticate with Google Artifact Registry automatically.
-pip install keyring keyrings.google-artifactregistry-auth
+RUN pip install keyring keyrings.google-artifactregistry-auth
+
+RUN pip install numba==0.61.2
 
 # Install vLLM for Jax and TPUs from the artifact registry
-VLLM_TARGET_DEVICE="tpu" pip install --no-cache-dir --pre \
+RUN VLLM_TARGET_DEVICE="tpu" pip install --no-cache-dir --pre \
     --index-url https://us-python.pkg.dev/cloud-tpu-images/maxtext-rl/simple/ \
     --extra-index-url https://pypi.org/simple/ \
     --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
@@ -42,11 +45,15 @@ VLLM_TARGET_DEVICE="tpu" pip install --no-cache-dir --pre \
     vllm==0.11.1rc1.dev292+g1b86bd8e1.tpu
 
 # Install tpu-commons from the artifact registry
-pip install --no-cache-dir --pre \
+RUN pip install --no-cache-dir --pre \
     --index-url https://us-python.pkg.dev/cloud-tpu-images/maxtext-rl/simple/ \
     --extra-index-url https://pypi.org/simple/ \
     --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
     --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
     tpu-commons==0.1.2
 
-pip install numba==0.61.2
+RUN if [ "$MODE" = "grpo-experimental" ]; then \
+    pip uninstall -y jax jaxlib libtpu && \
+    pip install --pre -U jax jaxlib -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ && \
+    pip install -U --pre libtpu -f https://storage.googleapis.com/jax-releases/libtpu_releases.html; \
+    fi
