@@ -24,10 +24,11 @@ MINIO_SECURE = True
 BUCKET = "datasets.dl"
 
 # Versions of c4/en to sample
-VERSIONS = ["3.0.1", "3.0.5", "3.0.7", "3.0.8", "3.0.9"]
+#VERSIONS = ["3.0.1", "3.0.5", "3.0.7", "3.0.8", "3.0.9"]
+VERSIONS = ["3.0.1"]
 
 # Local output base
-LOCAL_BASE = "/home/ggudukba/maxtext/c4_en_dataset/c4/en"
+LOCAL_BASE = "c4_en_dataset_minimal/c4/en"
 
 # Shard counts (simulate real behavior)
 NUM_SHARDS_TRAIN = 8
@@ -192,7 +193,6 @@ def main():
     print("Bucket exists. Starting minimal dataset creation...")
     ensure_dir(LOCAL_BASE)
 
-    client = Minio("minio-frameworks.amd.com", access_key="hidden", secret_key="hidden", secure=True)
 
     print("Listing c4/en top-level entries (non-recursive):")
     for obj in client.list_objects(BUCKET, prefix="c4/en", recursive=False):
