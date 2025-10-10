@@ -191,6 +191,32 @@ if [[ ${INSTALL_POST_TRAINING} -eq 1 ]] ; then
     -t ${LOCAL_IMAGE_NAME} .
 fi
 
+if [[ ${INSTALL_GRPO} -eq 1 ]] ; then
+  if [[ ${DEVICE} != "tpu" ]] ; then
+    echo "Error: MODE=grpo is only supported for DEVICE=tpu"
+    exit 1
+  fi
+
+  # # To install tpu_commons from a local path, we copy it into the build context, excluding __pycache__.
+  # # This assumes vllm, tunix, tpu_commons is a sibling directory to the current one (maxtext).
+  # rsync -a --exclude='__pycache__' ../tpu_commons .
+  # # To install vllm from a local path, we copy it into the build context, excluding __pycache__.
+  # # This assumes vllm is a sibling directory to the current one (maxtext).
+  # rsync -a --exclude='__pycache__' ../vllm .
+
+  # rsync -a --exclude='__pycache__' ../tunix .
+
+  # # The cleanup is set to run even if the build fails to remove the copied directory.
+  # trap "rm -rf ./tpu_commons ./vllm ./tunix" EXIT INT TERM
+
+  docker build \
+    --network host \
+    --build-arg BASEIMAGE=${LOCAL_IMAGE_NAME} \
+    --build-arg MODE=${MODE} \
+    -f ./maxtext_grpo_dependencies.Dockerfile \
+    -t ${LOCAL_IMAGE_NAME} .
+fi
+
 if [[ ${CUSTOM_JAX} -eq 1 ]] ; then
   echo "Installing custom jax and jaxlib"
   docker build --network host \

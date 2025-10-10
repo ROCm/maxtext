@@ -177,6 +177,8 @@ def train(mt_config, goodput_recorder=None):
   trainer = train_model(mt_config, trainer, mesh)
   return trainer, mesh
 
+  return trainer, mesh
+
 
 def main(argv: Sequence[str]) -> None:
   """Main function to run SFT training.

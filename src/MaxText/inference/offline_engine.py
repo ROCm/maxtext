@@ -469,6 +469,28 @@ class InferenceWorker:
 
     max_logging.log("InferenceWorker state reset complete")
 
+  def reset_state(self):
+    """Reset all worker state for a new inference run.
+
+    This allows reusing the same InferenceWorker instance across multiple
+    batch_inference calls without recreating the expensive engine components.
+    """
+    max_logging.log("Resetting InferenceWorker state")
+
+    # Reset inference state
+    self.running = False
+    self.completion_tokens_by_id = defaultdict(list)
+    self.prompt_logprobs_by_id = defaultdict(list)
+    self.empty_decode_slots = set()
+    for i in range(self.decode_batch_size):
+      self.empty_decode_slots.add(i)
+    self.slot_to_id = {}
+    self.true_lengths = {}
+    self.detokenization_queue = queue.Queue()
+    self.completed_sequences = set()
+
+    max_logging.log("InferenceWorker state reset complete")
+
   def run_inference(self, data: list[InputData], rng=None):
     """Start the inference process.
 
