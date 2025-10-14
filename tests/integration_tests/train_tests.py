@@ -24,11 +24,17 @@ from absl.testing import absltest
 class TrainTests(unittest.TestCase):
   """Tests train.py with various configs"""
 
+  decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+  _base_output_directory = (
+    os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs")
+    if decoupled
+    else "gs://runner-maxtext-logs"
+  )
   CONFIGS = {
       "base": [  # short test for train.py with TFDS c4
           None,
           os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "steps=2",
@@ -39,7 +45,7 @@ class TrainTests(unittest.TestCase):
       "synthetic": [  # tests base config with synthetic dataset
           None,
           os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "steps=2",
@@ -51,7 +57,7 @@ class TrainTests(unittest.TestCase):
       "pdb_lt_1": [  # tests base config with per_device_batch_size < 1
           None,
           os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "steps=2",
@@ -64,7 +70,7 @@ class TrainTests(unittest.TestCase):
       "tp_transpose": [  # tests base config with ici_tensor_transpose_parallelism=4
           None,
           os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "steps=2",
@@ -75,7 +81,7 @@ class TrainTests(unittest.TestCase):
       "int8": [  # tests base config with int8
           None,
           os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "quantization=int8",
@@ -87,7 +93,7 @@ class TrainTests(unittest.TestCase):
       "fp8": [  # tests base config with fp8
           None,
           os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "quantization=fp8",
@@ -99,7 +105,7 @@ class TrainTests(unittest.TestCase):
       "nanoo_fp8": [  # tests base config with nanoo_fp8
           None,
           os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "quantization=nanoo_fp8",
@@ -111,7 +117,7 @@ class TrainTests(unittest.TestCase):
       "dropout": [  # tests base config with dropout
           None,
           os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "steps=2",
@@ -125,7 +131,7 @@ class TrainTests(unittest.TestCase):
       "hf_input_pipeline": [  # test for train.py with TFDS c4, using HF input pipeline
           None,
           os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "steps=2",
           "enable_checkpointing=False",
@@ -219,7 +225,7 @@ class TrainTests(unittest.TestCase):
     cudnn_flash_te = [  # tests base config on GPU with flash attention"""
         None,
         os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-        "base_output_directory=gs://runner-maxtext-logs",
+    f"base_output_directory={TrainTests._base_output_directory}",
         "run_name=runner_test",
         "dataset_path=gs://maxtext-dataset",
         "steps=2",
@@ -238,7 +244,7 @@ class TrainTests(unittest.TestCase):
     context_parallel = [  # tests base config on GPU with context parallelism and flash attention"""
         None,
         os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-        "base_output_directory=gs://runner-maxtext-logs",
+    f"base_output_directory={TrainTests._base_output_directory}",
         "run_name=runner_test",
         "dataset_path=gs://maxtext-dataset",
         "steps=10",
@@ -260,7 +266,7 @@ class TrainTests(unittest.TestCase):
     tensor_parallel = [  # tests base config on GPU with context parallelism and flash attention"""
         None,
         os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-        "base_output_directory=gs://runner-maxtext-logs",
+    f"base_output_directory={TrainTests._base_output_directory}",
         "run_name=runner_test",
         "dataset_path=gs://maxtext-dataset",
         "steps=10",
@@ -281,7 +287,7 @@ class TrainTests(unittest.TestCase):
     optimizer_offload = [  # tests base config on GPU with optimizer state offload"""
         None,
         os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-        "base_output_directory=gs://runner-maxtext-logs",
+    f"base_output_directory={TrainTests._base_output_directory}",
         "run_name=runner_test",
         "dataset_path=gs://maxtext-dataset",
         "steps=10",
@@ -301,7 +307,7 @@ class TrainTests(unittest.TestCase):
     parameter_offload = [  # tests base config on GPU with parameter offload"""
         None,
         os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-        "base_output_directory=gs://runner-maxtext-logs",
+    f"base_output_directory={TrainTests._base_output_directory}",
         "run_name=runner_test",
         "dataset_path=gs://maxtext-dataset",
         "steps=10",
@@ -320,7 +326,7 @@ class TrainTests(unittest.TestCase):
     cudnn_flash_jax = [  # tests base config on GPU with flash attention"""
         None,
         os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-        "base_output_directory=gs://runner-maxtext-logs",
+    f"base_output_directory={TrainTests._base_output_directory}",
         "run_name=runner_test",
         "dataset_path=gs://maxtext-dataset",
         "steps=2",

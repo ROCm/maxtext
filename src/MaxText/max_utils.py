@@ -607,12 +607,20 @@ def print_model_vars(print_str, model_vars):
 
 def get_project():
   """Get project"""
-  completed_command = subprocess.run(["gcloud", "config", "get", "project"], check=True, capture_output=True)
-  project_outputs = completed_command.stdout.decode().strip().split("\n")
-  if len(project_outputs) < 1 or project_outputs[-1] == "":
-    max_logging.log("You must specify config.vertex_tensorboard_project or set 'gcloud config set project <project>'")
+  # When decoupling from Google Cloud, avoid invoking gcloud CLI entirely.
+  if os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE":
+    # Return a placeholder so code paths expecting a project string still work.
+    return os.environ.get("LOCAL_GCLOUD_PROJECT", "local-maxtext-project")
+  try:
+    completed_command = subprocess.run(["gcloud", "config", "get", "project"], check=True, capture_output=True)
+    project_outputs = completed_command.stdout.decode().strip().split("\n")
+    if len(project_outputs) < 1 or project_outputs[-1] == "":
+      max_logging.log("You must specify config.vertex_tensorboard_project or set 'gcloud config set project <project>'")
+      return None
+    return project_outputs[-1]
+  except (FileNotFoundError, subprocess.CalledProcessError) as ex:
+    max_logging.log(f"Unable to retrieve gcloud project (decouple={os.environ.get('DECOUPLE_GCLOUD')}): {ex}")
     return None
-  return project_outputs[-1]
 
 
 def delete_pytree(p):

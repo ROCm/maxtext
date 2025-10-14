@@ -27,14 +27,26 @@ class Train(unittest.TestCase):
 
   def test_tiny_config(self):
     test_tmpdir = os.environ.get("TEST_TMPDIR")  # pylint: disable=unused-variable
+    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    dataset_path = (
+        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "c4_en_dataset_minimal") if decoupled else "gs://maxtext-dataset"
+    )
+    base_output_directory = (
+        os.environ.get(
+            "LOCAL_BASE_OUTPUT",
+            os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs"),
+        )
+        if decoupled
+        else "gs://runner-maxtext-logs"
+    )
     train_main(
         [
             None,
             os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
             # pylint: disable=f-string-without-interpolation
-            f"base_output_directory=gs://runner-maxtext-logs",
+            f"base_output_directory={base_output_directory}",
             "run_name=runner_test",
-            r"dataset_path=gs://maxtext-dataset",
+            f"dataset_path={dataset_path}",
             "base_emb_dim=8",
             "base_num_query_heads=4",
             "base_num_kv_heads=4",

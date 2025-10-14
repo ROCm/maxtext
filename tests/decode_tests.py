@@ -27,49 +27,58 @@ from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT
 
 class DecodeTests(unittest.TestCase):
   """Tests decode with various configs."""
+  decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+  _dataset_path = (
+    os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "c4_en_dataset_minimal") if decoupled else "gs://maxtext-dataset"
+  )
+  _base_output_directory = (
+      os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs")
+      if decoupled
+      else "gs://runner-maxtext-logs"
+  )
 
   CONFIGS = {
-      "base": [  # tests decode
-          None,
-          os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
-          "run_name=runner_test",
-          "dataset_path=gs://maxtext-dataset",
-          "steps=2",
-          "enable_checkpointing=False",
-          "ici_tensor_parallelism=4",
-          "max_target_length=128",
-          "per_device_batch_size=1",
-          rf"tokenizer_path={os.path.join('src', MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
-      ],
-      "int8": [  # tests decode with int8 quantization
-          None,
-          os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
-          "run_name=runner_test",
-          "dataset_path=gs://maxtext-dataset",
-          "steps=2",
-          "enable_checkpointing=False",
-          "ici_tensor_parallelism=4",
-          "max_target_length=128",
-          "per_device_batch_size=1",
-          "quantization=int8",
-          "quantize_kvcache=True",
-          rf"tokenizer_path={os.path.join('src', MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
-      ],
-      "pdb_lt_1": [  # tests decode with per_device_batch_size < 1
-          None,
-          os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
-          "run_name=runner_test",
-          "dataset_path=gs://maxtext-dataset",
-          "steps=2",
-          "enable_checkpointing=False",
-          "ici_tensor_parallelism=4",
-          "max_target_length=128",
-          "per_device_batch_size=.25",
-          rf"tokenizer_path={os.path.join('src', MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
-      ],
+    "base": [
+      None,
+      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      f"base_output_directory={_base_output_directory}",
+      "run_name=runner_test",
+      f"dataset_path={_dataset_path}",
+      "steps=2",
+      "enable_checkpointing=False",
+      "ici_tensor_parallelism=4",
+      "max_target_length=128",
+      "per_device_batch_size=1",
+      rf"tokenizer_path={os.path.join('src', MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
+    ],
+    "int8": [
+      None,
+      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      f"base_output_directory={_base_output_directory}",
+      "run_name=runner_test",
+      f"dataset_path={_dataset_path}",
+      "steps=2",
+      "enable_checkpointing=False",
+      "ici_tensor_parallelism=4",
+      "max_target_length=128",
+      "per_device_batch_size=1",
+      "quantization=int8",
+      "quantize_kvcache=True",
+      rf"tokenizer_path={os.path.join('src', MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
+    ],
+    "pdb_lt_1": [
+      None,
+      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      f"base_output_directory={_base_output_directory}",
+      "run_name=runner_test",
+      f"dataset_path={_dataset_path}",
+      "steps=2",
+      "enable_checkpointing=False",
+      "ici_tensor_parallelism=4",
+      "max_target_length=128",
+      "per_device_batch_size=.25",
+      rf"tokenizer_path={os.path.join('src', MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
+    ],
   }
 
   @pytest.mark.tpu_only

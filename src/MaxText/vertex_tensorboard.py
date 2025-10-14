@@ -99,6 +99,10 @@ class VertexTensorboardManager:
 
   def configure_vertex_tensorboard(self, config):
     """Creates Vertex Tensorboard and start thread to upload data to Vertex Tensorboard."""
+    # Skip all Vertex related logic when decoupled from Google Cloud.
+    if os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE":
+      max_logging.log("DECOUPLE_GCLOUD=TRUE -> Skipping Vertex Tensorboard configuration.")
+      return
     if jax.process_index() == 0:
       if not os.environ.get("TENSORBOARD_PROJECT"):
         if not config.vertex_tensorboard_project:

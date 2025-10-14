@@ -63,6 +63,36 @@ install_maxtext_github_deps
 
 After installation, you can verify the package is available with `python3 -c "import MaxText"` and run training jobs with `python3 -m MaxText.train ...`.
 
+
+### Decoupled Mode (No Google Cloud Dependencies)
+
+Set `DECOUPLE_GCLOUD=TRUE` to run MaxText tests and local development without any Google Cloud SDK, `gs://` buckets, or Vertex AI integrations.
+
+When enabled:
+* All `gcloud` subprocess calls are skipped (a placeholder project string is returned or `None`).
+* Vertex Tensorboard creation/upload is disabled.
+* Test suite rewrites dataset paths to local minimal datasets under `rocm/c4_en_dataset_minimal`.
+* Smoke/decode tests use a local base output directory (you can override with `LOCAL_BASE_OUTPUT`).
+
+Minimal datasets included (checked into the repo):
+* ArrayRecord shards: generated via `python rocm/get_minimal_c4_en_dataset.py`, 
+located in `rocm/c4_en_dataset_minimal/c4/en/3.0.1/c4-{train,validation}.array_record-*`
+* Parquet (HF style): generated via `python rocm/get_minimal_hf_c4_parquet.py`, 
+located in `rocm/c4_en_dataset_minimal/hf/c4`
+
+
+Run a local smoke test fully offline:
+```bash
+export DECOUPLE_GCLOUD=TRUE
+pytest -k train_gpu_smoke_test -q
+```
+
+Optional environment variables:
+* `LOCAL_GCLOUD_PROJECT` - placeholder project string (default: `local-maxtext-project`).
+* `LOCAL_BASE_OUTPUT` - override default local output directory used in tests.
+
+
+
 ## 🔥 Latest news 🔥
 
 * \[September 26, 2025\] Vocabulary tiling ([PR](https://github.com/AI-Hypercomputer/maxtext/pull/2242)) is now supported in MaxText! Adjust config `num_vocab_tiling` to unlock more efficient memory usage.

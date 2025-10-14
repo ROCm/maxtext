@@ -41,11 +41,22 @@ def get_model_params(quantization):
 
 def run_e2e_test_flow(hardware, model_config, attention_type="autoselected", state_path=None):
   """Helper function to run training, generate parameter-only checkpoint, and decode."""
+  decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+  base_output_directory = (
+      os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs")
+      if decoupled
+      else "gs://runner-maxtext-logs"
+  )
+  dataset_path = (
+    os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "c4_en_dataset_minimal")
+    if decoupled
+    else "gs://maxtext-dataset"
+  )
   run_date = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
   test_config = [
       None,
       os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-      "base_output_directory=gs://runner-maxtext-logs",
+      f"base_output_directory={base_output_directory}",
       "async_checkpointing=False",
       f"hardware={hardware}",
       f"attention={attention_type}",
@@ -63,10 +74,10 @@ def run_e2e_test_flow(hardware, model_config, attention_type="autoselected", sta
             metrics_file="run_metrics.txt",
             attention_type=attention_type,
             dataset_type="tfds",
-            dataset_path="gs://maxtext-dataset",
+            dataset_path=dataset_path,
         )
     )
-    state_path = f"gs://runner-maxtext-logs/runner_{run_date}/checkpoints/0/items"
+    state_path = f"{base_output_directory}/runner_{run_date}/checkpoints/0/items"
 
   # Generate parameter-only checkpoint
   generate_param_only_ckpt_config = test_config + [
@@ -78,7 +89,7 @@ def run_e2e_test_flow(hardware, model_config, attention_type="autoselected", sta
   # Run inference on parameter-only checkpoint
   decode_config = test_config + [
       f"run_name=decode_{run_date}",
-      f"load_parameters_path=gs://runner-maxtext-logs/generate_param_{run_date}/checkpoints/0/items",
+      f"load_parameters_path={base_output_directory}/generate_param_{run_date}/checkpoints/0/items",
   ]
   decode_main(decode_config)
 
@@ -117,6 +128,8 @@ def test_param_ckpt_generation_with_pre_generated_ckpt(capsys):
       "model_name=gemma-2b",
       f"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizer.gemma')}",
   ]
+  if os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE":
+    pytest.skip("Skipping pre-generated checkpoint test in decoupled mode (requires remote GCS state)")
   run_e2e_test_flow(
       hardware="tpu",
       model_config=model_config,

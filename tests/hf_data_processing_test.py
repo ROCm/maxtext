@@ -32,6 +32,17 @@ class HfDataProcessingTest(unittest.TestCase):
 
   def setUp(self):
     super().setUp()
+    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    base_output_directory = (
+        os.path.join(
+            MAXTEXT_PKG_DIR,
+            "..",
+            "rocm",
+            "gcloud_decoupled_test_logs",
+        )
+        if decoupled
+        else "gs://max-experiments/"
+    )
     config = pyconfig.initialize(
         [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
         per_device_batch_size=1,
@@ -39,11 +50,23 @@ class HfDataProcessingTest(unittest.TestCase):
         mesh_axes=["data"],
         logical_axis_rules=[["batch", "data"]],
         data_sharding=["data"],
-        base_output_directory="gs://max-experiments/",
+        base_output_directory=base_output_directory,
         dataset_type="hf",
         hf_path="parquet",
         hf_data_dir="",
-        hf_train_files="gs://maxtext-dataset/hf/c4/c4-train-00000-of-01637.parquet",
+        hf_train_files=(
+            os.path.join(
+                MAXTEXT_PKG_DIR,
+                "..",
+                "rocm",
+                "c4_en_dataset_minimal",
+                "hf",
+                "c4",
+                "c4-train-00000-of-01637.parquet",
+            )
+            if os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+            else "gs://maxtext-dataset/hf/c4/c4-train-00000-of-01637.parquet"
+        ),
         tokenizer_path="google-t5/t5-large",
         enable_checkpointing=False,
     )

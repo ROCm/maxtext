@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for goodput_utils.py"""
+"""Tests for goodput_utils.py
+
+This test intentionally NOT auto-marked as 'decoupled'. When DECOUPLE_GCLOUD=TRUE we skip it
+entirely because it exercises Google Cloud Logging / Goodput integrations that are not
+available offline.
+"""
 
 import os
 import unittest
@@ -21,15 +26,18 @@ from MaxText.globals import MAXTEXT_PKG_DIR
 from unittest import mock
 from MaxText.utils.goodput_utils import create_goodput_recorder, maybe_monitor_goodput, maybe_record_goodput, GoodputEvent
 
+DECOUPLED = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
 
+@unittest.skipIf(DECOUPLED, "Skipping goodput utils tests in decoupled (no-GCP) mode")
 class GoodputUtilsTest(unittest.TestCase):
   """Tests for Goodput monitoring and recording."""
 
   def setUp(self):
     super().setUp()
+    base_output_directory = "gs://runner-maxtext-logs"
     self.config = pyconfig.initialize(
         [None, os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
-        base_output_directory="gs://runner-maxtext-logs",
+        base_output_directory=base_output_directory,
         run_name="runner_test",
         enable_checkpointing=False,
         monitor_goodput=True,

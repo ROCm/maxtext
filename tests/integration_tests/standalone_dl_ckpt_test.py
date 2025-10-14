@@ -38,13 +38,24 @@ class Standalone_DL_CKPT(unittest.TestCase):
   @pytest.mark.tpu_only
   def test_standalone_dataloader(self):
     random_run_name = self._get_random_test_name("standalone_dataloader")
+    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    base_output_directory = (
+        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs")
+        if decoupled
+        else "gs://runner-maxtext-logs"
+    )
+    dataset_path = (
+        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "c4_en_dataset_minimal")
+        if decoupled
+        else "gs://maxtext-dataset"
+    )
     sdl_main(
         (
             "",
             os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
             f"run_name={random_run_name}",
-            "base_output_directory=gs://runner-maxtext-logs",
-            "dataset_path=gs://maxtext-dataset",
+            f"base_output_directory={base_output_directory}",
+            f"dataset_path={dataset_path}",
             "steps=100",
             "enable_checkpointing=false",
             "enable_goodput_recording=False",
@@ -56,14 +67,25 @@ class Standalone_DL_CKPT(unittest.TestCase):
   @pytest.mark.tpu_only
   def test_standalone_checkpointer(self):
     random_run_name = self._get_random_test_name("standalone_checkpointer")
+    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    base_output_directory = (
+        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs")
+        if decoupled
+        else "gs://runner-maxtext-logs"
+    )
+    dataset_path = (
+        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "c4_en_dataset_minimal")
+        if decoupled
+        else "gs://maxtext-dataset"
+    )
     # checkpoint at 50
     sckpt_main(
         (
             "",
             os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
             f"run_name={random_run_name}",
-            "base_output_directory=gs://runner-maxtext-logs",
-            "dataset_path=gs://maxtext-dataset",
+            f"base_output_directory={base_output_directory}",
+            f"dataset_path={dataset_path}",
             "base_emb_dim=128",
             "base_num_query_heads=4",
             "base_num_kv_heads=4",
@@ -83,8 +105,8 @@ class Standalone_DL_CKPT(unittest.TestCase):
             "",
             os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
             f"run_name={random_run_name}",
-            "base_output_directory=gs://runner-maxtext-logs",
-            "dataset_path=gs://maxtext-dataset",
+      f"base_output_directory={base_output_directory}",
+            f"dataset_path={dataset_path}",
             "base_emb_dim=128",
             "base_num_query_heads=4",
             "base_num_kv_heads=4",
