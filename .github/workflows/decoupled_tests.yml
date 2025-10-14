@@ -16,22 +16,22 @@ on:
 
 jobs:
   decoupled:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest #will change
+    container:
+      image: rocm/jax:rocm7.0.2-jax0.6.0-py3.12-ubu24
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies (minimal)
+      
+      - name: Install dependencies (ROCm JAX base image)
         run: |
           python -m pip install --upgrade pip
-          pip install .[tpu] --no-cache-dir
-          install_maxtext_github_deps || true
-          pip install pytest
+          # Install core project in editable mode
+          pip install -e . --no-cache-dir || pip install . --no-cache-dir
+          # Install pinned stable stack requirements
+          pip install -r requirements_with_jax_stable_stack_0.6.0.txt --no-cache-dir
+          # Ensure pytest and plugins for csv/html reports
+          pip install pytest pytest-html pytest-csv
 
       - name: Generate minimal parquet (optional)
         env:
@@ -56,18 +56,21 @@ jobs:
             echo "ERROR: No tests collected under -m decoupled. Failing build." | tee -a maxtext/rocm/gcloud_decoupled_test_logs/ci.log
             exit 2
           fi
-          # Run tests and emit JUnit XML for summary
-          pytest maxtext/tests -m decoupled -q --junitxml=decoupled-tests-report.xml || EXIT=$?
-          EXEC_COUNT=$(grep -c '<testcase ' decoupled-tests-report.xml || true)
+          # Run tests producing CSV & HTML reports
+          pytest -vv maxtext/tests -m decoupled -q \
+            --csv=decoupled-tests-report.csv \
+            --html=decoupled-tests-report.html --self-contained-html || EXIT=$?
+          EXEC_COUNT=$(grep -E '^[^,]+,' decoupled-tests-report.csv | wc -l || true)
           echo "Executed $EXEC_COUNT testcases (exit=${EXIT:-0})" | tee -a maxtext/rocm/gcloud_decoupled_test_logs/ci.log
-          # Summary for GitHub UI
+          # Summary for GitHub UI (link style hints; artifacts uploaded next step)
           {
             echo "### Decoupled Test Run Summary";
             echo "Collected: $TEST_COUNT";
             echo "Executed: $EXEC_COUNT";
             echo "Exit Code: ${EXIT:-0}";
+            echo "Reports: CSV & HTML attached as artifacts.";
           } >> "$GITHUB_STEP_SUMMARY"
-          mv decoupled-tests-report.xml maxtext/rocm/gcloud_decoupled_test_logs/ 2>/dev/null || true
+          mv decoupled-tests-report.csv decoupled-tests-report.html maxtext/rocm/gcloud_decoupled_test_logs/ 2>/dev/null || true
           echo "Pytest exit code: ${EXIT:-0}" >> maxtext/rocm/gcloud_decoupled_test_logs/ci.log
           exit ${EXIT:-0}
 
