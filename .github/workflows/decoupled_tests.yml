@@ -1,0 +1,80 @@
+name: Decoupled Offline Tests
+
+on:
+  pull_request:
+    paths:
+      - 'maxtext/**'
+      - '.github/workflows/**'
+      - 'pyproject.toml'
+      - 'README.md'
+  push:
+    branches: [ main ]
+    paths:
+      - 'maxtext/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  decoupled:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies (minimal)
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[tpu] --no-cache-dir
+          install_maxtext_github_deps || true
+          pip install pytest
+
+      - name: Generate minimal parquet (optional)
+        env:
+          DECOUPLE_GCLOUD: TRUE
+        run: |
+          python maxtext/rocm/get_minimal_hf_c4_parquet.py --force --train-rows 200 --val-rows 40 || true
+
+      - name: Run decoupled tests
+        env:
+          DECOUPLE_GCLOUD: TRUE
+          LOCAL_GCLOUD_PROJECT: ci-decoupled
+          # Direct test outputs (checkpoints/logs) into the decoupled logs directory inside repo
+          LOCAL_BASE_OUTPUT: maxtext/rocm/gcloud_decoupled_test_logs
+        run: |
+          mkdir -p maxtext/rocm/gcloud_decoupled_test_logs
+          echo "Starting decoupled pytest run" >> maxtext/rocm/gcloud_decoupled_test_logs/ci.log
+          # Pre-collection to ensure at least one test is selected by the decoupled marker
+          COLLECT_OUTPUT=$(pytest maxtext/tests -m decoupled --collect-only -q)
+          TEST_COUNT=$(echo "$COLLECT_OUTPUT" | grep -v '^$' | wc -l)
+          echo "Collected $TEST_COUNT decoupled tests" | tee -a maxtext/rocm/gcloud_decoupled_test_logs/ci.log
+          if [ "$TEST_COUNT" -eq 0 ]; then
+            echo "ERROR: No tests collected under -m decoupled. Failing build." | tee -a maxtext/rocm/gcloud_decoupled_test_logs/ci.log
+            exit 2
+          fi
+          # Run tests and emit JUnit XML for summary
+          pytest maxtext/tests -m decoupled -q --junitxml=decoupled-tests-report.xml || EXIT=$?
+          EXEC_COUNT=$(grep -c '<testcase ' decoupled-tests-report.xml || true)
+          echo "Executed $EXEC_COUNT testcases (exit=${EXIT:-0})" | tee -a maxtext/rocm/gcloud_decoupled_test_logs/ci.log
+          # Summary for GitHub UI
+          {
+            echo "### Decoupled Test Run Summary";
+            echo "Collected: $TEST_COUNT";
+            echo "Executed: $EXEC_COUNT";
+            echo "Exit Code: ${EXIT:-0}";
+          } >> "$GITHUB_STEP_SUMMARY"
+          mv decoupled-tests-report.xml maxtext/rocm/gcloud_decoupled_test_logs/ 2>/dev/null || true
+          echo "Pytest exit code: ${EXIT:-0}" >> maxtext/rocm/gcloud_decoupled_test_logs/ci.log
+          exit ${EXIT:-0}
+
+      - name: Upload decoupled logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decoupled-logs
+          path: maxtext/rocm/gcloud_decoupled_test_logs
+          if-no-files-found: warn
