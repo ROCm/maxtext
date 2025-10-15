@@ -36,12 +36,12 @@ import tensorflow as tf
 # Configurable parameters
 # -----------------------
 
-# MinIO connection
-MINIO_ENDPOINT = "minio-frameworks.amd.com"
-MINIO_ACCESS_KEY = "hidden"
-MINIO_SECRET_KEY = "hidden"
-MINIO_SECURE = True
-BUCKET = "datasets.dl"
+# ------------ MinIO Connection Config (override via env) ------------
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio-frameworks.amd.com")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "hidden")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "hidden")
+MINIO_SECURE = os.environ.get("MINIO_SECURE", "true").lower() == "true"
+BUCKET = os.environ.get("MINIO_C4_BUCKET", "datasets.dl")
 
 # Versions of c4/en to sample
 #VERSIONS = ["3.0.1", "3.0.5", "3.0.7", "3.0.8", "3.0.9"]
