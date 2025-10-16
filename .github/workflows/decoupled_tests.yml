@@ -130,6 +130,26 @@ jobs:
           echo "Attach to container with: docker exec -it ${CONTAINER_NAME} bash" >> $GITHUB_STEP_SUMMARY
           echo "Remove when done: docker rm -f ${CONTAINER_NAME}" >> $GITHUB_STEP_SUMMARY
 
+      - name: Snapshot container image Artifact
+        if: always()
+        run: |
+          set -euo pipefail
+          CONTAINER_NAME="decouple_maxtext_tests"
+          IMAGE_TAG="maxtext-decoupled-tests:latest"
+          IMAGE_FILE="maxtext-decoupled-tests-image.tar.gz"
+          docker commit ${CONTAINER_NAME} ${IMAGE_TAG}
+          docker save ${IMAGE_TAG} | gzip -c > ${IMAGE_FILE}
+          ls -lh ${IMAGE_FILE} >> "${LOCAL_BASE_OUTPUT}/ci.log" || true
+          echo "Image snapshot saved as artifact candidate: ${IMAGE_FILE}" >> "${LOCAL_BASE_OUTPUT}/ci.log"
+
+      - name: Upload snapshot image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decoupled-docker-image
+          path: maxtext-decoupled-tests-image.tar.gz
+          if-no-files-found: warn
+
       - name: Upload decoupled logs
         if: always()
         uses: actions/upload-artifact@v4
