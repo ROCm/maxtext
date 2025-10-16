@@ -1,125 +1,130 @@
 #!/usr/bin/env python3
-"""Generate minimal HuggingFace-style C4 parquet shards using the MinIO instance.
+"""Minimal C4/en TFRecord -> Parquet converter.
 
-Same logic with ArrayRecord minimal generator (range selection + smallest shard) but for parquet.
-
-Outputs:
-  rocm/c4_en_dataset_minimal/hf/c4/c4-train-00000-of-01637.parquet
-  rocm/c4_en_dataset_minimal/hf/c4/c4-validation-00000-of-01637.parquet
-
-Appends logs to: rocm/gcloud_decoupled_test_logs/minimal_hf_parquet.log
+Fetch the first train & validation TFRecord 00000-of shard for a version and
+sample rows into two tiny parquet files with fixed output names for the usage
+in tests/grain_data_processing_test.py, tests/hf_data_processing_test.py,
+tests/train_tests.py:
+    c4-train-00000-of-01637.parquet
+    c4-validation-00000-of-01637.parquet
 """
-
-from __future__ import annotations
 
 import argparse
 import os
 from pathlib import Path
-from typing import List
 
 from minio import Minio
-from minio.error import S3Error
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# ------------ Remote Source Config (override via env) ------------
+import tensorflow as tf
+
+# ---------------- Environment / Defaults ----------------
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio-frameworks.amd.com")
 MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "hidden")
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "hidden")
 MINIO_SECURE = os.environ.get("MINIO_SECURE", "true").lower() == "true"
 BUCKET = os.environ.get("MINIO_C4_BUCKET", "datasets.dl")
+SCRIPT_DIR = Path(__file__).parent
 
-TRAIN_PREFIX = "c4/en/3.0.1/c4-train-"
-VAL_PREFIX = "c4/en/3.0.1/c4-validation-"
+def download_object(client: Minio, obj, dest_path: Path):
+    data = client.get_object(BUCKET, obj.object_name)
+    try:
+        with dest_path.open("wb") as f:
+            for chunk in data.stream(128 * 1024):
+                f.write(chunk)
+    finally:
+        data.close(); data.release_conn()
+    return dest_path
 
-# ------------ Local Output Paths ------------
-BASE_DIR = Path(__file__).parent / "c4_en_dataset_minimal" / "hf" / "c4"
-TRAIN_FILE = BASE_DIR / "c4-train-00000-of-01637.parquet"
-VAL_FILE = BASE_DIR / "c4-validation-00000-of-01637.parquet"
+def write_parquet(path: Path, rows: list[str]):
+    if path.exists():
+        print(f"[skip] {path} exists")
+        return
+    # Normalize & drop empties again defensively.
+    rows = [r.strip() for r in rows if isinstance(r, str) and r.strip()]
+    table = pa.Table.from_pydict({"text": rows})
+    pq.write_table(table, path, compression="ZSTD")
+    print(f"[write] {path} rows={len(rows)} size_kib={path.stat().st_size/1024:.1f}")
 
-LOG_DIR = Path(__file__).parent / "gcloud_decoupled_test_logs"
-LOG_FILE = LOG_DIR / "minimal_hf_parquet.log"
-
-
-def log(msg: str):
-  LOG_DIR.mkdir(parents=True, exist_ok=True)
-  with LOG_FILE.open("a", encoding="utf-8") as f:
-    f.write(msg + "\n")
-  print(msg)
-
-
-def list_smallest(client: Minio, prefix: str):
-  objs = sorted(
-      (o for o in client.list_objects(BUCKET, prefix=prefix, recursive=False)),
-      key=lambda o: getattr(o, "size", float("inf")),
-  )
-  return objs[0] if objs else None
-
-
-def fetch_rows(client: Minio, obj, row_cap: int) -> List[str]:
-  """Download parquet object and extract up to row_cap rows of 'text'."""
-  data = client.get_object(BUCKET, obj.object_name)
-  try:
-    blob = data.read()
-  finally:
-    data.close(); data.release_conn()
-  table = pq.read_table(pa.BufferReader(blob))
-  # Heuristic: if no 'text' column, pick first string column.
-  col_name = "text" if "text" in table.column_names else table.column_names[0]
-  col = table[col_name]
-  rows = [str(col[i].as_py()) for i in range(min(row_cap, col.length()))]
-  # Normalize minimal text (trim) to reduce size variability.
-  rows = [r.strip() for r in rows if isinstance(r, str) and r.strip()]
-  return rows
-
-
-def write_parquet(path: Path, rows: List[str], force: bool):
-  if path.exists() and not force:
-    log(f"[skip] {path} exists")
-    return
-  path.parent.mkdir(parents=True, exist_ok=True)
-  table = pa.Table.from_pydict({"text": rows})
-  pq.write_table(table, path, compression="ZSTD")
-  log(f"[write] {path} rows={len(rows)} size_kib={path.stat().st_size/1024:.1f}")
+def sample_tfrecord(path: Path, cap: int) -> list[str]:
+    """Sample up to `cap` records from a TFRecord, extracting only the 'text' feature.
+    Assumes each record is a serialized tf.train.Example with a bytes feature named 'text'.
+    Fails fast (raises) if parsing or feature access fails.
+    """
+    feature_spec = {"text": tf.io.FixedLenFeature([], tf.string)}
+    rows: list[str] = []
+    for raw in tf.data.TFRecordDataset(str(path)).take(cap):
+        parsed = tf.io.parse_single_example(raw, feature_spec)
+        txt = parsed["text"].numpy().decode("utf-8", "ignore").strip()
+        if txt:
+            rows.append(txt)
+    return rows
 
 
 def main():
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--force", action="store_true", help="Overwrite existing files")
-  parser.add_argument("--train-rows", type=int, default=800, help="Max train rows to sample")
-  parser.add_argument("--val-rows", type=int, default=160, help="Max validation rows to sample")
-  args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Minimal C4 TFRecord -> parquet generator")
+    p.add_argument("--version", default="3.0.1")
+    p.add_argument("--train-rows", type=int, default=800)
+    p.add_argument("--val-rows", type=int, default=160)
+    p.add_argument("--output-dir", default=str(SCRIPT_DIR / "c4_en_dataset_minimal" / "hf" / "c4"))
+    a = p.parse_args()
 
-  client = Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=MINIO_SECURE)
-  if not client.bucket_exists(BUCKET):
-    log(f"Bucket '{BUCKET}' does not exist. Abort.")
-    return
+    # Resolve output paths first so we can early stop.
+    out_dir = Path(a.output_dir)
+    if not out_dir.exists():
+        out_dir.mkdir(parents=True, exist_ok=True)
+    train_out = out_dir / "c4-train-00000-of-01637.parquet"
+    val_out = out_dir / "c4-validation-00000-of-01637.parquet"
+    if train_out.exists() and val_out.exists():
+        print("Both output parquet files already exist; skipping (no MinIO connection needed).")
+        return
 
-  try:
-    train_obj = list_smallest(client, TRAIN_PREFIX)
-    val_obj = list_smallest(client, VAL_PREFIX)
-  except S3Error as e:
-    log(f"List error: {e}")
-    return
+    client = Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=MINIO_SECURE)
+    if not client.bucket_exists(BUCKET):
+        print("Bucket missing; abort.")
+        return
 
-  if not train_obj or not val_obj:
-    log("Missing smallest shard(s); abort.")
-    return
+    ver = a.version
+    # List to find the first train 00000-of shard.
+    train_prefix = f"c4/en/{ver}/c4-train.tfrecord-00000-of-"
+    train_obj = None
+    for o in client.list_objects(BUCKET, prefix=train_prefix, recursive=False):
+        train_obj = o
+        break
+    if not train_obj:
+        print("Train 00000-of shard not found; abort.")
+        return
 
-  log(f"Train shard: {train_obj.object_name} size={train_obj.size/1024/1024:.2f} MiB")
-  log(f"Val shard: {val_obj.object_name} size={val_obj.size/1024/1024:.2f} MiB")
+    val_prefix = f"c4/en/{ver}/c4-validation.tfrecord-00000-of-"
+    val_obj = None
+    for o in client.list_objects(BUCKET, prefix=val_prefix, recursive=False):
+        val_obj = o
+        break
+    if not val_obj:
+        print("Validation 00000-of shard not found; abort.")
+        return
+    print(f"Using train object {train_obj.object_name} and validation object {val_obj.object_name}.")
 
-  try:
-    train_rows = fetch_rows(client, train_obj, args.train_rows)
-    val_rows = fetch_rows(client, val_obj, args.val_rows)
-  except S3Error as e:
-    log(f"Download error: {e}")
-    return
+    rows_train: list[str]
+    rows_val: list[str]
 
-  write_parquet(TRAIN_FILE, train_rows, args.force)
-  write_parquet(VAL_FILE, val_rows, args.force)
-  log("Done. Minimal HF parquet dataset generated.")
+    tmp_train = out_dir.parent / "_tmp_train"
+    download_object(client, train_obj, tmp_train)
+    rows_train = sample_tfrecord(tmp_train, a.train_rows)
+    try: tmp_train.unlink()
+    except Exception: pass
 
+    tmp_val = out_dir.parent / "_tmp_val"
+    download_object(client, val_obj, tmp_val)
+    rows_val = sample_tfrecord(tmp_val, a.val_rows)
+    try: tmp_val.unlink()
+    except Exception: pass
+
+    print(f"Rows: train={len(rows_train)} val={len(rows_val)}")
+    write_parquet(train_out, rows_train)
+    write_parquet(val_out, rows_val)
 
 if __name__ == "__main__":
-  main()
+    main()
+
