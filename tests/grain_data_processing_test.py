@@ -28,7 +28,7 @@ from MaxText import pyconfig
 from MaxText.input_pipeline import _grain_data_processing
 from MaxText.input_pipeline import input_pipeline_interface
 from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT, MAXTEXT_REPO_ROOT
-
+from maxtext.tests.test_utils import get_test_config_path
 
 class GrainArrayRecordProcessingTest(unittest.TestCase):
 
@@ -41,6 +41,7 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
     super().setUp()
     temp_dir = tempfile.gettempdir()
     decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+
     if decoupled:
       grain_train_files = os.path.join(
           MAXTEXT_PKG_DIR,
@@ -52,21 +53,28 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
           "3.0.1",
           "c4-train.array_record-*",
       )
+      base_output_directory = os.path.join(
+        MAXTEXT_PKG_DIR,
+        "..",
+        "rocm",
+        "gcloud_decoupled_test_logs",
+      )
+      config_file = get_test_config_path()
     else:
-      grain_train_files = os.path.join(temp_dir, "gcsfuse", "array-record", "c4", "en", "3.0.1", "c4-train.array_record*")
-      base_output_directory = (
-        os.path.join(
-            MAXTEXT_PKG_DIR,
-            "..",
-            "rocm",
-            "gcloud_decoupled_test_logs",
-        )
-        if decoupled
-        else "gs://max-experiments/"
-    )
+      grain_train_files = os.path.join(
+          temp_dir,
+          "gcsfuse",
+          "array-record",
+          "c4",
+          "en",
+          "3.0.1",
+          "c4-train.array_record*",
+      )
+    base_output_directory = "gs://max-experiments/"
+    config_file = get_test_config_path()
 
     self.config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], config_file],
         per_device_batch_size=1,
         run_name="test",
         mesh_axes=["data"],
@@ -133,9 +141,10 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
 class GrainArrayRecordProcessingWithMultiSourceBlendingTest(GrainArrayRecordProcessingTest):
 
   def setUp(self):
-    super().setUp()
+    # Override parent setUp to use multi-source blending
     temp_dir = tempfile.gettempdir()
     decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+
     if decoupled:
       base_pattern = os.path.join(
           MAXTEXT_PKG_DIR,
@@ -147,21 +156,24 @@ class GrainArrayRecordProcessingWithMultiSourceBlendingTest(GrainArrayRecordProc
           "3.0.1",
           "c4-train.array_record-*",
       )
+      base_output_directory = os.path.join(
+        MAXTEXT_PKG_DIR,
+        "..",
+        "rocm",
+        "gcloud_decoupled_test_logs",
+      )
+      config_file = get_test_config_path()
     else:
       base_pattern = f"{temp_dir}/gcsfuse/array-record/c4/en/3.0.1/c4-train.array_record*"
+      base_output_directory = "gs://max-experiments/"
+      config_file = get_test_config_path()
+      # Ensure GCS fuse mounted for cloud path usage
+      mount_gcsfuse()
+
     train_files_weighted = ";".join([f"{base_pattern}:0.3", f"{base_pattern}:0.7"])
-    base_output_directory = (
-        os.path.join(
-            MAXTEXT_PKG_DIR,
-            "..",
-            "rocm",
-            "gcloud_decoupled_test_logs",
-        )
-        if decoupled
-        else "gs://max-experiments/"
-    )
+
     self.config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], config_file],
         per_device_batch_size=1,
         run_name="test",
         mesh_axes=["data"],
@@ -196,6 +208,7 @@ class GrainParquetProcessingTest(unittest.TestCase):
     super().setUp()
     temp_dir = tempfile.gettempdir()
     decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+
     if decoupled:
       grain_train_file = os.path.join(
           MAXTEXT_PKG_DIR,
@@ -206,20 +219,26 @@ class GrainParquetProcessingTest(unittest.TestCase):
           "c4",
           "c4-train-00000-of-01637.parquet",
       )
+      base_output_directory = os.path.join(
+        MAXTEXT_PKG_DIR,
+        "..",
+        "rocm",
+        "gcloud_decoupled_test_logs",
+      )
+      config_file = get_test_config_path()
     else:
-      grain_train_file = os.path.join(temp_dir, "gcsfuse", "hf", "c4", "c4-train-00000-of-01637.parquet")
-    base_output_directory = (
-        os.path.join(
-            MAXTEXT_PKG_DIR,
-            "..",
-            "rocm",
-            "gcloud_decoupled_test_logs",
-        )
-        if decoupled
-        else "gs://max-experiments/"
-    )
+      grain_train_file = os.path.join(
+          temp_dir,
+          "gcsfuse",
+          "hf",
+          "c4",
+          "c4-train-00000-of-01637.parquet",
+      )
+    base_output_directory = "gs://max-experiments/"
+    config_file = get_test_config_path()
+
     self.config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], config_file],
         per_device_batch_size=1,
         run_name="test",
         mesh_axes=["data"],

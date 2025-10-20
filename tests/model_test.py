@@ -17,7 +17,6 @@ Model test.
 
 import sys
 import unittest
-import os.path
 
 import numpy as np
 import pytest
@@ -30,6 +29,7 @@ from MaxText import maxtext_utils
 from MaxText import pyconfig
 from MaxText.common_types import DECODING_ACTIVE_SEQUENCE_INDICATOR, MODEL_MODE_TRAIN, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
 from MaxText.globals import MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText.layers import models
 from MaxText.layers import quantizations
 
@@ -48,7 +48,7 @@ class TestModel(unittest.TestCase):
   def init_pyconfig(self, **kwargs):
     """Init pyconfig."""
     config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], get_test_config_path()],
         per_device_batch_size=1.0,
         run_name="test",
         enable_checkpointing=False,

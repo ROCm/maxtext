@@ -18,6 +18,7 @@ import pytest
 from MaxText.standalone_checkpointer import main as sckpt_main
 from MaxText.standalone_dataloader import main as sdl_main
 from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT
+from maxtext.tests.test_utils import get_test_config_path
 from datetime import datetime
 import random
 import string
@@ -52,7 +53,7 @@ class Standalone_DL_CKPT(unittest.TestCase):
     sdl_main(
         (
             "",
-            os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+            get_test_config_path(),
             f"run_name={random_run_name}",
             f"base_output_directory={base_output_directory}",
             f"dataset_path={dataset_path}",
@@ -82,7 +83,7 @@ class Standalone_DL_CKPT(unittest.TestCase):
     sckpt_main(
         (
             "",
-            os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+            get_test_config_path(),
             f"run_name={random_run_name}",
             f"base_output_directory={base_output_directory}",
             f"dataset_path={dataset_path}",
@@ -103,9 +104,9 @@ class Standalone_DL_CKPT(unittest.TestCase):
     sckpt_main(
         (
             "",
-            os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+            get_test_config_path(),
             f"run_name={random_run_name}",
-      f"base_output_directory={base_output_directory}",
+            f"base_output_directory={base_output_directory}",
             f"dataset_path={dataset_path}",
             "base_emb_dim=128",
             "base_num_query_heads=4",

@@ -21,6 +21,7 @@ import os
 import pytest
 
 from MaxText.globals import MAXTEXT_ASSETS_ROOT, MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText.train import main as train_main
 from MaxText.decode import main as decode_main
 from MaxText.generate_param_only_checkpoint import main as generate_param_only_ckpt_main
@@ -55,7 +56,7 @@ def run_e2e_test_flow(hardware, model_config, attention_type="autoselected", sta
   run_date = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
   test_config = [
       None,
-      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      get_test_config_path(),
       f"base_output_directory={base_output_directory}",
       "async_checkpointing=False",
       f"hardware={hardware}",

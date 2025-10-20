@@ -30,6 +30,7 @@ from math import isclose
 import os.path
 import pytest
 from MaxText.globals import MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText.train import main as train_main
 
 
@@ -44,7 +45,7 @@ def get_checkpointing_command(run_date, hardware, steps, metrics_file, attention
   ]
   return [
       None,
-      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      get_test_config_path(),
       f"hardware={hardware}",
       f"run_name=runner_{run_date}",
       f"steps={steps}",

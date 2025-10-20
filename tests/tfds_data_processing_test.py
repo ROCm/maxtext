@@ -26,6 +26,7 @@ import tensorflow_datasets as tfds
 
 from MaxText import pyconfig
 from MaxText.globals import MAXTEXT_ASSETS_ROOT, MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText.input_pipeline import _tfds_data_processing
 from MaxText.input_pipeline import input_pipeline_interface
 
@@ -35,17 +36,17 @@ class TfdsDataProcessingTest(unittest.TestCase):
   def setUp(self):
     super().setUp()
     config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
-        per_device_batch_size=1,
-        run_name="test",
-        mesh_axes=["data"],
-        logical_axis_rules=[["batch", "data"]],
-        data_sharding=["data"],
-        base_output_directory="gs://max-experiments/",
-        dataset_path="gs://maxtext-dataset/",
-        tokenizer_path=os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizer"),
-        enable_checkpointing=False,
-        eval_interval=10,
+      [sys.argv[0], get_test_config_path()],
+      per_device_batch_size=1,
+      run_name="test",
+      mesh_axes=["data"],
+      logical_axis_rules=[["batch", "data"]],
+      data_sharding=["data"],
+      base_output_directory="gs://max-experiments/",
+      dataset_path="gs://maxtext-dataset/",
+      tokenizer_path=os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizer"),
+      enable_checkpointing=False,
+      eval_interval=10,
     )
     os.environ["TFDS_DATA_DIR"] = config.dataset_path
     self.config = config

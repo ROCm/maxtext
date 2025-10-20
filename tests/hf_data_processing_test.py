@@ -24,6 +24,11 @@ from jax.experimental import mesh_utils
 
 from MaxText import pyconfig
 from MaxText.globals import MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import (
+  get_test_config_path,
+  get_local_or_cloud_dir,
+  get_local_or_cloud_dataset_path,
+)
 from MaxText.input_pipeline import _hf_data_processing
 from MaxText.input_pipeline import input_pipeline_interface
 
@@ -32,56 +37,50 @@ class HfDataProcessingTest(unittest.TestCase):
 
   def setUp(self):
     super().setUp()
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
-    base_output_directory = (
-        os.path.join(
-            MAXTEXT_PKG_DIR,
-            "..",
-            "rocm",
-            "gcloud_decoupled_test_logs",
-        )
-        if decoupled
-        else "gs://max-experiments/"
-    )
-    config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
-        per_device_batch_size=1,
-        run_name="test",
-        mesh_axes=["data"],
-        logical_axis_rules=[["batch", "data"]],
-        data_sharding=["data"],
-        base_output_directory=base_output_directory,
-        dataset_type="hf",
-        hf_path="parquet",
-        hf_data_dir="",
-        hf_train_files=(
-            os.path.join(
-                MAXTEXT_PKG_DIR,
-                "..",
-                "rocm",
-                "c4_en_dataset_minimal",
-                "hf",
-                "c4",
-                "c4-train-00000-of-01637.parquet",
-            )
-            if os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
-            else "gs://maxtext-dataset/hf/c4/c4-train-00000-of-01637.parquet"
-        ),
-        tokenizer_path="google-t5/t5-large",
-        enable_checkpointing=False,
-    )
-    self.config = config
-    self.mesh_shape_1d = (len(jax.devices()),)
-    self.mesh = Mesh(mesh_utils.create_device_mesh(self.mesh_shape_1d), self.config.mesh_axes)
-    self.process_indices = input_pipeline_interface.get_process_loading_real_data(
-        self.config.data_sharding,
-        self.config.global_batch_size_to_load,
-        self.config.global_batch_size_to_train_on,
-        self.config.max_target_length,
-        self.mesh,
-    )
+  temp_local_logs = os.path.join(
+    "rocm",
+    "gcloud_decoupled_test_logs",
+  )
+  base_output_directory = get_local_or_cloud_dir(
+    cloud_path="gs://max-experiments/",
+    local_relative=temp_local_logs,
+  )
+  config = pyconfig.initialize(
+    [sys.argv[0], get_test_config_path()],
+    per_device_batch_size=1,
+    run_name="test",
+    mesh_axes=["data"],
+    logical_axis_rules=[["batch", "data"]],
+    data_sharding=["data"],
+    base_output_directory=base_output_directory,
+    dataset_type="hf",
+    hf_path="parquet",
+    hf_data_dir="",
+    hf_train_files=get_local_or_cloud_dataset_path(
+      cloud_path="gs://maxtext-dataset/hf/c4/c4-train-00000-of-01637.parquet",
+      local_relative=os.path.join(
+        "rocm",
+        "c4_en_dataset_minimal",
+        "hf",
+        "c4",
+        "c4-train-00000-of-01637.parquet",
+      ),
+    ),
+    tokenizer_path="google-t5/t5-large",
+    enable_checkpointing=False,
+  )
+  self.config = config
+  self.mesh_shape_1d = (len(jax.devices()),)
+  self.mesh = Mesh(mesh_utils.create_device_mesh(self.mesh_shape_1d), self.config.mesh_axes)
+  self.process_indices = input_pipeline_interface.get_process_loading_real_data(
+    self.config.data_sharding,
+    self.config.global_batch_size_to_load,
+    self.config.global_batch_size_to_train_on,
+    self.config.max_target_length,
+    self.mesh,
+  )
 
-    self.train_iter = _hf_data_processing.make_hf_train_iterator(self.config, self.mesh, self.process_indices)
+  self.train_iter = _hf_data_processing.make_hf_train_iterator(self.config, self.mesh, self.process_indices)
 
   def test_train_ds(self):
     expected_shape = [jax.device_count(), self.config.max_target_length]

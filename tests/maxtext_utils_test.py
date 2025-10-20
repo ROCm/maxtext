@@ -16,7 +16,6 @@
 
 from typing import Any
 from collections.abc import Callable
-import os.path
 import unittest
 
 from jax import random, vmap
@@ -38,6 +37,7 @@ from MaxText import inference_utils
 from MaxText import pyconfig
 from MaxText.common_types import MODEL_MODE_TRAIN
 from MaxText.globals import MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText.layers import models
 from MaxText.layers import quantizations
 from MaxText.maxtext_utils import assert_params_sufficiently_sharded, get_formatted_sharding_annotations
@@ -176,7 +176,7 @@ class MaxUtilsInitStateWithMultipleCollections(unittest.TestCase):
 
   def setUp(self):
     self.config = pyconfig.initialize(
-        [None, os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")], enable_checkpointing=False
+        [None, get_test_config_path()], enable_checkpointing=False
     )
     self.model = ModelWithMultipleCollections()
     self.key1, self.key2, self.key3 = random.split(random.key(0), num=3)
@@ -214,7 +214,7 @@ class MaxUtilsInitTransformerState(unittest.TestCase):
 
   def setUp(self):
     self.config = pyconfig.initialize(
-        [None, os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")], enable_checkpointing=False
+        [None, get_test_config_path()], enable_checkpointing=False
     )
     devices_array = maxtext_utils.create_device_mesh(self.config)
     self.mesh = Mesh(devices_array, self.config.mesh_axes)

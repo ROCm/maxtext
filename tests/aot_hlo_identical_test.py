@@ -27,6 +27,7 @@ import hashlib
 import re
 import jax
 from MaxText.globals import MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText import train_compile
 from MaxText import train
 
@@ -138,10 +139,10 @@ class AotHloIdenticalTest(unittest.TestCase):
       shared_args.extend(extra_args)
 
     train_dump_dir = os.path.join(root, test_name, "real")
-    train_argv = (None, os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")) + tuple(shared_args)
+    train_argv = (None, get_test_config_path()) + tuple(shared_args)
     topology = self.get_device_user_facing_name()
     aot_args = [f"compile_topology={topology}", "compile_topology_num_slices=1"]
-    compile_argv = (None, os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")) + tuple(shared_args) + tuple(aot_args)
+    compile_argv = (None, get_test_config_path()) + tuple(shared_args) + tuple(aot_args)
     compile_dump_dir = os.path.join(root, test_name, "aot")
 
     # Cleanup directories before use

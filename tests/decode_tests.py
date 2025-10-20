@@ -23,6 +23,7 @@ from absl.testing import absltest
 
 from MaxText.decode import main as decode_main
 from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT
+from maxtext.tests.test_utils import get_test_config_path
 
 
 class DecodeTests(unittest.TestCase):
@@ -40,7 +41,7 @@ class DecodeTests(unittest.TestCase):
   CONFIGS = {
     "base": [
       None,
-      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      get_test_config_path(),
       f"base_output_directory={_base_output_directory}",
       "run_name=runner_test",
       f"dataset_path={_dataset_path}",
@@ -53,7 +54,7 @@ class DecodeTests(unittest.TestCase):
     ],
     "int8": [
       None,
-      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      get_test_config_path(),
       f"base_output_directory={_base_output_directory}",
       "run_name=runner_test",
       f"dataset_path={_dataset_path}",
@@ -68,7 +69,7 @@ class DecodeTests(unittest.TestCase):
     ],
     "pdb_lt_1": [
       None,
-      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      get_test_config_path(),
       f"base_output_directory={_base_output_directory}",
       "run_name=runner_test",
       f"dataset_path={_dataset_path}",
