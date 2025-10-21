@@ -34,6 +34,7 @@ from MaxText.gcloud_stub import is_decoupled
 from MaxText import pyconfig
 from MaxText.common_types import MODEL_MODE_TRAIN
 from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT
+from MaxText.layers import nnx_wrappers
 from MaxText.layers import pipeline
 from MaxText.layers import simple_layer
 from MaxText.train import main as train_main
@@ -79,7 +80,11 @@ class PipelineParallelismTest(unittest.TestCase):
           config=config, mesh=mesh, model_mode=model_mode, rngs=rngs
       )
     else:
-      single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode)
+      if issubclass(single_pipeline_stage_class, nnx_wrappers.ToLinen):
+        rngs = nnx.Rngs(params=0)
+        single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode, rngs=rngs)
+      else:
+        single_pipeline_stage = single_pipeline_stage_class(config=config, mesh=mesh, model_mode=model_mode)
 
     def get_inputs(batch_size, sequence, features):
       """Get random inputs, and random dummy targets
