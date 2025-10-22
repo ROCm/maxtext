@@ -22,7 +22,15 @@ import jax.numpy as jnp
 
 from absl import app
 
-from jetstream.engine import engine_api
+DECOUPLE_GCLOUD = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+if not DECOUPLE_GCLOUD:
+  from jetstream.engine import engine_api  # type: ignore
+else:
+  class _StubEngineApi:
+    class ResultTokens:  # minimal stub used in helper
+      def __init__(self, *args, **kwargs):
+        raise RuntimeError("ResultTokens unavailable (JetStream disabled; set DECOUPLE_GCLOUD=TRUE)")
+  engine_api = _StubEngineApi()  # type: ignore
 
 from MaxText import max_utils
 from MaxText import maxengine
@@ -112,6 +120,8 @@ def main(argv: Sequence[str]) -> None:
         text, image_placeholder=config.image_placeholder, model_name=config.model_name, num_images=len(images)
     )
 
+  if DECOUPLE_GCLOUD:
+    raise RuntimeError("JetStream disabled by DECOUPLE_GCLOUD=TRUE; decode requires JetStream tokenizer.")
   metadata = engine.get_tokenizer()
   tokenizer_model = engine.build_tokenizer(metadata)
   try:

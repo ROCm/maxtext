@@ -18,24 +18,37 @@ from typing import Any, Type
 
 import jax
 
-from jetstream.core import config_lib
-from jetstream.engine import engine_api
+import os
+DECOUPLE_GCLOUD = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+if not DECOUPLE_GCLOUD:
+  from jetstream.core import config_lib  # type: ignore
+  from jetstream.engine import engine_api  # type: ignore
+else:
+  class _Stub:
+    def __getattr__(self, name):
+      raise RuntimeError("JetStream config unavailable (DECOUPLE_GCLOUD TRUE)")
+  config_lib = _Stub()  # type: ignore
+  engine_api = _Stub()  # type: ignore
 
 from MaxText import maxengine
 
 
 # TODO: merge it with the above create_maxengine().
-def create_exp_maxengine(devices: config_lib.Devices, config: Any) -> engine_api.Engine:
+def create_exp_maxengine(devices: Any, config: Any):
+  if DECOUPLE_GCLOUD:
+    raise RuntimeError("JetStream disabled by DECOUPLE_GCLOUD=TRUE; experimental MaxEngine unsupported.")
   return maxengine.MaxEngine(config=config, devices=devices)
 
 
-def create_maxengine(devices: config_lib.Devices, config: Any) -> engine_api.Engine:
+def create_maxengine(devices: Any, config: Any):
   del devices
   return maxengine.MaxEngine(config)
 
 
-def get_server_config(config_str: str, config: Any) -> Type[config_lib.ServerConfig]:
-  """Gets the Server Config Required by JetStream"""
+def get_server_config(config_str: str, config: Any):
+  """Gets the Server Config Required by JetStream (disabled when DECOUPLE_GCLOUD=TRUE)."""
+  if DECOUPLE_GCLOUD:
+    raise RuntimeError("JetStream disabled by DECOUPLE_GCLOUD=TRUE; server config unsupported.")
   match config_str:
     case "MaxtextInterleavedServer":
       server_config = config_lib.ServerConfig(

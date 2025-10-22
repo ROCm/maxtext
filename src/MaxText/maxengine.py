@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Implementation of Engine API for MaxText."""
+"""Implementation of Engine API for MaxText.
+
+We conditionally import JetStream-related modules only when the environment
+variable DECOUPLE_GCLOUD=TRUE is set. This allows running local/unit tests
+without pulling in heavy Google/JetStream dependencies (grpc servers, device
+probing, etc.).
+"""
 
 from collections import defaultdict
 from typing import Any, Callable
@@ -36,12 +42,32 @@ from flax import struct
 from flax.linen import partitioning as nn_partitioning
 import flax
 
-from jetstream.core import config_lib
-from jetstream.engine import engine_api
-from jetstream.engine import token_utils
-from jetstream.engine import tokenizer_api
-from jetstream.engine.tokenizer_pb2 import TokenizerParameters
-from jetstream.engine.tokenizer_pb2 import TokenizerType
+DECOUPLE_GCLOUD = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+if not DECOUPLE_GCLOUD:
+  from jetstream.core import config_lib  # type: ignore
+  from jetstream.engine import engine_api  # type: ignore
+  from jetstream.engine import token_utils  # type: ignore
+  from jetstream.engine import tokenizer_api  # type: ignore
+  from jetstream.engine.tokenizer_pb2 import TokenizerParameters  # type: ignore
+  from jetstream.engine.tokenizer_pb2 import TokenizerType  # type: ignore
+else:
+  # Lightweight fallbacks to allow imports; calling methods relying on JetStream will raise.
+  class _Stub:
+    def __getattr__(self, name):  # pragma: no cover
+      raise RuntimeError(
+        f"JetStream dependency '{name}' unavailable because DECOUPLE_GCLOUD is not TRUE."
+      )
+  config_lib = _Stub()
+  engine_api = _Stub()
+  token_utils = _Stub()
+  tokenizer_api = _Stub()
+
+  class TokenizerParameters:  # minimal stub for type hints
+    def __init__(self, *args, **kwargs):
+      raise RuntimeError("JetStream TokenizerParameters unavailable (DECOUPLE_GCLOUD not TRUE)")
+
+  class TokenizerType:  # stub enum-like
+    DESCRIPTOR = _Stub()
 
 from MaxText import inference_utils
 from MaxText import max_utils
@@ -98,7 +124,7 @@ class MaxEngineConfig:
     return self.keys
 
 
-class MaxEngine(engine_api.Engine):
+class MaxEngine(engine_api.Engine if not DECOUPLE_GCLOUD else object):
   """The computational core of the generative model server.
 
   Engine defines an API that models must adhere to as they plug into the
@@ -1487,7 +1513,13 @@ class MaxEngine(engine_api.Engine):
     }
 
   def get_tokenizer(self) -> TokenizerParameters:
-    """Return a protobuf of tokenizer info, callable from Py or C++."""
+    """Return tokenizer parameters; requires JetStream when decoupled.
+
+    When DECOUPLE_GCLOUD is FALSE we provide a clear error instead of failing
+    cryptically on attribute access.
+    """
+    if DECOUPLE_GCLOUD:
+      raise RuntimeError("JetStream disabled by DECOUPLE_GCLOUD=TRUE; tokenizer unsupported.")
     try:
       tokenizer_type_val = TokenizerType.DESCRIPTOR.values_by_name[self.config.tokenizer_type].number
       return TokenizerParameters(
@@ -1500,8 +1532,9 @@ class MaxEngine(engine_api.Engine):
     except KeyError as _:
       raise KeyError(f"Unsupported tokenizer type: {self.config.tokenizer_type}") from None
 
-  def build_tokenizer(self, metadata: TokenizerParameters) -> tokenizer_api.Tokenizer:
-    """Return a tokenizer"""
+  def build_tokenizer(self, metadata: TokenizerParameters):  # return type depends on JetStream
+    if DECOUPLE_GCLOUD:
+      raise RuntimeError("JetStream disabled by DECOUPLE_GCLOUD=TRUE; build_tokenizer unsupported.")
     if metadata.tokenizer_type == TokenizerType.tiktoken:
       return token_utils.TikToken(metadata)
     elif metadata.tokenizer_type == TokenizerType.sentencepiece:
@@ -1647,14 +1680,8 @@ class MaxEngine(engine_api.Engine):
     raise NotImplementedError
 
 
-def set_engine_vars_from_base_engine(
-    engine: MaxEngine,
-    base_engine: MaxEngine,
-    rng: PRNGKeyType,
-):
-  """Set internal vars from base_engine, which has already loaded the checkpoint and has sharding,
-  mesh, and kv cache related vars set.
-  """
+def set_engine_vars_from_base_engine(engine: MaxEngine, base_engine: MaxEngine, rng: PRNGKeyType):
+  """Set internal vars from base_engine. Requires JetStream if quantization logic is invoked."""
   if base_engine.model.quant:
     engine.model.quant.quant_mode = base_engine.model.quant.quant_mode
   engine.state_mesh_annotations = base_engine.state_mesh_annotations

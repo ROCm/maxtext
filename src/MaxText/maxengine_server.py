@@ -17,9 +17,17 @@
 import os
 import sys
 
-import pathwaysutils  # pylint: disable=unused-import
-
-from jetstream.core import server_lib, config_lib
+import os
+DECOUPLE_GCLOUD = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+if not DECOUPLE_GCLOUD:
+  import pathwaysutils  # pylint: disable=unused-import
+  from jetstream.core import server_lib, config_lib  # type: ignore
+else:
+  class _Stub:
+    def __getattr__(self, name):
+      raise RuntimeError("JetStream server components unavailable (DECOUPLE_GCLOUD not TRUE)")
+  server_lib = _Stub()  # type: ignore
+  config_lib = _Stub()  # type: ignore
 
 import jax
 
@@ -37,7 +45,7 @@ from MaxText import maxengine_config
 # )
 
 
-def _create_prefix_caching_config(config) -> config_lib.PrefixCachingConfig | None:
+def _create_prefix_caching_config(config):
   if not config.enable_prefix_caching:
     return None
 
@@ -51,6 +59,8 @@ def _create_prefix_caching_config(config) -> config_lib.PrefixCachingConfig | No
 
 
 def main(config):
+  if DECOUPLE_GCLOUD:
+    raise RuntimeError("JetStream disabled by DECOUPLE_GCLOUD=TRUE; server unavailable.")
   pathwaysutils.initialize()
 
   # No devices for local cpu test. A None for prefill and a None for generate.
