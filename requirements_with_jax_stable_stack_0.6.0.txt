@@ -1,7 +1,5 @@
 absl_py==2.2.2
 aqtp==0.9.0
-#benchmark_db_writer==1.0.0.dev20250610
-#benchmark_db_writer.egg==info
 cloud_accelerator_diagnostics==0.1.1
 cloud_tpu_diagnostics==0.1.5
 chex==0.1.90
@@ -12,12 +10,9 @@ flax==0.10.7
 grain==0.2.10
 grpcio==1.72.0rc1
 huggingface_hub==0.33.0
-#jax==0.6.0
-#jaxlib==0.6.0 # Manually adding to ensure consistency in future
 jaxtyping==0.3.2
-#jetstream==0.1.0
+#google-jetstream @ https://github.com/AI-Hypercomputer/JetStream/archive/daedc21c393f23449fb54ddc4f75fca34348ea9c.zip
 jsonlines==4.0.0
-#libtpu==0.0.15 # Manually adding to ensure consistency in future
 matplotlib==3.10.3
 ml_collections==1.1.0
 ml_dtypes==0.5.1
@@ -53,4 +48,10 @@ tqdm==4.67.1
 #transformer_engine==2.4.0
 transformers==4.52.4
 trl==0.19.0
+#google-tunix[prod]
 urllib3==2.5.0
+https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.6.0/jaxlib-0.6.0-cp312-cp312-manylinux2014_x86_64.whl
+jax==0.6.0
+jax-rocm7-pjrt==0.6.0
+jax-rocm7-plugin==0.6.0
+

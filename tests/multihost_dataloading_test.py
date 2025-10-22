@@ -31,7 +31,7 @@ import tensorflow as tf
 from MaxText import pyconfig
 from MaxText import multihost_dataloading
 from MaxText.globals import MAXTEXT_PKG_DIR
-from MaxText.tests.test_utils import get_test_config_path
+from maxtext.tests.test_utils import get_test_config_path
 
 
 class MultihostDataloadingTest(unittest.TestCase):

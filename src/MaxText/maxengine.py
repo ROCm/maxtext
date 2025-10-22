@@ -21,7 +21,7 @@ import os.path
 import uuid
 import warnings
 
-from jax.experimental.layout import Format
+from jax.experimental.layout import Layout
 from jax.sharding import PartitionSpec as P
 import jax
 import jax.numpy as jnp

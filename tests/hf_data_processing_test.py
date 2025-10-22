@@ -24,11 +24,7 @@ from jax.experimental import mesh_utils
 
 from MaxText import pyconfig
 from MaxText.globals import MAXTEXT_PKG_DIR
-from maxtext.tests.test_utils import (
-  get_test_config_path,
-  get_local_or_cloud_dir,
-  get_local_or_cloud_dataset_path,
-)
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText.input_pipeline import _hf_data_processing
 from MaxText.input_pipeline import input_pipeline_interface
 
@@ -37,14 +33,12 @@ class HfDataProcessingTest(unittest.TestCase):
 
   def setUp(self):
     super().setUp()
+  decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
   temp_local_logs = os.path.join(
     "rocm",
     "gcloud_decoupled_test_logs",
   )
-  base_output_directory = get_local_or_cloud_dir(
-    cloud_path="gs://max-experiments/",
-    local_relative=temp_local_logs,
-  )
+  base_output_directory = (temp_local_logs if decoupled else "gs://max-experiments/")
   config = pyconfig.initialize(
     [sys.argv[0], get_test_config_path()],
     per_device_batch_size=1,
@@ -56,16 +50,13 @@ class HfDataProcessingTest(unittest.TestCase):
     dataset_type="hf",
     hf_path="parquet",
     hf_data_dir="",
-    hf_train_files=get_local_or_cloud_dataset_path(
-      cloud_path="gs://maxtext-dataset/hf/c4/c4-train-00000-of-01637.parquet",
-      local_relative=os.path.join(
+    hf_train_files=(os.path.join(
         "rocm",
         "c4_en_dataset_minimal",
         "hf",
         "c4",
         "c4-train-00000-of-01637.parquet",
-      ),
-    ),
+      ) if decoupled else "gs://maxtext-dataset/hf/c4/c4-train-00000-of-01637.parquet"),
     tokenizer_path="google-t5/t5-large",
     enable_checkpointing=False,
   )

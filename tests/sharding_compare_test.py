@@ -20,7 +20,7 @@ import os
 import pytest
 
 from MaxText.globals import MAXTEXT_PKG_DIR
-from MaxText.tests.test_utils import get_test_config_path
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText.train_compile import get_shaped_inputs, get_topology_mesh, validate_config
 from MaxText import pyconfig
 
