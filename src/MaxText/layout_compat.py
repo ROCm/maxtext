@@ -18,7 +18,7 @@ else:  # jax <= 0.6.0
     Format = Layout  # type: ignore
 
 # Device local layout provider; AUTO lives on Layout for newer versions.
-if _ver >= (0, 6, 3):  # AUTO moved to Layout by 0.6.3
+if _ver >= (0, 7, 0):  # AUTO moved to Layout by >= (0, 7, 0)
     DLL = Layout
 else:
     DLL = getattr(_layout, "DeviceLocalLayout", Layout)
