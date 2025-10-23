@@ -1,7 +1,6 @@
 absl_py==2.2.2
 aqtp==0.9.0
 cloud_accelerator_diagnostics==0.1.1
-cloud_tpu_diagnostics==0.1.5
 chex==0.1.90
 datasets==3.6.0
 etils==1.12.2
