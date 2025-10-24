@@ -21,15 +21,12 @@ import os.path
 import uuid
 import warnings
 
-from jax.experimental.layout import Format
-from jax.sharding import PartitionSpec as P
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
-if jax.__version_info__ >= (0, 6, 3):
-  from jax.experimental.layout import Layout as DLL  # type: ignore
-else:
-  from jax.experimental.layout import DeviceLocalLayout as DLL  # type: ignore
+# Centralized Layout/Format compatibility.
+from MaxText.layout_compat import Format, Layout, DLL
 
 from flax import linen as nn
 from flax import struct
@@ -167,7 +164,6 @@ class MaxEngine(engine_api.Engine):
 
     arg_layouts, _ = compiled_generate.input_formats
     generate_out_layouts, _ = compiled_generate.output_formats
-
     return compiled_generate, arg_layouts[0], arg_layouts[1], generate_out_layouts
 
   def _identity(self, x: Any) -> Any:
@@ -179,15 +175,19 @@ class MaxEngine(engine_api.Engine):
     """Lays out an array tensor by tensor to prevent OOMs."""
 
     def _layout(x, s, l):
-      if x.format == l:
+      if getattr(x, "format", None) == l:
         return x
       # Somehow this can be None sometimes.
-      dll = (l.layout if jax.__version_info__ >= (0, 6, 3) else l.device_local_layout) if isinstance(l, Format) else l
+      dll_attr = "layout" if jax.__version_info__ >= (0, 7, 0) else "device_local_layout"
+      dll = getattr(l, dll_attr, l)
       f = jax.jit(self._identity, out_shardings=Format(dll, s)).lower(x).compile(compiler_options=xla_flags)
       y = f(x)
       # Achieves donation of the input argument, but allows for different memory
       # layouts and shapes.
-      jax.tree.map(lambda z: z.delete(), x)
+      try:
+        jax.tree.map(lambda z: z.delete(), x)
+      except Exception:  # pragma: no cover
+        pass
       jax.block_until_ready(y)
       return y
 
