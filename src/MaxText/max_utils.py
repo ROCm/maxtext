@@ -37,6 +37,7 @@ import psutil
 from tensorboardX import writer
 
 from MaxText import max_logging
+from MaxText.decouple import is_decoupled
 from MaxText.common_types import MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN
 
 initialize_multi_tier_checkpointing = initialization.initialize_multi_tier_checkpointing
@@ -607,9 +608,7 @@ def print_model_vars(print_str, model_vars):
 
 def get_project():
   """Get project"""
-  # When decoupling from Google Cloud, avoid invoking gcloud CLI entirely.
-  if os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE":
-    # Return a placeholder so code paths expecting a project string still work.
+  if is_decoupled():
     return os.environ.get("LOCAL_GCLOUD_PROJECT", "local-maxtext-project")
   try:
     completed_command = subprocess.run(["gcloud", "config", "get", "project"], check=True, capture_output=True)
@@ -619,7 +618,7 @@ def get_project():
       return None
     return project_outputs[-1]
   except (FileNotFoundError, subprocess.CalledProcessError) as ex:
-    max_logging.log(f"Unable to retrieve gcloud project (decouple={os.environ.get('DECOUPLE_GCLOUD')}): {ex}")
+    max_logging.log(f"Unable to retrieve gcloud project (decoupled={is_decoupled()}): {ex}")
     return None
 
 

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import os.path
 import tempfile
+from MaxText.decouple import is_decoupled
 import unittest
 
 import jax
@@ -40,13 +41,13 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
   def setUp(self):
     super().setUp()
     temp_dir = tempfile.gettempdir()
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    decoupled = is_decoupled()
 
     if decoupled:
       grain_train_files = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "rocm",
+          "decoupled_datasets",
           "c4_en_dataset_minimal",
           "c4",
           "en",
@@ -56,7 +57,7 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
       base_output_directory = os.path.join(
         MAXTEXT_PKG_DIR,
         "..",
-        "rocm",
+        "decoupled_datasets",
         "gcloud_decoupled_test_logs",
       )
       config_file = get_test_config_path()
@@ -143,13 +144,13 @@ class GrainArrayRecordProcessingWithMultiSourceBlendingTest(GrainArrayRecordProc
   def setUp(self):
     # Override parent setUp to use multi-source blending
     temp_dir = tempfile.gettempdir()
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    decoupled = is_decoupled()
 
     if decoupled:
       base_pattern = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "rocm",
+          "decoupled_datasets",
           "c4_en_dataset_minimal",
           "c4",
           "en",
@@ -159,7 +160,7 @@ class GrainArrayRecordProcessingWithMultiSourceBlendingTest(GrainArrayRecordProc
       base_output_directory = os.path.join(
         MAXTEXT_PKG_DIR,
         "..",
-        "rocm",
+        "decoupled_datasets",
         "gcloud_decoupled_test_logs",
       )
       config_file = get_test_config_path()
@@ -207,13 +208,13 @@ class GrainParquetProcessingTest(unittest.TestCase):
   def setUp(self):
     super().setUp()
     temp_dir = tempfile.gettempdir()
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    decoupled = is_decoupled()
 
     if decoupled:
       grain_train_file = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "rocm",
+          "decoupled_datasets",
           "c4_en_dataset_minimal",
           "hf",
           "c4",
@@ -222,7 +223,7 @@ class GrainParquetProcessingTest(unittest.TestCase):
       base_output_directory = os.path.join(
         MAXTEXT_PKG_DIR,
         "..",
-        "rocm",
+        "decoupled_datasets",
         "gcloud_decoupled_test_logs",
       )
       config_file = get_test_config_path()
@@ -309,9 +310,9 @@ def mount_gcsfuse():
   Mounts a GCS bucket (gs://maxtext-dataset) to a local directory (/tmp/gcsfuse)
   using gcsfuse if not already mounted.
   """
-  if os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE":
-    # No-op when decoupled.
-    return
+  from MaxText.decouple import is_decoupled
+  if is_decoupled():
+    return  # No-op when decoupled.
   temp_dir = tempfile.gettempdir()
   mount_path = os.path.join(temp_dir, "gcsfuse")
 

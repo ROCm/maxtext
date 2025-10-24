@@ -70,6 +70,9 @@ def add_arguments_to_parser(parser):
   return parser
 
 
+import pytest
+
+@pytest.mark.external_training # Calls gsutil to pull tokenizer.
 class DistillationDataProcessingTest(unittest.TestCase):
 
   @classmethod

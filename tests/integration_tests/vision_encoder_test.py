@@ -36,6 +36,8 @@ from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_TEST_ASSETS_ROOT, MAXTEXT_A
 from maxtext.tests.test_utils import get_test_config_path
 from MaxText import maxengine
 
+pytestmark = [pytest.mark.external_serving]  # uses pre-generated multimodal checkpoint
+
 
 # 4b with vit
 DEFAULT_LOAD_PARAMETERS_PATH = (

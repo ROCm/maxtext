@@ -35,6 +35,8 @@ from MaxText.layers import models
 from MaxText.layers import quantizations
 from MaxText.maxengine import MaxEngine
 
+pytestmark = [pytest.mark.external_serving]
+
 
 class MaxEngineTest(unittest.TestCase):
   """Tests for MaxEngine."""

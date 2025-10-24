@@ -12,7 +12,7 @@ args=(
   "${CONFIG_PATH}"
   "tokenizer_path="${MAXTEXT_ASSETS_ROOT:-${MAXTEXT_PKG_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/MaxText/assets}}"/tokenizer.llama2"
   "model_name=llama2-7b"
-  "load_parameters_path=gs://msingh-bkt/checkpoints/quant_llama2-7b-chat/20241120034012/int8_"
+  "load_parameters_path=gs://msingh-bkt/checkpoints/quant_llama2-7b-chat/20241120034012/int8_"  # TODO: pre-generated quant checkpoint
   "checkpoint_is_quantized=true"
   "quantization=int8"
   "weight_dtype=bfloat16"

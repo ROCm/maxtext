@@ -37,10 +37,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 
-from cloud_tpu_diagnostics import diagnostic
-from cloud_tpu_diagnostics.configuration import debug_configuration
-from cloud_tpu_diagnostics.configuration import diagnostic_configuration
-from cloud_tpu_diagnostics.configuration import stack_trace_configuration
+from MaxText.decouple import cloud_diagnostics as _cloud_diag
+diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration = _cloud_diag()
 
 from MaxText import checkpointing
 from MaxText import exceptions

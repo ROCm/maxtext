@@ -15,11 +15,11 @@
 """Integration tests for gradient accumulation."""
 
 import tempfile
+import pytest
 
 import numpy as np
 import json
 import unittest
-import pytest
 import string
 import random
 import os.path

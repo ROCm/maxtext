@@ -22,6 +22,7 @@ import tempfile
 import unittest
 import pytest
 import os
+from MaxText.decouple import is_decoupled
 import shutil
 import hashlib
 import re
@@ -40,12 +41,12 @@ class AotHloIdenticalTest(unittest.TestCase):
     Fix the dump dir and xla flags
     """
     jax.config.update("jax_enable_compilation_cache", False)
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    decoupled = is_decoupled()
     if decoupled:
       logs_root = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "rocm",
+          "decoupled_datasets",
           "gcloud_decoupled_test_logs",
           "aot_hlo_identical_test",
       )
@@ -119,7 +120,7 @@ class AotHloIdenticalTest(unittest.TestCase):
 
   def assert_compile_and_real_match_hlo(self, test_name, *extra_args):
     """check that AOT compiled and trained HLO files are identical for a given test"""
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    decoupled = is_decoupled()
     if decoupled:
       root = self._aot_logs_root  # set in setUp
       base_output_directory = root

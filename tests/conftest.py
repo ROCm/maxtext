@@ -1,58 +1,54 @@
-# Automatically apply the 'decoupled' marker when DECOUPLE_GCLOUD=TRUE so
-# workflows can select these tests via -m decoupled even if tests themselves 
-# don't specify it.
+# Automatically apply the 'decoupled' marker (when DECOUPLE_GCLOUD=TRUE) ONLY to
+# tests that don't get skipped in decoupled mode. If a test is skipped because it
+# requires TPU hardware (`tpu_only`) or any external integration
+# (`external_serving`, `external_training`, `diagnostics`), we do NOT add the
+# decoupled marker. This lets us select the decoupled tests using `-m decoupled` 
+# easily.
 
-import os
 import pytest
+from MaxText.decouple import is_decoupled
+try:
+  import jax
+  _HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
+except Exception:  # pragma: no cover
+  _HAS_TPU = False
 
 
-JETSTREAM_HINT_FILENAMES = [
-    "decode_tests.py",
-    "offline_engine_test.py",
-    "maxengine_server",
-    "grpo_trainer_correctness_test.py",  # may exercise serving pathways
-]
-
-JETSTREAM_MARKERS = {"jetstream", "tunix", "serving", "decode_server"}
-
+GCE_MARKERS = {"external_serving", "external_training"}
 
 def pytest_collection_modifyitems(config, items):
-  decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
-  if not decoupled:
-    return
-
-  decoupled_marker = pytest.mark.decoupled
-  skip_jetstream = pytest.mark.skip(
-      reason="Skipped: JetStream / Tunix disabled by DECOUPLE_GCLOUD=TRUE"
-  )
+  decoupled = is_decoupled()
+  skip_no_tpu = None
+  if not _HAS_TPU:
+    skip_no_tpu = pytest.mark.skip(reason="Skipped: requires TPU hardware, none detected")
+  # Adding the decoupled marker only to tests that aren't skipped.
+  decoupled_marker = pytest.mark.decoupled if decoupled else None
 
   for item in items:
-    nodeid = item.nodeid
-
-    # Preserve existing behavior: mark decoupled tests (except goodput utils)
-    if "goodput_utils_test.py" not in nodeid and not any(m.name == "decoupled" for m in item.iter_markers()):
+    cur_test_markers = {m.name for m in item.iter_markers()} # Iterate thru the markers of the cur test
+    skip_flag = False
+    if skip_no_tpu and "tpu_only" in cur_test_markers:
+      item.add_marker(skip_no_tpu)
+      skip_flag = True
+    # Skip in decoupled mode if any external integration markers are present
+    if decoupled:
+      mutual_markers = cur_test_markers & GCE_MARKERS
+      if mutual_markers:
+        reason = (
+            "Skipped: decoupled mode disables: "
+            + ", ".join(sorted(mutual_markers))
+        )
+        item.add_marker(pytest.mark.skip(reason=reason))
+        skip_flag = True
+    # Add decoupled marker only if DECOUPLE_GCLOUD AND not skipped.
+    if decoupled_marker and not skip_flag:
       item.add_marker(decoupled_marker)
 
-    # Determine if test should be skipped due to JetStream dependency
-    markers = {m.name for m in item.iter_markers()}
-    filename = str(getattr(item, "fspath", ""))
-    needs_jetstream = False
-
-    if markers & JETSTREAM_MARKERS:
-      needs_jetstream = True
-    else:
-      for hint in JETSTREAM_HINT_FILENAMES:
-        if hint in filename or hint in nodeid:
-          needs_jetstream = True
-          break
-
-    if needs_jetstream:
-      item.add_marker(skip_jetstream)
-
-
 def pytest_configure(config):
-  config.addinivalue_line("markers", "jetstream: tests requiring JetStream serving components")
-  config.addinivalue_line("markers", "tunix: tests requiring tunix components")
-  config.addinivalue_line("markers", "serving: tests invoking server mode")
-  config.addinivalue_line("markers", "decode_server: tests invoking decode server")
-  config.addinivalue_line("markers", "decoupled: auto-marked when DECOUPLE_GCLOUD=TRUE")
+  for m in [
+      "tpu_only: tests that require TPU hardware",
+      "external_serving: JetStream / serving / decode server components",
+      "external_training: SFT / tunix / goodput integrations",
+      "decoupled: marked on tests that are not skipped due to GCE deps, when DECOUPLE_GCLOUD=TRUE",
+  ]:
+    config.addinivalue_line("markers", m)

@@ -18,6 +18,7 @@ and then running decode with it.
 """
 from datetime import datetime
 import os
+from MaxText.decouple import is_decoupled
 import pytest
 
 from MaxText.globals import MAXTEXT_ASSETS_ROOT, MAXTEXT_PKG_DIR
@@ -42,14 +43,14 @@ def get_model_params(quantization):
 
 def run_e2e_test_flow(hardware, model_config, attention_type="autoselected", state_path=None):
   """Helper function to run training, generate parameter-only checkpoint, and decode."""
-  decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+  decoupled = is_decoupled()
   base_output_directory = (
-      os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs")
+      os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "gcloud_decoupled_test_logs")
       if decoupled
       else "gs://runner-maxtext-logs"
   )
   dataset_path = (
-    os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "c4_en_dataset_minimal")
+    os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "c4_en_dataset_minimal")
     if decoupled
     else "gs://maxtext-dataset"
   )
@@ -123,14 +124,13 @@ def test_param_ckpt_generation_with_dot_product(quantization, capsys):
 @pytest.mark.integration_test
 @pytest.mark.tpu_only
 @pytest.mark.scheduled_only
+@pytest.mark.external_serving  # Requires pre-generated checkpoint (Gemma-2b)
 def test_param_ckpt_generation_with_pre_generated_ckpt(capsys):
   """Tests the parameter-only checkpoint generation and decode flow with a pre-generated Gemma-2b model checkpoint."""
   model_config = [
       "model_name=gemma-2b",
       f"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizer.gemma')}",
   ]
-  if os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE":
-    pytest.skip("Skipping pre-generated checkpoint test in decoupled mode (requires remote GCS state)")
   run_e2e_test_flow(
       hardware="tpu",
       model_config=model_config,

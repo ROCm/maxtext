@@ -66,19 +66,22 @@ After installation, you can verify the package is available with `python3 -c "im
 
 ### Decoupled Mode (No Google Cloud Dependencies)
 
-Set `DECOUPLE_GCLOUD=TRUE` to run MaxText tests and local development without any Google Cloud SDK, `gs://` buckets, or Vertex AI integrations.
+Set `DECOUPLE_GCLOUD=TRUE` to run MaxText tests and local development without any Google Cloud SDK, `gs://` buckets, JetStream, Tunix, or Vertex AI integrations.
 
 When enabled:
-* All `gcloud` subprocess calls are skipped (a placeholder project string is returned or `None`).
-* Vertex Tensorboard creation/upload is disabled.
-* Test suite rewrites dataset paths to local minimal datasets under `rocm/c4_en_dataset_minimal`.
-* Smoke/decode tests use a local base output directory (you can override with `LOCAL_BASE_OUTPUT`).
+* Skips external integration tests with markers:
+  * `external_serving` (`jetstream`, `serving`, `decode_server`)
+  * `external_training` (`tunix`, `goodput`)
+* Production / serving entrypoints (`decode.py`, `maxengine_server.py`, `maxengine_config.py`, tokenizer access in `maxengine.py`) **fail fast with a clear RuntimeError** when decoupled. This prevents accidentally running partial serving logic locally.
+* Import-time safety is still preserved by lightweight stub namespaces returned from `decouple.py` (so modules import cleanly); only active use of missing functionality raises.
+* Rewrites dataset paths in certain tests to point at minimal local datasets if provided.
+* Uses a local base output directory (override with `LOCAL_BASE_OUTPUT`).
 
 Minimal datasets included (checked into the repo):
-* ArrayRecord shards: generated via `python rocm/get_minimal_c4_en_dataset.py`, 
-located in `rocm/c4_en_dataset_minimal/c4/en/3.0.1/c4-{train,validation}.array_record-*`
-* Parquet (HF style): generated via `python rocm/get_minimal_hf_c4_parquet.py`, 
-located in `rocm/c4_en_dataset_minimal/hf/c4`
+* ArrayRecord shards: generated via `python decoupled_datasets/get_minimal_c4_en_dataset.py`, 
+  located in `decoupled_datasets/c4_en_dataset_minimal/c4/en/3.0.1/c4-{train,validation}.array_record-*`
+* Parquet (HF style): generated via `python decoupled_datasets/get_minimal_hf_c4_parquet.py`, 
+  located in `decoupled_datasets/c4_en_dataset_minimal/hf/c4`
 
 
 Run a local smoke test fully offline:
@@ -90,6 +93,71 @@ pytest -k train_gpu_smoke_test -q
 Optional environment variables:
 * `LOCAL_GCLOUD_PROJECT` - placeholder project string (default: `local-maxtext-project`).
 * `LOCAL_BASE_OUTPUT` - override default local output directory used in tests.
+
+#### Centralized Decoupling API (`decouple.py`)
+
+MaxText exposes a single module `MaxText.decouple` to avoid scattering environment checks:
+
+```python
+from MaxText.decouple import is_decoupled, cloud_diagnostics, jetstream, tunix
+
+if is_decoupled():
+  # Skip optional integrations or use local fallbacks
+  pass
+
+# Cloud diagnostics (returns diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration)
+diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration = cloud_diagnostics()
+
+# JetStream (serving) components
+config_lib, engine_api, token_utils, tokenizer_api, token_params_ns = jetstream()
+TokenizerParameters = getattr(token_params_ns, "TokenizerParameters", object)
+
+# Tunix post-training components
+peft_trainer, tunix_hooks = tunix()
+```
+
+Behavior when `DECOUPLE_GCLOUD=TRUE`:
+* `is_decoupled()` returns True.
+* Each helper returns lightweight stubs whose attributes are safe to access; calling methods raises a clear `RuntimeError` only when actually invoked.
+* Prevents import-time failures for optional dependencies (JetStream, Tunix, `cloud_tpu_diagnostics`).
+
+Guidelines:
+* Prefer calling `jetstream()` / `tunix()` once at module import and branching on `is_decoupled()` for functionality that truly requires the dependency.
+* Use `is_decoupled()` to avoid direct `os.environ["DECOUPLE_GCLOUD"]` checking.
+* Tests add a `decoupled` marker if DECOUPLE_GCLOUD && not marked with below markers.
+* Pytest markers: `external_serving`, `external_training`.
+* Removing filename heuristics: only explicit markers determine skipping; please add the appropriate marker at the top of new tests.
+
+This centralized approach keeps optional integrations cleanly separated from core MaxText logic, making local development (e.g. on ROCm/NVIDIA GPUs) frictionless.
+
+#### Remaining GCE-Dependent Elements / TODOs
+The following items remain coupled to Google Cloud resources and are targeted for removal or localization. Each has clear next steps.
+
+**Checkpoints**
+* Create ultra-minimal parameter-only checkpoints (tiny model: 1–2 layers, small vocab) for tests that currently load full remote weights (e.g. vision encoder, GRPO correctness, parameter-only Gemma flow).
+* Provide a `LOCAL_PREGENERATED_ROOT` override so tests can transparently prefer local artifacts when present.
+* Add a smoke script: `scripts/make_minimal_checkpoints.sh` that invokes training for 1 step and extracts parameter-only form.
+* Add CI verification to ensure pre-generated checkpoint tests are either marked `external_serving` or point to local fixtures.
+
+**Tokenizers**
+* Mirror required tokenizer files (Gemma, Llama families, etc.) into a compact `local_tokenizers/` directory (target total size ≤ 20 MB).
+* Add integrity hashes (SHA256) and a check script `scripts/verify_tokenizers.py`.
+* Update tests to use: `TOKENIZER_ROOT = os.getenv("LOCAL_TOKENIZER_ROOT", os.path.join(MAXTEXT_PKG_DIR, "..", "local_tokenizers"))`.
+
+**Markers & Documentation**
+* Finalize explicit mapping of pre-generated checkpoint tests to `external_serving` (DONE for first pass; keep auditing new tests).
+* Consider introducing a dedicated `pre_generated_checkpoint` marker if granularity becomes necessary (deferred until local fixtures land).
+
+**Automation / Guardrails**
+* Lint rule (regex) rejecting raw `gs://` paths in tests unless accompanied by an external marker.
+* Add README section enumerating which tests are expected to transition once local assets exist.
+
+**Acceptance Criteria**
+* Running `DECOUPLE_GCLOUD=TRUE pytest -m decoupled` exercises all logic without remote downloads.
+* All remaining `external_serving` tests either (a) skip cleanly offline or (b) succeed using local fixtures.
+* No test relies on an undeclared remote tokenizer or checkpoint path.
+
+> Progress tracking: Open issues will be labeled `decoupled-mode` and `local-fixtures`. Feel free to contribute minimal assets PRs first.
 
 
 

@@ -10,6 +10,7 @@ Fails only on missing core imports or device query failure; alias test asserts m
 """
 from __future__ import annotations
 import os, time, importlib
+from MaxText.decouple import is_decoupled
 
 CORE_IMPORTS = ["jax", "jax.numpy", "flax", "numpy"]
 OPTIONAL_IMPORTS = ["transformers", "MaxText", "MaxText.pyconfig", "MaxText.maxengine"]
@@ -80,7 +81,7 @@ def test_jax_devices():
 
 
 def test_decoupled_flag_consistency():
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    decoupled = is_decoupled()
     # Soft check only; logic exercised in other tests.
     if decoupled:
         pass

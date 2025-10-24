@@ -23,6 +23,7 @@ from datetime import datetime
 import random
 import string
 import os.path
+from MaxText.decouple import is_decoupled
 
 
 class Standalone_DL_CKPT(unittest.TestCase):
@@ -39,14 +40,14 @@ class Standalone_DL_CKPT(unittest.TestCase):
   @pytest.mark.tpu_only
   def test_standalone_dataloader(self):
     random_run_name = self._get_random_test_name("standalone_dataloader")
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    decoupled = is_decoupled()
     base_output_directory = (
-        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs")
+        os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "gcloud_decoupled_test_logs")
         if decoupled
         else "gs://runner-maxtext-logs"
     )
     dataset_path = (
-        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "c4_en_dataset_minimal")
+        os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "c4_en_dataset_minimal")
         if decoupled
         else "gs://maxtext-dataset"
     )
@@ -68,14 +69,14 @@ class Standalone_DL_CKPT(unittest.TestCase):
   @pytest.mark.tpu_only
   def test_standalone_checkpointer(self):
     random_run_name = self._get_random_test_name("standalone_checkpointer")
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    decoupled = is_decoupled()
     base_output_directory = (
-        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs")
+        os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "gcloud_decoupled_test_logs")
         if decoupled
         else "gs://runner-maxtext-logs"
     )
     dataset_path = (
-        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "c4_en_dataset_minimal")
+        os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "c4_en_dataset_minimal")
         if decoupled
         else "gs://maxtext-dataset"
     )

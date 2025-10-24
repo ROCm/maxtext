@@ -15,22 +15,15 @@
 """CLI utility for running inference on a single/multi stream(s)."""
 
 import os
-from typing import Sequence
+from typing import Sequence, Any
 import numpy as np
 import jax
 import jax.numpy as jnp
 
 from absl import app
 
-DECOUPLE_GCLOUD = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
-if not DECOUPLE_GCLOUD:
-  from jetstream.engine import engine_api  # type: ignore
-else:
-  class _StubEngineApi:
-    class ResultTokens:  # minimal stub used in helper
-      def __init__(self, *args, **kwargs):
-        raise RuntimeError("ResultTokens unavailable (JetStream disabled; set DECOUPLE_GCLOUD=TRUE)")
-  engine_api = _StubEngineApi()  # type: ignore
+from MaxText.decouple import jetstream, is_decoupled
+_config_lib, engine_api, _token_utils, _tokenizer_api, _token_params_ns = jetstream()
 
 from MaxText import max_utils
 from MaxText import maxengine
@@ -43,7 +36,7 @@ from MaxText import multimodal_utils
 _NUM_STREAMS = 1
 
 
-def _batch_first_result_token(first_tokens: list[engine_api.ResultTokens], batch_size: int):
+def _batch_first_result_token(first_tokens: list[Any], batch_size: int):
   """Batches together a list of first result tokens from prefill calls.
 
   This is needed because prefill currently returns the first token as a batch of size 1
@@ -120,10 +113,14 @@ def main(argv: Sequence[str]) -> None:
         text, image_placeholder=config.image_placeholder, model_name=config.model_name, num_images=len(images)
     )
 
-  if DECOUPLE_GCLOUD:
-    raise RuntimeError("JetStream disabled by DECOUPLE_GCLOUD=TRUE; decode requires JetStream tokenizer.")
-  metadata = engine.get_tokenizer()
-  tokenizer_model = engine.build_tokenizer(metadata)
+  if is_decoupled():
+    raise RuntimeError(
+        "JetStream disabled by DECOUPLE_GCLOUD=TRUE; decode requires JetStream tokenizer. "
+        "Unset DECOUPLE_GCLOUD to run decode, or run only tests marked safe for decoupled mode."
+    )
+  else:
+    metadata = engine.get_tokenizer()
+    tokenizer_model = engine.build_tokenizer(metadata)
   try:
     # TODO: update jetstream.engine.tokenizer_api.Tokenizer to maintain tokenizer state.
     has_chat_template = getattr(tokenizer_model.tokenizer, "chat_template", False)  # pytype: disable=attribute-error

@@ -12,7 +12,7 @@ args=(
   "${CONFIG_PATH}"
   "tokenizer_path=${MAXTEXT_ASSETS_ROOT:-${MAXTEXT_PKG_DIR:-${MAXTEXT_REPO_ROOT:-$PWD}/src/MaxText/assets}}/tokenizer.llama2"
   "model_name=llama2-7b"
-  "load_parameters_path=gs://runner-maxtext-logs/direct_generate_param_only_checkpoint_2024-06-11-04-13/checkpoints/0/items/"
+  "load_parameters_path=gs://runner-maxtext-logs/direct_generate_param_only_checkpoint_2024-06-11-04-13/checkpoints/0/items/"  # TODO: pre-generated checkpoint
   "checkpoint_is_quantized=false"
   "weight_dtype=bfloat16"
   "max_prefill_predict_length=16"

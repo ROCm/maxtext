@@ -15,7 +15,9 @@
 """Tests for training and data loading hooks for SFT"""
 import pytest
 
-pytestmark = pytest.mark.tpu_only
+# Requires sft.yml file referencing HF dataset path (`hf_path` in sft.yml) which isn't
+# available in decoupled mode.
+pytestmark = [pytest.mark.external_training]
 
 import jax
 

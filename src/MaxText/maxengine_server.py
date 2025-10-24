@@ -17,19 +17,12 @@
 import os
 import sys
 
-import os
-DECOUPLE_GCLOUD = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
-if not DECOUPLE_GCLOUD:
-  import pathwaysutils  # pylint: disable=unused-import
-  from jetstream.core import server_lib, config_lib  # type: ignore
-else:
-  class _Stub:
-    def __getattr__(self, name):
-      raise RuntimeError("JetStream server components unavailable (DECOUPLE_GCLOUD not TRUE)")
-  server_lib = _Stub()  # type: ignore
-  config_lib = _Stub()  # type: ignore
+from MaxText.decouple import jetstream, is_decoupled
+server_lib, config_lib, _token_utils, _tokenizer_api, _token_params_ns = jetstream()
+import pathwaysutils  # pylint: disable=unused-import
 
 import jax
+from typing import Any
 
 from MaxText import pyconfig
 from MaxText import maxengine_config
@@ -59,7 +52,7 @@ def _create_prefix_caching_config(config):
 
 
 def main(config):
-  if DECOUPLE_GCLOUD:
+  if is_decoupled():
     raise RuntimeError("JetStream disabled by DECOUPLE_GCLOUD=TRUE; server unavailable.")
   pathwaysutils.initialize()
 
@@ -67,7 +60,7 @@ def main(config):
   devices = server_lib.get_devices()
   server_config = maxengine_config.get_server_config(config.inference_server, config)
 
-  metrics_server_config: config_lib.MetricsServerConfig | None = None
+  metrics_server_config: Any | None = None  # Use Any to avoid stub type issues when decoupled
   if config.prometheus_port != 0:
     metrics_server_config = config_lib.MetricsServerConfig(port=config.prometheus_port)
 

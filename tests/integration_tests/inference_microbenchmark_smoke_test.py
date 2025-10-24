@@ -17,6 +17,9 @@ import jax
 import os.path
 import pytest
 import unittest
+
+pytestmark = [pytest.mark.external_serving]
+
 from absl.testing import absltest
 
 from MaxText import pyconfig

@@ -14,6 +14,7 @@
 
 """Smoke test for int8"""
 import os
+from MaxText.decouple import is_decoupled
 import unittest
 
 from absl.testing import absltest
@@ -27,14 +28,14 @@ class Train(unittest.TestCase):
 
   def test_tiny_config(self):
     test_tmpdir = os.environ.get("TEST_TMPDIR")  # pylint: disable=unused-variable
-    decoupled = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+    decoupled = is_decoupled()
     dataset_path = (
-        os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "c4_en_dataset_minimal") if decoupled else "gs://maxtext-dataset"
+        os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "c4_en_dataset_minimal") if decoupled else "gs://maxtext-dataset"
     )
     base_output_directory = (
         os.environ.get(
             "LOCAL_BASE_OUTPUT",
-            os.path.join(MAXTEXT_PKG_DIR, "..", "rocm", "gcloud_decoupled_test_logs"),
+            os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "gcloud_decoupled_test_logs"),
         )
         if decoupled
         else "gs://runner-maxtext-logs"

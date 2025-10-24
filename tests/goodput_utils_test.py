@@ -14,9 +14,7 @@
 
 """Tests for goodput_utils.py
 
-This test intentionally NOT auto-marked as 'decoupled'. When DECOUPLE_GCLOUD=TRUE we skip it
-entirely because it exercises Google Cloud Logging / Goodput integrations that are not
-available offline.
+Pytest marker: Google Cloud Goodput integrations not available offline (decoupled).
 """
 
 import os
@@ -27,9 +25,9 @@ from maxtext.tests.test_utils import get_test_config_path
 from unittest import mock
 from MaxText.utils.goodput_utils import create_goodput_recorder, maybe_monitor_goodput, maybe_record_goodput, GoodputEvent
 
-DECOUPLED = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
+import pytest
 
-@unittest.skipIf(DECOUPLED, "Skipping goodput utils tests in decoupled (no-GCP) mode")
+pytestmark = [pytest.mark.external_training]
 class GoodputUtilsTest(unittest.TestCase):
   """Tests for Goodput monitoring and recording."""
 

@@ -17,6 +17,7 @@
 import sys
 import unittest
 import os.path
+import pytest
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,8 @@ import numpy as np
 from MaxText.inference.offline_engine import OfflineEngine, InputData, CompletionOutput
 from MaxText import pyconfig
 from MaxText.globals import MAXTEXT_PKG_DIR
+
+pytestmark = [pytest.mark.external_serving]
 from maxtext.tests.test_utils import get_test_config_path
 
 
