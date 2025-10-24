@@ -29,7 +29,17 @@ from collections.abc import Sequence
 
 from jax.sharding import Mesh
 
-# Central Layout/Format compatibility (provides Format alias if missing).
+# --- Early monkey patch for JAX < 0.7.0: ensure jax.experimental.layout.Format exists for libraries (Orbax) ---
+try:  # pragma: no cover - defensive; if anything fails we silently continue.
+    import importlib
+    _layout_mod = importlib.import_module("jax.experimental.layout")
+    # If Format missing but Layout present (pre-0.7.0), alias it.
+    if not hasattr(_layout_mod, "Format") and hasattr(_layout_mod, "Layout"):
+        _layout_mod.Format = _layout_mod.Layout  # type: ignore[attr-defined}
+except Exception:  # noqa: BLE001
+    pass
+
+# Central Layout/Format compatibility (provides Format symbol for internal imports).
 from .layout_compat import Format, Layout  # noqa: F401
 
 from MaxText import maxtext_utils
