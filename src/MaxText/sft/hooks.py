@@ -28,8 +28,13 @@ import jax.numpy as jnp
 
 from flax import nnx
 
-from tunix.sft import peft_trainer
-from tunix.sft.hooks import DataHooks, TrainingHooks
+from MaxText.decouple import tunix as _tunix
+peft_trainer, _tunix_hooks = _tunix()
+# Ensure hook bases are proper types (class objects). Some stub implementations might supply instances.
+_raw_data_hooks = getattr(_tunix_hooks, "DataHooks", object)
+_raw_training_hooks = getattr(_tunix_hooks, "TrainingHooks", object)
+DataHooks = _raw_data_hooks if isinstance(_raw_data_hooks, type) else object
+TrainingHooks = _raw_training_hooks if isinstance(_raw_training_hooks, type) else object
 
 from MaxText import exceptions
 from MaxText import max_logging
@@ -55,7 +60,7 @@ class SFTTrainingHooks(TrainingHooks):
     self.eval_metadata = defaultdict(float)
 
   @override
-  def on_train_start(self, train_ctx: peft_trainer.PeftTrainer):
+  def on_train_start(self, train_ctx):
     """Called at the beginning of training."""
     state = nnx.state(train_ctx.model)
     params = state.filter(nnx.Param)
@@ -80,7 +85,7 @@ class SFTTrainingHooks(TrainingHooks):
     self.metadata["first_train_step"] = train_ctx.train_steps
 
   @override
-  def on_train_end(self, train_ctx: peft_trainer.PeftTrainer):  # pylint: disable=unused-argument
+  def on_train_end(self, train_ctx):  # pylint: disable=unused-argument
     """Called at the end of training."""
     assert (
         "first_train_step" in self.metadata
@@ -90,7 +95,7 @@ class SFTTrainingHooks(TrainingHooks):
       self.metric_logger.flush_metrics_and_cleanup()
 
   @override
-  def on_train_step_start(self, train_ctx: peft_trainer.PeftTrainer):
+  def on_train_step_start(self, train_ctx):
     """Called at the beginning of a training step."""
     if self.config.enable_goodput_recording:
       record_goodput(self.goodput_recorder, f"record_{GoodputEvent.STEP.value}_start_time", train_ctx.train_steps)
@@ -105,7 +110,7 @@ class SFTTrainingHooks(TrainingHooks):
   @override
   def on_train_step_end(
       self,
-      train_ctx: peft_trainer.PeftTrainer,
+      train_ctx,
       train_step: int,
       train_loss: float,
       step_time: float,
@@ -135,14 +140,14 @@ class SFTTrainingHooks(TrainingHooks):
     del self.train_metadata[train_step - 1]
 
   @override
-  def on_eval_step_start(self, train_ctx: peft_trainer.PeftTrainer):
+  def on_eval_step_start(self, train_ctx):
     """Called at the beginning of an evaluation step."""
     self.eval_metadata["eval_step_count"] += 1.0
     # Calculate the number of non-padded tokens in the batch
     self.eval_metadata["total_weights"] += jnp.sum(train_ctx.data_hooks.eval_batch["targets_segmentation"] != 0)
 
   @override
-  def on_eval_step_end(self, train_ctx: peft_trainer.PeftTrainer, eval_loss: float):
+  def on_eval_step_end(self, train_ctx, eval_loss: float):
     """Called at the end of evaluation step."""
     assert (
         self.eval_metadata["eval_step_count"] != 0
@@ -174,7 +179,7 @@ class SFTDataHooks(DataHooks):
     self.eval_batch = None
 
   @override
-  def load_next_train_batch(self, train_ctx: peft_trainer.PeftTrainer):  # pylint: disable=unused-argument
+  def load_next_train_batch(self, train_ctx):  # pylint: disable=unused-argument
     """Loads the next batch of data for training."""
     try:
       self.train_batch = self.train_data_loader.load_next_batch()
@@ -184,7 +189,7 @@ class SFTDataHooks(DataHooks):
     return self.train_batch
 
   @override
-  def load_next_eval_batch(self, train_ctx: peft_trainer.PeftTrainer):
+  def load_next_eval_batch(self, train_ctx):
     """Loads the next batch of data for evaluation."""
     try:
       # Run evaluation only for `config.eval_steps` steps.
