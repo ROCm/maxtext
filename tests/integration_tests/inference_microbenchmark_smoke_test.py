@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" Smoke test for inference microbenchmark"""
-import jax
+""" Smoke test for inference microbenchmark.
+
+Note: Heavy dependencies (jax, MaxText modules) are imported lazily inside the test method so that
+pytest's collection phase can safely deselect this file when running in decoupled mode based on the
+`external_serving` marker without triggering those imports.
+"""
 import os.path
 import pytest
 import unittest
-from absl.testing import absltest
 
-from MaxText import pyconfig
-from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT
-from MaxText.inference_microbenchmark import run_benchmarks
+pytestmark = [pytest.mark.external_serving]
 
 
 class Inference_Microbenchmark(unittest.TestCase):
@@ -30,6 +31,11 @@ class Inference_Microbenchmark(unittest.TestCase):
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
   def test(self):
+    # Lazy imports to avoid import-time side effects when deselected
+    import jax
+    from MaxText import pyconfig
+    from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT
+    from MaxText.inference_microbenchmark import run_benchmarks
     jax.config.update("jax_default_prng_impl", "unsafe_rbg")
     config = pyconfig.initialize(
         [
@@ -49,5 +55,7 @@ class Inference_Microbenchmark(unittest.TestCase):
     run_benchmarks(config)
 
 
-if __name__ == "__main__":
-  absltest.main()
+if __name__ == "__main__":  # pragma: no cover
+  # Keep main path minimal; rely on pytest for execution.
+  import pytest as _pytest
+  raise SystemExit(_pytest.main([__file__]))

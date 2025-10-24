@@ -56,6 +56,9 @@ from MaxText.layers import models
 from MaxText.layers import quantizations
 from MaxText.inference.offline_engine import InputData
 
+# This test is for serving pathways via offline_engine and maxengine.
+pytestmark = [pytest.mark.external_serving]
+
 
 def get_golden_data(config):
   """Get the golden data for GrpoTrainer from maxtext/MaxText/scratch_code/generate_grpo_golden_logits.py."""
