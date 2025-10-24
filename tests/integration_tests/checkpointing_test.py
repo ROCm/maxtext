@@ -155,4 +155,3 @@ def test_autoselected_attention():
 @pytest.mark.gpu_only
 def test_with_dot_product():
   run_checkpointing("gpu", "dot_product")
-

@@ -460,4 +460,3 @@ def test_gmm_kernel(group_sizes, k, n, tiling, dtype):
 
 if __name__ == "__main__":
   unittest.main()
-

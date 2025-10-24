@@ -64,7 +64,6 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
         "datasets",
         "gcloud_decoupled_test_logs",
       )
-      config_file = get_test_config_path()
     else:
       grain_train_files = os.path.join(
           temp_dir,
@@ -75,7 +74,7 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
           "3.0.1",
           "c4-train.array_record*",
       )
-    base_output_directory = "gs://max-experiments/"
+      base_output_directory = "gs://max-experiments/"
     config_file = get_test_config_path()
 
     self.config = pyconfig.initialize(
@@ -316,6 +315,7 @@ def mount_gcsfuse():
   Mounts a GCS bucket (gs://maxtext-dataset) to a local directory (/tmp/gcsfuse)
   using gcsfuse if not already mounted.
   """
+  from MaxText.gcloud_stub import is_decoupled
   if is_decoupled():
     return  # No-op when decoupled.
   temp_dir = tempfile.gettempdir()
@@ -337,5 +337,3 @@ def mount_gcsfuse():
 if __name__ == "__main__":
   mount_gcsfuse()
   unittest.main()
-
-

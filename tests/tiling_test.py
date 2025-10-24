@@ -26,6 +26,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.tests.test_utils import get_test_config_path
 from flax import linen as nn
+from maxtext.tests.test_utils import get_test_config_path
 
 from MaxText import maxtext_utils
 from MaxText import max_utils

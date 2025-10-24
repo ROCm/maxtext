@@ -218,7 +218,7 @@ class MaxUtilsInitTransformerState(unittest.TestCase):
     # Conditionally set ici_fsdp_parallelism to match device count in decoupled mode
     extra_args = {"ici_fsdp_parallelism": jax.device_count()} if is_decoupled() else {}
     self.config = pyconfig.initialize(
-        [None, get_test_config_path()], enable_checkpointing=False, **extra_args
+        [None, get_test_config_path()], enable_checkpointing=False
     )
     devices_array = maxtext_utils.create_device_mesh(self.config)
     self.mesh = Mesh(devices_array, self.config.mesh_axes)
@@ -678,4 +678,3 @@ class TestCalculateBytesFromPytree(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
-

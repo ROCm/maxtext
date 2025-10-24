@@ -140,4 +140,3 @@ def test_param_ckpt_generation_with_pre_generated_ckpt(capsys):
   captured = capsys.readouterr()
   expected_output = "Input `I love to`"
   assert expected_output in captured.out
-

@@ -14,7 +14,6 @@
 
 """Tests for train.py with various configs"""
 import os
-import jax
 from MaxText.gcloud_stub import is_decoupled
 import unittest
 import pytest
@@ -162,7 +161,6 @@ class TrainTests(unittest.TestCase):
           "enable_goodput_recording=False",
           rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
       ],
->>>>>>> 423dc895 (TE Dense op integration)
       "dropout": [  # tests base config with dropout
           None,
           get_test_config_path(),
