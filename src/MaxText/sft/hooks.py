@@ -30,9 +30,11 @@ from flax import nnx
 
 from MaxText.decouple import tunix as _tunix
 peft_trainer, _tunix_hooks = _tunix()
-# If decoupled mode, _tunix_hooks may be a stub, so use object base types.
-DataHooks = getattr(_tunix_hooks, "DataHooks", object)
-TrainingHooks = getattr(_tunix_hooks, "TrainingHooks", object)
+# Ensure hook bases are proper types (class objects). Some stub implementations might supply instances.
+_raw_data_hooks = getattr(_tunix_hooks, "DataHooks", object)
+_raw_training_hooks = getattr(_tunix_hooks, "TrainingHooks", object)
+DataHooks = _raw_data_hooks if isinstance(_raw_data_hooks, type) else object
+TrainingHooks = _raw_training_hooks if isinstance(_raw_training_hooks, type) else object
 
 from MaxText import exceptions
 from MaxText import max_logging

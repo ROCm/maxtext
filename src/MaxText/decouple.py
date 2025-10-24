@@ -84,14 +84,17 @@ def jetstream():
 # ---------------- Tunix -----------------
 
 def _tunix_stubs():
+    class DataHooks:  # simple base type
+        def __init__(self, *a, **k):
+            pass
+    class TrainingHooks:  # simple base type
+        def __init__(self, *a, **k):
+            pass
     class _StubPeftTrainer:
         def __init__(self, *a, **k):
             pass
-    class _StubHooks(SimpleNamespace):
-        def __getattr__(self, _name):  # pragma: no cover
-            return lambda *a, **k: None
     peft_trainer = SimpleNamespace(PeftTrainer=_StubPeftTrainer)
-    hooks = _StubHooks(DataHooks=_StubHooks(), TrainingHooks=_StubHooks())
+    hooks = SimpleNamespace(DataHooks=DataHooks, TrainingHooks=TrainingHooks)
     return peft_trainer, hooks
 
 def tunix():
