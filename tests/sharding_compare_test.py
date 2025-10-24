@@ -20,6 +20,7 @@ import os
 import pytest
 
 from MaxText.globals import MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText.train_compile import get_shaped_inputs, get_topology_mesh, validate_config
 from MaxText import pyconfig
 
@@ -82,11 +83,11 @@ def compare_named_sharding_jsons(json1: dict, model1_name: str, json2: dict, mod
 def test_sharding_dump_for_model(model_name: str, topology: str, num_slice: str) -> None:
   """Test if the sharding of new model implementation is as expected."""
   params = [
-      "/deps/MaxText/tests/sharding_compare_test",
-      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-      f"compile_topology={topology}",
-      f"compile_topology_num_slices={num_slice}",
-      f"model_name={model_name}",
+    "/deps/MaxText/tests/sharding_compare_test",
+    get_test_config_path(),
+    f"compile_topology={topology}",
+    f"compile_topology_num_slices={num_slice}",
+    f"model_name={model_name}",
   ]
 
   json_path = f"sharding_info/" f"{model_name}/" f"{topology}/" f"slice_{num_slice}/named_shardings.json"

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import os.path
 import tempfile
+from MaxText.decouple import is_decoupled
 import unittest
 
 import jax
@@ -28,7 +29,7 @@ from MaxText import pyconfig
 from MaxText.input_pipeline import _grain_data_processing
 from MaxText.input_pipeline import input_pipeline_interface
 from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT, MAXTEXT_REPO_ROOT
-
+from maxtext.tests.test_utils import get_test_config_path
 
 class GrainArrayRecordProcessingTest(unittest.TestCase):
 
@@ -40,18 +41,49 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
   def setUp(self):
     super().setUp()
     temp_dir = tempfile.gettempdir()
+    decoupled = is_decoupled()
+
+    if decoupled:
+      grain_train_files = os.path.join(
+          MAXTEXT_PKG_DIR,
+          "..",
+          "decoupled_datasets",
+          "c4_en_dataset_minimal",
+          "c4",
+          "en",
+          "3.0.1",
+          "c4-train.array_record-*",
+      )
+      base_output_directory = os.path.join(
+        MAXTEXT_PKG_DIR,
+        "..",
+        "decoupled_datasets",
+        "gcloud_decoupled_test_logs",
+      )
+      config_file = get_test_config_path()
+    else:
+      grain_train_files = os.path.join(
+          temp_dir,
+          "gcsfuse",
+          "array-record",
+          "c4",
+          "en",
+          "3.0.1",
+          "c4-train.array_record*",
+      )
+    base_output_directory = "gs://max-experiments/"
+    config_file = get_test_config_path()
+
     self.config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], config_file],
         per_device_batch_size=1,
         run_name="test",
         mesh_axes=["data"],
         logical_axis_rules=[["batch", "data"]],
         data_sharding=["data"],
-        base_output_directory="gs://max-experiments/",
+        base_output_directory=base_output_directory,
         dataset_type="grain",
-        grain_train_files=os.path.join(
-            temp_dir, "gcsfuse", "array-record", "c4", "en", "3.0.1", "c4-train.array_record*"
-        ),
+        grain_train_files=grain_train_files,
         tokenizer_path=os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizer"),
         enable_checkpointing=False,
     )
@@ -110,24 +142,47 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
 class GrainArrayRecordProcessingWithMultiSourceBlendingTest(GrainArrayRecordProcessingTest):
 
   def setUp(self):
-    super().setUp()
+    # Override parent setUp to use multi-source blending
     temp_dir = tempfile.gettempdir()
-    # We use the same dataset for testing, but you can use different datasets by changing the file patterns.
-    grain_train_files = [
-        f"{temp_dir}/gcsfuse/array-record/c4/en/3.0.1/c4-train.array_record*:0.3",
-        f"{temp_dir}/gcsfuse/array-record/c4/en/3.0.1/c4-train.array_record*:0.7",
-    ]
-    grain_train_files = ";".join(grain_train_files)
+    decoupled = is_decoupled()
+
+    if decoupled:
+      base_pattern = os.path.join(
+          MAXTEXT_PKG_DIR,
+          "..",
+          "decoupled_datasets",
+          "c4_en_dataset_minimal",
+          "c4",
+          "en",
+          "3.0.1",
+          "c4-train.array_record-*",
+      )
+      base_output_directory = os.path.join(
+        MAXTEXT_PKG_DIR,
+        "..",
+        "decoupled_datasets",
+        "gcloud_decoupled_test_logs",
+      )
+      config_file = get_test_config_path()
+    else:
+      base_pattern = f"{temp_dir}/gcsfuse/array-record/c4/en/3.0.1/c4-train.array_record*"
+      base_output_directory = "gs://max-experiments/"
+      config_file = get_test_config_path()
+      # Ensure GCS fuse mounted for cloud path usage
+      mount_gcsfuse()
+
+    train_files_weighted = ";".join([f"{base_pattern}:0.3", f"{base_pattern}:0.7"])
+
     self.config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], config_file],
         per_device_batch_size=1,
         run_name="test",
         mesh_axes=["data"],
         logical_axis_rules=[["batch", "data"]],
         data_sharding=["data"],
-        base_output_directory="gs://max-experiments/",
+        base_output_directory=base_output_directory,
         dataset_type="grain",
-        grain_train_files=grain_train_files,
+        grain_train_files=train_files_weighted,
         tokenizer_path=os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizer"),
         enable_checkpointing=False,
     )
@@ -153,17 +208,47 @@ class GrainParquetProcessingTest(unittest.TestCase):
   def setUp(self):
     super().setUp()
     temp_dir = tempfile.gettempdir()
+    decoupled = is_decoupled()
+
+    if decoupled:
+      grain_train_file = os.path.join(
+          MAXTEXT_PKG_DIR,
+          "..",
+          "decoupled_datasets",
+          "c4_en_dataset_minimal",
+          "hf",
+          "c4",
+          "c4-train-00000-of-01637.parquet",
+      )
+      base_output_directory = os.path.join(
+        MAXTEXT_PKG_DIR,
+        "..",
+        "decoupled_datasets",
+        "gcloud_decoupled_test_logs",
+      )
+      config_file = get_test_config_path()
+    else:
+      grain_train_file = os.path.join(
+          temp_dir,
+          "gcsfuse",
+          "hf",
+          "c4",
+          "c4-train-00000-of-01637.parquet",
+      )
+    base_output_directory = "gs://max-experiments/"
+    config_file = get_test_config_path()
+
     self.config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], config_file],
         per_device_batch_size=1,
         run_name="test",
         mesh_axes=["data"],
         logical_axis_rules=[["batch", "data"]],
         data_sharding=["data"],
-        base_output_directory="gs://max-experiments/",
+        base_output_directory=base_output_directory,
         dataset_type="grain",
         grain_file_type="parquet",
-        grain_train_files=os.path.join(temp_dir, "gcsfuse", "hf", "c4", "c4-train-00000-of-01637.parquet"),
+        grain_train_files=grain_train_file,
         grain_worker_count=1,
         tokenizer_path=os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizer"),
         enable_checkpointing=False,
@@ -225,6 +310,9 @@ def mount_gcsfuse():
   Mounts a GCS bucket (gs://maxtext-dataset) to a local directory (/tmp/gcsfuse)
   using gcsfuse if not already mounted.
   """
+  from MaxText.decouple import is_decoupled
+  if is_decoupled():
+    return  # No-op when decoupled.
   temp_dir = tempfile.gettempdir()
   mount_path = os.path.join(temp_dir, "gcsfuse")
 

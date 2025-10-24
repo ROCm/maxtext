@@ -15,17 +15,18 @@
 """Integration tests for gradient accumulation."""
 
 import tempfile
+import pytest
 
 import numpy as np
 import json
 import unittest
-import pytest
 import string
 import random
 import os.path
 
 from MaxText.train import main as train_main
 from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT
+from maxtext.tests.test_utils import get_test_config_path
 
 
 def generate_random_string(length=10):
@@ -44,7 +45,7 @@ class GradientAccumulationTest(unittest.TestCase):
     run_regular_metrics_file = os.path.join(temp_dir, f"runner_regular_{random_suffix}.txt")
     shared_maxtext_args = [
         None,
-        os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+        get_test_config_path(),
         "base_output_directory=gs://runner-maxtext-logs",
         "dataset_path=gs://maxtext-dataset",
         "gradient_clipping_threshold=0",  # Ensures we are testing raw scales of gradients (clipping off)

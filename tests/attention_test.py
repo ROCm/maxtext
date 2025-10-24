@@ -41,6 +41,7 @@ from MaxText.globals import MAXTEXT_PKG_DIR
 from MaxText.layers.attentions import Attention
 from MaxText.layers.attention_op import ChunkedCausalMask, _make_bidirectional_block_mask, _generate_chunk_attention_mask
 from MaxText.layers.attention_mla import MLA
+from maxtext.tests.test_utils import get_test_config_path
 
 
 class BidirectionalBlockMaskTest(unittest.TestCase):
@@ -285,8 +286,9 @@ class AttentionTest(parameterized.TestCase):
   def setUp(self):
     """Initializes the configuration for each test"""
     super().setUp()
+    # Centralized config selection via helper.
     config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], get_test_config_path()],
         **self.config_arguments,
     )
     self.cfg = config
@@ -595,7 +597,7 @@ class AttentionTest(parameterized.TestCase):
 
     # Test with Context Parallelism
     cfg_cp = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], get_test_config_path()],
         **self.config_arguments,
         ici_context_parallelism=ici_context_parallelism,
         context_parallel_load_balance=context_parallel_load_balance,
@@ -660,7 +662,7 @@ class AttentionTest(parameterized.TestCase):
     rtol, atol = 1e-02, 1e-02
 
     config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], get_test_config_path()],
         per_device_batch_size=1.0,
         run_name="test",
         enable_checkpointing=False,
@@ -751,7 +753,7 @@ class AttentionTest(parameterized.TestCase):
     rtol, atol = 1e-02, 1e-02
 
     config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], get_test_config_path()],
         per_device_batch_size=1.0,
         run_name="test",
         enable_checkpointing=False,
@@ -1049,7 +1051,7 @@ class MLATest(parameterized.TestCase):
     """Initializes the configuration for each test"""
     super().setUp()
     config = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], get_test_config_path()],
         **self.config_arguments,
     )
     self.cfg = config
@@ -1061,7 +1063,7 @@ class MLATest(parameterized.TestCase):
   def init_mla(self, config_arguments, rope_type):
     """Helper function to initialize MLA with different model names."""
     cfg = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], get_test_config_path()],
         **config_arguments,
         rope_type=rope_type,
     )
@@ -1194,7 +1196,7 @@ class MLATest(parameterized.TestCase):
     attention_config_args = self.config_arguments.copy()
     attention_config_args["attention_type"] = AttentionType.GLOBAL.value
     attention_cfg = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], get_test_config_path()],
         **attention_config_args,
     )
     dummy_inputs_q = jnp.ones(
@@ -1328,7 +1330,7 @@ class MLATest(parameterized.TestCase):
 
     # Test with Context Parallelism
     cfg_cp = pyconfig.initialize(
-        [sys.argv[0], os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [sys.argv[0], get_test_config_path()],
         **config_arguments,
         rope_type=cfg.rope_type,
         ici_context_parallelism=ici_context_parallelism,
