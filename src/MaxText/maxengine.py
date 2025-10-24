@@ -21,12 +21,15 @@ import os.path
 import uuid
 import warnings
 
+from jax.experimental.layout import Format
+from jax.sharding import PartitionSpec as P
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P
 
-# Centralized Layout/Format compatibility.
-from MaxText.layout_compat import Format, Layout, DLL
+if jax.__version_info__ >= (0, 6, 3):
+  from jax.experimental.layout import Layout as DLL  # type: ignore
+else:
+  from jax.experimental.layout import DeviceLocalLayout as DLL  # type: ignore
 
 from flax import linen as nn
 from flax import struct
@@ -164,6 +167,7 @@ class MaxEngine(engine_api.Engine):
 
     arg_layouts, _ = compiled_generate.input_formats
     generate_out_layouts, _ = compiled_generate.output_formats
+
     return compiled_generate, arg_layouts[0], arg_layouts[1], generate_out_layouts
 
   def _identity(self, x: Any) -> Any:
@@ -175,24 +179,21 @@ class MaxEngine(engine_api.Engine):
     """Lays out an array tensor by tensor to prevent OOMs."""
 
     def _layout(x, s, l):
-      if getattr(x, "format", None) == l:
+      if x.format == l:
         return x
       # Somehow this can be None sometimes.
-      dll_attr = "layout" if jax.__version_info__ >= (0, 7, 0) else "device_local_layout"
-      dll = getattr(l, dll_attr, l)
+      dll = (l.layout if jax.__version_info__ >= (0, 6, 3) else l.device_local_layout) if isinstance(l, Format) else l
       f = jax.jit(self._identity, out_shardings=Format(dll, s)).lower(x).compile(compiler_options=xla_flags)
       y = f(x)
       # Achieves donation of the input argument, but allows for different memory
       # layouts and shapes.
-      try:
-        jax.tree.map(lambda z: z.delete(), x)
-      except Exception:  # pragma: no cover
-        pass
+      jax.tree.map(lambda z: z.delete(), x)
       jax.block_until_ready(y)
       return y
 
-    shardings = jax.tree.map(lambda a: a.sharding, arrays)
-    return jax.tree.map(_layout, arrays, shardings, layouts)
+    shardings = jax.tree.map(lambda x: x.sharding, arrays)
+    arrays = jax.tree.map(_layout, arrays, shardings, layouts)
+    return arrays
 
   def aot_compile(
       self, params: Params, pass_rng_shape: bool, xla_flags: dict[str, Any] | None = None
@@ -423,7 +424,41 @@ class MaxEngine(engine_api.Engine):
       nucleus_topp: float | None = None,
       temperature: float | None = None,
   ) -> tuple[Prefix, engine_api.ResultTokens]:
-    """JIT prefill: build KV cache and sample first token (supports chunked prefill)."""
+    """Performs a JIT-compiled prefill operation on a sequence of tokens.
+
+    This function processes an input sequence (prompt) through the model to compute
+    the key-value cache (KV cache). It supports chunked prefilling, where a long
+    prompt can be processed in multiple calls by passing an `existing_prefix`.
+    After processing the tokens, it samples the first token to begin the
+    autoregressive decoding process.
+
+    Args:
+      params: The model parameters.
+      existing_prefix: An optional `ExistingPrefix` containing the KV cache and
+        tokens of a previously processed chunk. Used for chunked prefilling.
+      padded_tokens: The input token sequence, padded to a fixed length.
+      images: Optional input images for multimodal models.
+      true_length: The actual length of `padded_tokens` before padding.
+      sampler: A callable for custom sampling logic (currently unused).
+      rng: JAX random number generator key for sampling.
+      slot: The batch slot index for this request, used for paged attention.
+      page_state: The current state of the paged attention manager.
+      return_prompt_logp: If True, calculates and returns the log probabilities
+        of the prompt tokens.
+      algorithm: The sampling algorithm to use (e.g., 'greedy', 'composite').
+        Overrides the engine's default.
+      topk: The value for top-k sampling. Overrides the engine's default.
+      nucleus_topp: The value for top-p (nucleus) sampling. Overrides the
+        engine's default.
+      temperature: The sampling temperature. Overrides the engine's default.
+
+    Returns:
+      A tuple containing:
+        - A prefix dictionary with the computed KV cache, the logits for the
+          next token, the first sampled token, and other metadata.
+        - An `engine_api.ResultTokens` object containing the single sampled
+          token to begin decoding.
+    """
 
     start_position = 0
     previous_chunk = None
@@ -771,7 +806,27 @@ class MaxEngine(engine_api.Engine):
       nucleus_topp: float | None = None,
       temperature: float | None = None,
   ) -> tuple[Any, PackedPrefix, list[engine_api.ResultTokens]]:
-    """JIT prefill for packed prompts to amortize setup over concatenated sequences."""
+    """Computes a kv-cache for a new packed generate request, which is a
+    concatenation of several shorter prompts. Experimentation shows that
+    longer prefill sequences gives approximately 15% boost in time per prefilled
+    token.
+
+    Args:
+      params: Scalar multiplier.
+      existing_prefix: If provided, represents a prefix that has already been
+        processed by the underlying model.
+      padded_tokens: Logically appended tokens to any existing prefix, this is
+        what we compute prefill on.
+      decoder_positions: int values indicating the position of token in its
+        original sequence.
+      decoder_segment_ids: int values indicating which sequence the the token
+        originally belong to.
+      start_pos: Padded array indicating the start position of each of the prompts.
+      true_length: Padded array indicating the true lengths of each of the prompts.
+      num_prompts: the number of prompts packed in the entire sequence.
+    Returns:
+      kv_cache: For the resulting text.
+    """
     if existing_prefix:
       raise ValueError("We don't know what to do with existing_prefix")
 
@@ -911,7 +966,35 @@ class MaxEngine(engine_api.Engine):
       nucleus_topp: float | None = None,
       temperature: float | None = None,
   ) -> tuple[DecodeState, engine_api.ResultTokens]:
-    """JIT decode: single autoregressive step (updates cache, samples next token)."""
+    """Performs a single, JIT-compiled autoregressive decoding step.
+
+    This function takes the current decoding state, which includes the KV cache
+    for the sequence generated so far, and generates the next token. It uses the
+    model to predict logits for the next token based on the previous token and
+    then samples from that distribution.
+
+    Args:
+      params: The model parameters.
+      decode_state: The current state of the decoding process, containing the
+        KV cache, the previously generated token, the current position, etc.
+        This argument is donated to save memory.
+      sampler: A callable for custom sampling logic (currently unused).
+      rng: JAX random number generator key for sampling.
+      page_state: The current state of the paged attention manager.
+      algorithm: The sampling algorithm to use (e.g., 'greedy', 'composite').
+        Overrides the engine's default.
+      topk: The value for top-k sampling. Overrides the engine's default.
+      nucleus_topp: The value for top-p (nucleus) sampling. Overrides the
+        engine's default.
+      temperature: The sampling temperature. Overrides the engine's default.
+
+    Returns:
+      A tuple containing:
+        - The updated `DecodeState` with the new KV cache, new token, and
+          incremented position, ready for the next decoding step.
+        - An `engine_api.ResultTokens` object containing the newly generated
+          token and its metadata.
+    """
 
     previous_token = decode_state["tokens"]
     rng, new_rng = jax.random.split(rng)

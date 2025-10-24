@@ -29,9 +29,6 @@ from collections.abc import Sequence
 
 from jax.sharding import Mesh
 
-# Central Layout/Format compatibility (provides Format alias if missing).
-from .layout_compat import Format, Layout  # noqa: F401
-
 from MaxText import maxtext_utils
 from MaxText import model_creation_utils
 from MaxText import pyconfig
