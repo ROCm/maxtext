@@ -130,35 +130,9 @@ Guidelines:
 
 This centralized approach keeps optional integrations cleanly separated from core MaxText logic, making local development (e.g. on ROCm/NVIDIA GPUs) frictionless.
 
-#### Remaining GCE-Dependent Elements / TODOs
-The following items remain coupled to Google Cloud resources and are targeted for removal or localization. Each has clear next steps.
-
-**Checkpoints**
-* Create ultra-minimal parameter-only checkpoints (tiny model: 1–2 layers, small vocab) for tests that currently load full remote weights (e.g. vision encoder, GRPO correctness, parameter-only Gemma flow).
-* Provide a `LOCAL_PREGENERATED_ROOT` override so tests can transparently prefer local artifacts when present.
-* Add a smoke script: `scripts/make_minimal_checkpoints.sh` that invokes training for 1 step and extracts parameter-only form.
-* Add CI verification to ensure pre-generated checkpoint tests are either marked `external_serving` or point to local fixtures.
-
-**Tokenizers**
-* Mirror required tokenizer files (Gemma, Llama families, etc.) into a compact `local_tokenizers/` directory (target total size ≤ 20 MB).
-* Add integrity hashes (SHA256) and a check script `scripts/verify_tokenizers.py`.
-* Update tests to use: `TOKENIZER_ROOT = os.getenv("LOCAL_TOKENIZER_ROOT", os.path.join(MAXTEXT_PKG_DIR, "..", "local_tokenizers"))`.
-
-**Markers & Documentation**
-* Finalize explicit mapping of pre-generated checkpoint tests to `external_serving` (DONE for first pass; keep auditing new tests).
-* Consider introducing a dedicated `pre_generated_checkpoint` marker if granularity becomes necessary (deferred until local fixtures land).
-
-**Automation / Guardrails**
-* Lint rule (regex) rejecting raw `gs://` paths in tests unless accompanied by an external marker.
-* Add README section enumerating which tests are expected to transition once local assets exist.
-
-**Acceptance Criteria**
-* Running `DECOUPLE_GCLOUD=TRUE pytest -m decoupled` exercises all logic without remote downloads.
-* All remaining `external_serving` tests either (a) skip cleanly offline or (b) succeed using local fixtures.
-* No test relies on an undeclared remote tokenizer or checkpoint path.
-
-> Progress tracking: Open issues will be labeled `decoupled-mode` and `local-fixtures`. Feel free to contribute minimal assets PRs first.
-
+#### Remaining GCE-Dependent Elements
+Some tests still require real checkpoints, so creating minimal testing checkpoints for local execution is a TODO.
+Similarly, some tests require tokenizers from remote sources. Adding these to local execution destinations is a TODO (max 20 MB). 
 
 
 ## 🔥 Latest news 🔥
