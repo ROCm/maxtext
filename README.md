@@ -72,10 +72,12 @@ When enabled:
 * Skips external integration tests with markers:
   * `external_serving` (`jetstream`, `serving`, `decode_server`)
   * `external_training` (`tunix`, `goodput`)
-* Production / serving entrypoints (`decode.py`, `maxengine_server.py`, `maxengine_config.py`, tokenizer access in `maxengine.py`) **fail fast with a clear RuntimeError** when decoupled. This prevents accidentally running partial serving logic locally.
-* Import-time safety is still preserved by lightweight stub namespaces returned from `decouple.py` (so modules import cleanly); only active use of missing functionality raises.
-* Rewrites dataset paths in certain tests to point at minimal local datasets if provided.
-* Uses a local base output directory (override with `LOCAL_BASE_OUTPUT`).
+* `decoupled` – Applied by `tests/conftest.py` to tests that are runnable in decoupled mode (i.e. not skipped for TPU or external markers).
+* Production / serving entrypoints (`decode.py`, `maxengine_server.py`, `maxengine_config.py`, tokenizer access in `maxengine.py`) **fail fast with a clear RuntimeError** when decoupled. This prevents accidentally running partial serving logic locally when decoupled mode is ON.
+* Import-time safety is preserved by lightweight stubs returned from `decouple.py` (so modules import cleanly); only active use of missing functionality raises.
+* Conditionally replaces dataset paths in certain tests to point at minimal local datasets.
+* Uses a local base output directory (users can override with `LOCAL_BASE_OUTPUT`).
+* All tests that previously hard-coded `configs/base.yml` now use the helper `get_test_config_path()` from `tests/test_utils.py`. This helper ensures usage of `decoupled_base_test.yml`
 
 Minimal datasets included (checked into the repo):
 * ArrayRecord shards: generated via `python decoupled_datasets/get_minimal_c4_en_dataset.py`, 
@@ -121,12 +123,14 @@ Behavior when `DECOUPLE_GCLOUD=TRUE`:
 * Each helper returns lightweight stubs whose attributes are safe to access; calling methods raises a clear `RuntimeError` only when actually invoked.
 * Prevents import-time failures for optional dependencies (JetStream, Tunix, `cloud_tpu_diagnostics`).
 
-Guidelines:
+#### Guidelines:
 * Prefer calling `jetstream()` / `tunix()` once at module import and branching on `is_decoupled()` for functionality that truly requires the dependency.
 * Use `is_decoupled()` to avoid direct `os.environ["DECOUPLE_GCLOUD"]` checking.
-* Tests add a `decoupled` marker if DECOUPLE_GCLOUD && not marked with below markers.
-* Pytest markers: `external_serving`, `external_training`.
-* Removing filename heuristics: only explicit markers determine skipping; please add the appropriate marker at the top of new tests.
+* Use `get_test_config_path()` instead of hard-coded `base.yml`.
+* Prefer conditional local fallbacks for cloud buckets and avoid introducing direct `gs://...` paths.
+* Please add the appropriate external dependency marker (`external_serving` or `external_training`) for new tests. Prefer the smallest scope instead of module-wide `pytestmark` when only a part of a file needs an external dependency.
+* Tests add a `decoupled` marker if DECOUPLE_GCLOUD && not marked with external dependency markers.
+
 
 This centralized approach keeps optional integrations cleanly separated from core MaxText logic, making local development (e.g. on ROCm/NVIDIA GPUs) frictionless.
 

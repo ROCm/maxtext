@@ -19,8 +19,8 @@ GCE_MARKERS = {"external_serving", "external_training"}
 def pytest_collection_modifyitems(config, items):
   """Customize collection:
   - If no TPU, still skip tpu_only tests (explicit skip marker).
-  - In decoupled mode, deselect tests marked external_serving/external_training instead of skipping,
-    so they do not appear as skipped failures; they simply aren't part of the session.
+  - If decoupled, deselect tests marked external_serving/external_training, don't skip them,
+    so that they don't appear as skipped, but they simply aren't part of the session.
   - Apply decoupled marker to remaining collected tests.
   """
   decoupled = is_decoupled()
@@ -32,7 +32,7 @@ def pytest_collection_modifyitems(config, items):
     skip_no_tpu = pytest.mark.skip(reason="Skipped: requires TPU hardware, none detected")
 
   for item in items:
-    cur_test_markers = {m.name for m in item.iter_markers()}
+    cur_test_markers = {m.name for m in item.iter_markers()} # Iterate thru the markers of every test
     # Hardware skip retains skip semantics
     if skip_no_tpu and "tpu_only" in cur_test_markers:
       item.add_marker(skip_no_tpu)
