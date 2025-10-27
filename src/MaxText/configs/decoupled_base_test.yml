@@ -25,6 +25,9 @@ profiler_steps: 0
 # Leave dataset-related keys to be overridden by individual tests.
 dataset_type: ""
 
+# Use dot_product attention to avoid GPU Pallas shared memory limits on AMD GPUs
+attention: "dot_product"
+
 # Avoid HLO dump overhead.
 dump_hlo: false
 jax_cache_dir: ""
