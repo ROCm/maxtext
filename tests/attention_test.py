@@ -42,6 +42,7 @@ from MaxText.layers.attentions import Attention
 from MaxText.layers.attention_op import ChunkedCausalMask, _make_bidirectional_block_mask, _generate_chunk_attention_mask
 from MaxText.layers.attention_mla import MLA
 from maxtext.tests.test_utils import get_test_config_path
+from MaxText.decouple import is_decoupled
 
 
 class BidirectionalBlockMaskTest(unittest.TestCase):
@@ -286,10 +287,13 @@ class AttentionTest(parameterized.TestCase):
   def setUp(self):
     """Initializes the configuration for each test"""
     super().setUp()
+    # Conditionally set ici_fsdp_parallelism to match device count in decoupled mode
+    extra_args = {"ici_fsdp_parallelism": jax.device_count()} if is_decoupled() else {}
     # Centralized config selection via helper.
     config = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
         **self.config_arguments,
+        **extra_args,
     )
     self.cfg = config
 
@@ -1050,9 +1054,12 @@ class MLATest(parameterized.TestCase):
   def setUp(self):
     """Initializes the configuration for each test"""
     super().setUp()
+    # Conditionally set ici_fsdp_parallelism to match device count in decoupled mode
+    extra_args = {"ici_fsdp_parallelism": jax.device_count()} if is_decoupled() else {}
     config = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
         **self.config_arguments,
+        **extra_args,
     )
     self.cfg = config
     self.rng = jax.random.PRNGKey(0)
