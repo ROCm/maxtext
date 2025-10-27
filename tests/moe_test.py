@@ -67,6 +67,7 @@ class TokenDroppingTest(unittest.TestCase):
         rngs=self.rngs,
     )
 
+  @pytest.mark.tpu_only
   def test_generate_masks(self):
     # expert_capacity = (tokens_per_batch / num_experts) * capacity_factor
     # expert_capacity_in_batch = (4 * 2 / 8) * 2 = 2
@@ -230,6 +231,7 @@ class DeepSeekRoutingTest(unittest.TestCase):
         rngs=self.rngs,
     )
 
+  @pytest.mark.tpu_only
   def test_deepseek_routing(self):
     # shape as [batch, sequence, num_experts] = [1,2,16]
     gate_logits = jnp.array(
@@ -936,3 +938,4 @@ class RoutedMoeTest(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
