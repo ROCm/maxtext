@@ -69,6 +69,10 @@ pip install uv
 uv pip install -e .[tpu] --resolution=lowest
 # or install the gpu package by running the following line
 # uv pip install -e .[cuda12] --resolution=lowest
+# or install the gpu package for amd gpu by running the following line
+# uv pip install -e .[rocm7] --resolution=lowest
+#this will not install rocm transformer-engine and rocm jax/xla gpu plugin, 
+#you need to manually install those or use rocm jax0.7x docker image with rocm transformer-engine
 install_maxtext_github_deps
 ```
 
