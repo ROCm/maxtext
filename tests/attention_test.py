@@ -1202,9 +1202,11 @@ class MLATest(parameterized.TestCase):
     # Create a copy of the arguments and override the attention_type for the base model
     attention_config_args = self.config_arguments.copy()
     attention_config_args["attention_type"] = AttentionType.GLOBAL.value
+    extra_args = {"ici_fsdp_parallelism": jax.device_count()} if is_decoupled() else {}
     attention_cfg = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
         **attention_config_args,
+        **extra_args,
     )
     dummy_inputs_q = jnp.ones(
         (attention_cfg.global_batch_size_to_train_on, attention_cfg.max_target_length, attention_cfg.base_emb_dim)
@@ -1235,7 +1237,10 @@ class MLATest(parameterized.TestCase):
     self.assertTrue(hasattr(base_attention, "out"), "Base Attention should have 'out' projection.")
 
     # 3. Initialize the MLA layer
-    _, mla_layer = self.init_mla(self.config_arguments, rope_type="default")
+    mla_config_args = self.config_arguments.copy()
+    mla_extra_args = {"ici_fsdp_parallelism": jax.device_count()} if is_decoupled() else {}
+    mla_config_args.update(mla_extra_args)
+    _, mla_layer = self.init_mla(mla_config_args, rope_type="default")
 
     # 4. Assert that the MLA layer DOES NOT HAVE the base projections
     self.assertFalse(hasattr(mla_layer, "query"), "MLA should not have 'query' projection.")
