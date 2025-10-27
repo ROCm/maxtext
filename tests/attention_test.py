@@ -907,6 +907,7 @@ class AttentionTest(parameterized.TestCase):
           jax.numpy.allclose(attention_w_reshape_q_idx, attention_wo_reshape_q_idx, rtol=rtol, atol=atol, equal_nan=False)
       )
 
+  @pytest.mark.tpu_only
   def test_sliding_window_attention(self):
     """Test sliding window attention"""
 
@@ -1189,6 +1190,7 @@ class MLATest(parameterized.TestCase):
       # TODO (b/394626702) uncomment last check when decode and kv_cache are implemented for MLA
       # self.assertTrue(jax.numpy.allclose(mla_full_this_idx, mla_idx, rtol=1e-02, atol=1e-02, equal_nan=False))
 
+  @pytest.mark.tpu_only
   def test_projection_initialization(self):
     """Tests that MLA and Attention layers initialize the correct projection weights."""
     # 1. Initialize a standard Attention layer for comparison

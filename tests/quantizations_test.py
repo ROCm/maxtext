@@ -376,10 +376,12 @@ class QuantTest(unittest.TestCase):
   def test_fp8_full_quantization(self):
     self.quantization_config("fp8_full")
 
+  @pytest.mark.tpu_only
   @pytest.mark.gpu_only
   def test_fp8_gpu_quantization(self):
     self.quantization_config("fp8_gpu", grad_tolerance=1.0)
 
+  @pytest.mark.tpu_only
   @pytest.mark.gpu_only
   def test_fp8_nanoo_quantization(self):
     self.quantization_config("fp8_nanoo", grad_tolerance=1.0)

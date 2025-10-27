@@ -17,6 +17,7 @@
 from typing import Any
 from collections.abc import Callable
 import unittest
+import pytest
 
 from jax import random, vmap
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -221,12 +222,14 @@ class MaxUtilsInitTransformerState(unittest.TestCase):
     quant = quantizations.configure_quantization(self.config)
     self.model = Transformer(self.config, mesh=self.mesh, quant=quant, model_mode=MODEL_MODE_TRAIN)
 
+  @pytest.mark.tpu_only
   def test_setup_decode_state(self):
     rng = random.PRNGKey(0)
     state, _ = maxtext_utils.setup_decode_state(self.model, self.config, rng, self.mesh, None)
     self.assertEqual(state.tx, None)
     self.assertEqual(state.opt_state, {})
 
+  @pytest.mark.tpu_only
   def test_setup_initial_state(self):
     rng = random.PRNGKey(0)
     tx = optax.adam(learning_rate=0.001)

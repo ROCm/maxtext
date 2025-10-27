@@ -20,6 +20,8 @@ import jax
 from jax.sharding import Mesh
 import jax.numpy as jnp
 
+import pytest
+
 from MaxText import pyconfig
 from MaxText import optimizers
 from MaxText.common_types import MODEL_MODE_TRAIN
@@ -31,6 +33,7 @@ from maxtext.tests.test_utils import get_test_config_path
 
 Transformer = models.transformer_as_linen
 
+pytestmark = [pytest.mark.tpu_only]
 
 class StateDtypes(unittest.TestCase):
   """Tests that state has expected dtypes, e.g. weights default to float32"""
