@@ -109,10 +109,12 @@ class TestModel(unittest.TestCase):
 
     self.assertEqual(logits.dtype, expected_dtype)
 
+  @pytest.mark.tpu_only
   def test_logits_dtype_with_cast_to_fp32(self):
     """Test logits datatype with cast to 32-bit floating point."""
     self._test_logits_cast_driver(cast_logits_to_fp32=True, expected_dtype=jnp.float32)
 
+  @pytest.mark.tpu_only
   def test_logits_dtype_without_cast(self):
     """Test logits datatype without casting."""
     self._test_logits_cast_driver(cast_logits_to_fp32=False, expected_dtype=jnp.bfloat16)

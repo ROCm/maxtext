@@ -21,6 +21,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 from flax import linen as nn
 
+import pytest
+
 from MaxText.common_types import Config
 from MaxText import max_logging, pyconfig
 from MaxText import maxtext_utils
@@ -34,7 +36,7 @@ from MaxText.common_types import MODEL_MODE_TRAIN
 
 TEST_LAYER_NUM = 1
 
-
+pytestmark = [pytest.mark.tpu_only]
 class MultiTokenPredictionLayerTest(unittest.TestCase):
   """Unit tests for the standalone MultiTokenPredictionLayer."""
 
@@ -169,7 +171,7 @@ class MTPBlockTestModel(nn.Module):
         deterministic,
     )
 
-
+pytestmark = [pytest.mark.tpu_only]
 class MultiTokenPredictionBlockTest(unittest.TestCase):
   """Unit tests for the MultiTokenPredictionBlock."""
 
