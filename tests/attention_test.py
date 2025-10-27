@@ -297,6 +297,8 @@ class AttentionTest(parameterized.TestCase):
     # Conditionally set ici_fsdp_parallelism to match device count in decoupled mode
     extra_args = {"ici_fsdp_parallelism": jax.device_count()} if is_decoupled() else {}
     jax.config.update("jax_remove_size_one_mesh_axis_from_type", True)
+    # Conditionally set ici_fsdp_parallelism to match device count in decoupled mode
+    extra_args = {"ici_fsdp_parallelism": jax.device_count()} if is_decoupled() else {}
     # Centralized config selection via helper.
     config = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
@@ -1075,6 +1077,8 @@ class MLATest(parameterized.TestCase):
     # Conditionally set ici_fsdp_parallelism to match device count in decoupled mode
     extra_args = {"ici_fsdp_parallelism": jax.device_count()} if is_decoupled() else {}
     jax.config.update("jax_remove_size_one_mesh_axis_from_type", True)
+    # Conditionally set ici_fsdp_parallelism to match device count in decoupled mode
+    extra_args = {"ici_fsdp_parallelism": jax.device_count()} if is_decoupled() else {}
     config = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
         **self.config_arguments,
