@@ -59,7 +59,7 @@ class TrainTests(unittest.TestCase):
       "pdb_lt_1": [  # tests base config with per_device_batch_size < 1
           None,
           get_test_config_path(),
-      f"base_output_directory={_base_output_directory}",
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "steps=2",
@@ -72,7 +72,7 @@ class TrainTests(unittest.TestCase):
       "tp_transpose": [  # tests base config with ici_tensor_transpose_parallelism=4
           None,
           get_test_config_path(),
-      f"base_output_directory={_base_output_directory}",
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "steps=2",
@@ -83,7 +83,7 @@ class TrainTests(unittest.TestCase):
       "int8": [  # tests base config with int8
           None,
           get_test_config_path(),
-      f"base_output_directory={_base_output_directory}",
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "quantization=int8",
@@ -95,7 +95,7 @@ class TrainTests(unittest.TestCase):
       "fp8": [  # tests base config with fp8
           None,
           get_test_config_path(),
-      f"base_output_directory={_base_output_directory}",
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "quantization=fp8",
@@ -107,7 +107,7 @@ class TrainTests(unittest.TestCase):
       "nanoo_fp8": [  # tests base config with nanoo_fp8
           None,
           get_test_config_path(),
-      f"base_output_directory={_base_output_directory}",
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "quantization=nanoo_fp8",
@@ -119,7 +119,7 @@ class TrainTests(unittest.TestCase):
       "dropout": [  # tests base config with dropout
           None,
           get_test_config_path(),
-      f"base_output_directory={_base_output_directory}",
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "dataset_path=gs://maxtext-dataset",
           "steps=2",
@@ -133,7 +133,7 @@ class TrainTests(unittest.TestCase):
       "hf_input_pipeline": [  # test for train.py with TFDS c4, using HF input pipeline
           None,
           get_test_config_path(),
-      f"base_output_directory={_base_output_directory}",
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
           "steps=2",
           "enable_checkpointing=False",

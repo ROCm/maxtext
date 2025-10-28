@@ -108,6 +108,7 @@ def test_param_ckpt_generation_with_autoselected_attention(quantization, capsys)
   assert expected_output in captured.out
 
 
+@pytest.mark.external_serving
 @pytest.mark.integration_test
 @pytest.mark.gpu_only
 @pytest.mark.parametrize("quantization", [(""), ("int8")])
@@ -139,3 +140,4 @@ def test_param_ckpt_generation_with_pre_generated_ckpt(capsys):
   captured = capsys.readouterr()
   expected_output = "Input `I love to`"
   assert expected_output in captured.out
+

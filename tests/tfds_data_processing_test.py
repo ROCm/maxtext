@@ -21,6 +21,7 @@ import jax
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 
+from maxtext.src.MaxText.decouple import is_decoupled
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
@@ -30,23 +31,38 @@ from maxtext.tests.test_utils import get_test_config_path
 from MaxText.input_pipeline import _tfds_data_processing
 from MaxText.input_pipeline import input_pipeline_interface
 
+MAXTEXT_ASSETS_ROOT = os.path.join("src", MAXTEXT_PKG_DIR, "assets")
 
 class TfdsDataProcessingTest(unittest.TestCase):
 
   def setUp(self):
     super().setUp()
-    config = pyconfig.initialize(
-      [sys.argv[0], get_test_config_path()],
+    decoupled = is_decoupled()
+    if decoupled:
+      local_dataset_name = "c4/en:3.1.0"
+      _dataset_path = os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "c4_en_dataset_minimal")
+      _base_output_directory = os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "gcloud_decoupled_test_logs")
+    else:
+      local_dataset_name = None
+      _dataset_path = "gs://maxtext-dataset"
+      _base_output_directory = "gs://max-experiments/"
+    config_kwargs = dict(
       per_device_batch_size=1,
       run_name="test",
       mesh_axes=["data"],
       logical_axis_rules=[["batch", "data"]],
       data_sharding=["data"],
-      base_output_directory="gs://max-experiments/",
-      dataset_path="gs://maxtext-dataset/",
+      base_output_directory=_base_output_directory,
+      dataset_path=_dataset_path,
       tokenizer_path=os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizer"),
       enable_checkpointing=False,
       eval_interval=10,
+    )
+    if decoupled and local_dataset_name:
+      config_kwargs["dataset_name"] = local_dataset_name
+    config = pyconfig.initialize(
+      [sys.argv[0], get_test_config_path()],
+      **config_kwargs
     )
     os.environ["TFDS_DATA_DIR"] = config.dataset_path
     self.config = config
@@ -132,3 +148,4 @@ class TfdsDataProcessingTest(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
