@@ -7,8 +7,13 @@
 
 import pytest
 from MaxText.decouple import is_decoupled
+import jax
+
+# Configure JAX to use unsafe_rbg PRNG implementation to match main scripts
+if is_decoupled():
+    jax.config.update("jax_default_prng_impl", "unsafe_rbg")
+
 try:
-  import jax
   _HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
 except Exception:  # pragma: no cover
   _HAS_TPU = False
