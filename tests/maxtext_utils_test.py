@@ -351,7 +351,8 @@ class TestAssertParamsSufficientlySharded(unittest.TestCase):
     multi-dimensional mesh passes the assertion.
     """
     # Create a mesh shape for a 5D mesh.
-    devices = np.array(jax.devices()).reshape((4, 1, 1, 1, 1))
+    num_devices = jax.device_count()
+    devices = np.array(jax.devices()).reshape((num_devices, 1, 1, 1, 1))
     mesh = Mesh(devices, self.mesh_axes)
 
     with mesh:
@@ -367,7 +368,8 @@ class TestAssertParamsSufficientlySharded(unittest.TestCase):
     Tests that a tensor on a complex mesh fails if it's not sharded along any
     of the primary valid axes (like 'fsdp').
     """
-    devices = np.array(jax.devices()).reshape((4, 1, 1, 1, 1))
+    num_devices = jax.device_count()
+    devices = np.array(jax.devices()).reshape((num_devices, 1, 1, 1, 1))
     mesh = Mesh(devices, self.mesh_axes)
     with mesh:
       pspec = PartitionSpec(("sequence", "context"), "stage", "tensor", None)
@@ -380,7 +382,8 @@ class TestAssertParamsSufficientlySharded(unittest.TestCase):
     """
     Tests that a mix of sharded (correctly) and unsharded tensors on a complex mesh fails.
     """
-    devices = np.array(jax.devices()).reshape((4, 1, 1, 1, 1))
+    num_devices = jax.device_count()
+    devices = np.array(jax.devices()).reshape((num_devices, 1, 1, 1, 1))
     mesh = Mesh(devices, self.mesh_axes)
     with mesh:
       sharded_pspec = PartitionSpec(("fsdp", "sequence"), "stage", ("tensor"), None)
@@ -408,7 +411,8 @@ class TestAssert_Formatted_sharding_annotations(unittest.TestCase):
       self.skipTest("This test suite requires at least 4 TPU devices")
 
     self.mesh_axes = ("fsdp", "sequence", "tensor", "stage", "context")
-    devices = np.array(jax.devices()).reshape((4, 1, 1, 1, 1))
+    num_devices = jax.device_count()
+    devices = np.array(jax.devices()).reshape((num_devices, 1, 1, 1, 1))
     self.mesh = Mesh(devices, self.mesh_axes)
 
   def test_multi_axis_mixed_formating(self):
@@ -673,3 +677,4 @@ class TestCalculateBytesFromPytree(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
