@@ -14,9 +14,9 @@
 
 bash scripts/test_8gpu_llama4_proxy.sh
 
-RAY_ADDRESS=local python -m MaxText.train MaxText/configs/base.yml run_name=runner_jaxpp_$(date +%Y-%m-%d-%H-%M) base_output_directory=/tmp/log hardware=gpu dataset_type=synthetic model_name=gpt3-52k steps=20 dtype=bfloat16 max_target_length=2048 per_device_batch_size=4 dcn_data_parallelism=1 ici_data_parallelism=2 ici_tensor_parallelism=2 ici_pipeline_parallelism=2 num_pipeline_repeats=1 num_pipeline_microbatches=8 enable_checkpointing=false use_jaxpp=True schedule=interleaved_1f1b
+RAY_ADDRESS=local python -m MaxText.train src/MaxText/configs/base.yml run_name=runner_jaxpp_$(date +%Y-%m-%d-%H-%M) base_output_directory=/tmp/log hardware=gpu dataset_type=synthetic model_name=gpt3-52k steps=20 dtype=bfloat16 max_target_length=2048 per_device_batch_size=4 dcn_data_parallelism=1 ici_data_parallelism=2 ici_tensor_parallelism=2 ici_pipeline_parallelism=2 num_pipeline_repeats=1 num_pipeline_microbatches=8 enable_checkpointing=false use_jaxpp=True schedule=interleaved_1f1b
 
-tests=$(python3 -m pytest --co -q -W ignore::DeprecationWarning MaxText/tests/train_compile_jaxpp_test.py | awk '/^[[:space:]]*$/{exit} {print}')
+tests=$(python3 -m pytest --co -q -W ignore::DeprecationWarning tests/train_compile_jaxpp_test.py | awk '/^[[:space:]]*$/{exit} {print}')
 
 for t in $tests; do
     echo $t

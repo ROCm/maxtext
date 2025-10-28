@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Copyright 2023 Google LLC
+# Copyright 2023–2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      https://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,8 +27,20 @@
 # works with any custom wheels.
 # bash docker_build_dependency_image.sh MODE=custom_wheels
 
+# bash docker_build_dependency_image.sh MODE=grpo
+
 # Enable "exit immediately if any command fails" option
 set -e
+
+# Check for docker permissions
+if ! docker info > /dev/null 2>&1; then
+  echo "ERROR: Permission denied while trying to connect to the Docker daemon." >&2
+  echo "You can fix this by:" >&2
+  echo "1. Running this script with sudo: 'sudo bash $0 $@'" >&2
+  echo "2. Adding your user to the 'docker' group: 'sudo usermod -aG docker \${USER}' (requires a new login session)." >&2
+  echo "3. Running `newgrp docker` in your current terminal." >&2
+  exit 1
+fi
 
 export LOCAL_IMAGE_NAME=maxtext_base_image
 echo "Building to $LOCAL_IMAGE_NAME"
@@ -40,9 +52,10 @@ echo "Starting to build your docker image. This will take a few minutes but the 
 
 # Set environment variables
 for ARGUMENT in "$@"; do
-    IFS='=' read -r KEY VALUE <<< "$ARGUMENT"
+    IFS='=' read -r RAW_KEY VALUE <<< "$ARGUMENT"
+    KEY=$(echo "$RAW_KEY" | tr '[:lower:]' '[:upper:]')
     export "$KEY"="$VALUE"
-    echo "$KEY"="$VALUE"
+    echo "$KEY=$VALUE"
 done
 
 
@@ -54,11 +67,18 @@ fi
 if [[ -z ${MODE} ]]; then
   export MODE=stable
   echo "Default MODE=${MODE}"
+  export CUSTOM_JAX=0
+  export INSTALL_GRPO=0
 elif [[ ${MODE} == "custom_wheels" ]] ; then
   export MODE=nightly
   export CUSTOM_JAX=1
+  export INSTALL_GRPO=0
+elif [[ ${MODE} == "grpo" || ${MODE} == "grpo-experimental" ]] ; then
+  export INSTALL_GRPO=1
+  export CUSTOM_JAX=0
 else
   export CUSTOM_JAX=0
+  export INSTALL_GRPO=0
 fi
 
 if [[ -z ${DEVICE} ]]; then
@@ -66,30 +86,30 @@ if [[ -z ${DEVICE} ]]; then
   echo "Default DEVICE=${DEVICE}"
 fi
 
-# Function to build with MODE=stable-stack
-build_stable_stack() {
+# Function to build with MODE=jax_ai_image
+build_ai_image() {
     if [[ -z ${BASEIMAGE+x} ]]; then
         echo "Error: BASEIMAGE is unset, please set it!"
         exit 1
     fi
     COMMIT_HASH=$(git rev-parse --short HEAD)
-    echo "Building JAX Stable Stack MaxText at commit hash ${COMMIT_HASH}..."
+    echo "Building JAX AI MaxText Imageat commit hash ${COMMIT_HASH}..."
 
-    docker build --no-cache \
-        --build-arg JAX_STABLE_STACK_BASEIMAGE=${BASEIMAGE} \
+    docker build \
+        --build-arg JAX_AI_IMAGE_BASEIMAGE=${BASEIMAGE} \
         --build-arg COMMIT_HASH=${COMMIT_HASH} \
         --build-arg DEVICE="$DEVICE" \
         --network=host \
         -t ${LOCAL_IMAGE_NAME} \
-        -f ./maxtext_jax_stable_stack.Dockerfile .
+        -f ./maxtext_jax_ai_image.Dockerfile .
 }
 
 if [[ -z ${LIBTPU_GCS_PATH+x} ]] ; then
   export LIBTPU_GCS_PATH=NONE
   echo "Default LIBTPU_GCS_PATH=${LIBTPU_GCS_PATH}"
   if [[ ${DEVICE} == "gpu" ]]; then
-    if [[ ${MODE} == "stable_stack" ]]; then
-      build_stable_stack
+    if [[ ${MODE} == "stable_stack" || ${MODE} == "jax_ai_image" ]]; then
+      build_ai_image
     else
       if [[ ${MODE} == "pinned" ]]; then
         export BASEIMAGE=ghcr.io/nvidia/jax:base-2024-12-04
@@ -99,11 +119,14 @@ if [[ -z ${LIBTPU_GCS_PATH+x} ]] ; then
       docker build --network host --build-arg MODE=${MODE} --build-arg JAX_VERSION=$JAX_VERSION --build-arg DEVICE=$DEVICE --build-arg BASEIMAGE=$BASEIMAGE -f ./maxtext_gpu_dependencies.Dockerfile -t ${LOCAL_IMAGE_NAME} .
     fi
   else
-    if [[ ${MODE} == "stable_stack" ]]; then
-      build_stable_stack
+    if [[ ${MODE} == "stable_stack" || ${MODE} == "jax_ai_image" ]]; then
+      build_ai_image
     elif [[ ${MANTARAY} == "true" ]]; then
       echo "Building with benchmark-db"
       docker build --network host --build-arg MODE=${MODE} --build-arg JAX_VERSION=$JAX_VERSION --build-arg LIBTPU_GCS_PATH=$LIBTPU_GCS_PATH --build-arg DEVICE=$DEVICE -f ./maxtext_db_dependencies.Dockerfile -t ${LOCAL_IMAGE_NAME} .
+    elif [[ ${INSTALL_GRPO} -eq 1 && ${DEVICE} == "tpu" ]]; then
+      echo "Installing MaxText stable mode dependencies for GRPO"
+      docker build --network host --build-arg MODE=stable --build-arg JAX_VERSION=$JAX_VERSION --build-arg LIBTPU_GCS_PATH=$LIBTPU_GCS_PATH --build-arg DEVICE=$DEVICE -f ./maxtext_dependencies.Dockerfile -t ${LOCAL_IMAGE_NAME} .
     else
       docker build --network host --build-arg MODE=${MODE} --build-arg JAX_VERSION=$JAX_VERSION --build-arg LIBTPU_GCS_PATH=$LIBTPU_GCS_PATH --build-arg DEVICE=$DEVICE -f ./maxtext_dependencies.Dockerfile -t ${LOCAL_IMAGE_NAME} .
     fi
@@ -111,6 +134,32 @@ if [[ -z ${LIBTPU_GCS_PATH+x} ]] ; then
 else
   docker build --network host --build-arg MODE=${MODE} --build-arg JAX_VERSION=$JAX_VERSION --build-arg LIBTPU_GCS_PATH=$LIBTPU_GCS_PATH -f ./maxtext_dependencies.Dockerfile -t ${LOCAL_IMAGE_NAME} .
   docker build --network host --build-arg CUSTOM_LIBTPU=true -f ./maxtext_libtpu_path.Dockerfile -t ${LOCAL_IMAGE_NAME} .
+fi
+
+if [[ ${INSTALL_GRPO} -eq 1 ]] ; then
+  if [[ ${DEVICE} != "tpu" ]] ; then
+    echo "Error: MODE=grpo is only supported for DEVICE=tpu"
+    exit 1
+  fi
+
+  # # To install tpu_commons from a local path, we copy it into the build context, excluding __pycache__.
+  # # This assumes vllm, tunix, tpu_commons is a sibling directory to the current one (maxtext).
+  # rsync -a --exclude='__pycache__' ../tpu_commons .
+  # # To install vllm from a local path, we copy it into the build context, excluding __pycache__.
+  # # This assumes vllm is a sibling directory to the current one (maxtext).
+  # rsync -a --exclude='__pycache__' ../vllm .
+
+  # rsync -a --exclude='__pycache__' ../tunix .
+
+  # # The cleanup is set to run even if the build fails to remove the copied directory.
+  # trap "rm -rf ./tpu_commons ./vllm ./tunix" EXIT INT TERM
+
+  docker build \
+    --network host \
+    --build-arg BASEIMAGE=${LOCAL_IMAGE_NAME} \
+    --build-arg MODE=${MODE} \
+    -f ./maxtext_grpo_dependencies.Dockerfile \
+    -t ${LOCAL_IMAGE_NAME} .
 fi
 
 if [[ ${CUSTOM_JAX} -eq 1 ]] ; then

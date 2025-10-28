@@ -22,4 +22,5 @@ RUN uv pip install -U pip && uv pip install --no-cache-dir -U -r /tmp/requiremen
 COPY --chown=$USER_UID:$USER_GID . maxtext
 
 RUN uv pip install --no-cache-dir -e '/workdir/jaxpp[dev]'
-RUN if [[ -n "$JAX_INSTALL_URL" ]]; then uv pip install $JAX_INSTALL_URL; fi
+RUN uv pip install --no-cache-dir -e /workdir/maxtext[cuda_12] --resolution=lowest && \
+    if [[ -n "$JAX_INSTALL_URL" ]]; then uv pip install $JAX_INSTALL_URL; fi
