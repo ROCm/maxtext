@@ -28,11 +28,31 @@ def _cloud_diag_stubs():
     class _StubDiag:
         def run(self, *_a, **_k):
             return {"status": "skipped"}
+        def diagnose(self, *_a, **_k):
+            # Return a context manager that gracefully handles any errors
+            import contextlib
+            @contextlib.contextmanager
+            def _graceful_diagnose():
+                try:
+                    yield
+                except Exception as e:
+                    # Log error but don't crash
+                    print(f"Warning: Using stubs in decoupling mode for cloud_diagnostics replacement. This stub is for diagnose function: {e}")
+            return _graceful_diagnose()
+    class _StubDebugConfig:
+        def __init__(self, *a, **k):
+            pass
+    class _StubStackTraceConfig:
+        def __init__(self, *a, **k):
+            pass
+    class _StubDiagnosticConfig:
+        def __init__(self, debug_config=None, *a, **k):
+            self.debug_config = debug_config
     return (
         _StubDiag(),
-        SimpleNamespace(DebugConfig=SimpleNamespace, StackTraceConfig=SimpleNamespace),
-        SimpleNamespace(DiagnosticConfig=SimpleNamespace),
-        SimpleNamespace(StackTraceConfig=SimpleNamespace),
+        SimpleNamespace(DebugConfig=_StubDebugConfig, StackTraceConfig=_StubStackTraceConfig),
+        SimpleNamespace(DiagnosticConfig=_StubDiagnosticConfig),
+        SimpleNamespace(StackTraceConfig=_StubStackTraceConfig),
     )
 
 def cloud_diagnostics():
