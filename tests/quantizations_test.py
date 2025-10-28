@@ -41,7 +41,7 @@ from MaxText.decouple import is_decoupled
 
 _QUERY_REGEX = ".*/query"
 _VALUE_REGEX = ".*/value"
-
+MAXTEXT_PKG_DIR = os.path.join("src", MAXTEXT_PKG_DIR)
 
 class QuantTestModule(nn.Module):
   """Test module for einsum."""
