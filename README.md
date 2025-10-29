@@ -129,7 +129,10 @@ Behavior when `DECOUPLE_GCLOUD=TRUE`:
 * Use `get_test_config_path()` instead of hard-coded `base.yml`.
 * Prefer conditional local fallbacks for cloud buckets and avoid introducing direct `gs://...` paths.
 * Please add the appropriate external dependency marker (`external_serving` or `external_training`) for new tests. Prefer the smallest scope instead of module-wide `pytestmark` when only a part of a file needs an external dependency.
-* Tests add a `decoupled` marker if DECOUPLE_GCLOUD && not marked with external dependency markers.
+* Tests add a `decoupled` marker if DECOUPLE_GCLOUD && not marked with external dependency markers. Run tests with:
+```
+pytest -m decoupled -vv tests
+```
 
 
 This centralized approach keeps optional integrations cleanly separated from core MaxText logic, making local development (e.g. on ROCm/NVIDIA GPUs) frictionless.
@@ -209,3 +212,4 @@ MaxText aims to provide you with the best OSS models, whether as a reference imp
 ## Get involved
 
 Please join our [Discord Channel](https://discord.com/invite/2H9PhvTcDU) and if you have feedback, you can file a feature request, documentation request, or bug report [here](https://github.com/AI-Hypercomputer/maxtext/issues/new/choose).
+
