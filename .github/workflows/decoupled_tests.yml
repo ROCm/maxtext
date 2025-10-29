@@ -23,7 +23,8 @@ jobs:
     env:
       DECOUPLE_GCLOUD: TRUE
       LOCAL_GCLOUD_PROJECT: ci-decoupled
-      LOCAL_BASE_OUTPUT: rocm/gcloud_decoupled_test_logs
+      LOCAL_BASE: decoupled_datasets
+      LOCAL_BASE_OUTPUT: decoupled_datasets/gcloud_decoupled_test_logs
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,7 +47,7 @@ jobs:
           docker run -d -it --name ${CONTAINER_NAME} -w ${WORKDIR} ${ENV_VARS} ${RUNTIME_FLAGS} ${DEVICE_FLAGS} ${MOUNT} ${DOCKER_IMAGE}
           echo "Container ${CONTAINER_NAME} started with centralized env vars." >> "${LOCAL_BASE_OUTPUT}/ci.log"
 
-      - name: Install Maxtext Package
+      - name: Install Requirements and Maxtext Package
         run: |
           set -euo pipefail
           CONTAINER_NAME="decouple_maxtext_tests"
@@ -55,6 +56,9 @@ jobs:
             pip install . --no-cache-dir
             mkdir -p "${LOCAL_BASE_OUTPUT}"
             echo "Maxtext package installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
+            pip install -r requirements_decoupled_rocm_jax_0_6_0.txt --no-cache-dir
+            pip install pytest pytest-html pytest-csv minio array-record
+            echo "Requirements installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
           '
 
       - name: Build and Install TE
@@ -83,27 +87,26 @@ jobs:
             echo "TE built and installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
           '
 
-      - name: Install Requirements
-        run: |
-          set -euo pipefail
-          CONTAINER_NAME="decouple_maxtext_tests"
-          docker exec ${CONTAINER_NAME} bash -euo pipefail -c '
-            pip install -r requirements_with_jax_stable_stack_0.6.0.txt --no-cache-dir
-            pip install pytest pytest-html pytest-csv
-            mkdir -p "${LOCAL_BASE_OUTPUT}"
-            echo "Requirements installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
-          '
-
       - name: Generate datasets
         run: |
           set -euo pipefail
           CONTAINER_NAME="decouple_maxtext_tests"
           docker exec ${CONTAINER_NAME} bash -euo pipefail -c '
+            echo "Installing minio and array-record deps for minimal data generation." >> "${LOCAL_BASE_OUTPUT}/ci.log"
+            pip install minio array-record
             echo "Generating minimal ArrayRecord shards" >> "${LOCAL_BASE_OUTPUT}/ci.log"
-            python rocm/get_minimal_c4_en_dataset.py || { echo "ArrayRecord generation failed"; exit 3; }
+            python ${LOCAL_BASE}/get_minimal_c4_en_dataset.py --force || { echo "ArrayRecord generation failed"; exit 3; }
             echo "Generating minimal parquet shards" >> "${LOCAL_BASE_OUTPUT}/ci.log"
-            python rocm/get_minimal_hf_c4_parquet.py --force --train-rows 200 --val-rows 40
+            python ${LOCAL_BASE}/get_minimal_hf_c4_parquet.py --force --train-rows 200 --val-rows 40
             echo "Minimal dataset setup complete." >> "${LOCAL_BASE_OUTPUT}/ci.log"
+            echo "Generating minimal tfrecord shards." >> "${LOCAL_BASE_OUTPUT}/ci.log"
+            python ${LOCAL_BASE}/convert_arrayrecord_to_tfrecord.py --version-dir ${LOCAL_BASE}/c4_en_dataset_minimal/c4/en/3.0.1 --builder-name __local_c4_builder --force
+            echo "Minimal tfrecord shards generation complete." >> "${LOCAL_BASE_OUTPUT}/ci.log"
+            cp -r ${LOCAL_BASE}/c4_en_dataset_minimal/c4/en/3.0.1 ${LOCAL_BASE}/c4_en_dataset_minimal/c4/en/3.1.0
+            echo "Generating TFDS metadata." >> "${LOCAL_BASE_OUTPUT}/ci.log"
+            python ${LOCAL_BASE}/generate_tfds_metadata.py --root ${LOCAL_BASE}/c4_en_dataset_minimal --version 3.0.1 --source-version 3.0.1 --force
+            python ${LOCAL_BASE}/generate_tfds_metadata.py --root ${LOCAL_BASE}/c4_en_dataset_minimal --version 3.1.0 --source-version 3.0.1 --force
+            echo "Minimal dataset generation complete!" >> "${LOCAL_BASE_OUTPUT}/ci.log"
           '
 
       - name: Collect & run decoupled tests
@@ -126,7 +129,7 @@ jobs:
             echo "Reports: CSV & HTML attached as artifacts." >> $GITHUB_STEP_SUMMARY
           '
 
-          echo "Container ${CONTAINER_NAME} still alive." >> rocm/gcloud_decoupled_test_logs/ci.log
+          echo "Container ${CONTAINER_NAME} still alive." >> decoupled_datasets/gcloud_decoupled_test_logs/ci.log
           echo "Attach to container with: docker exec -it ${CONTAINER_NAME} bash" >> $GITHUB_STEP_SUMMARY
           echo "Remove when done: docker rm -f ${CONTAINER_NAME}" >> $GITHUB_STEP_SUMMARY
 
@@ -155,5 +158,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: decoupled-logs
-          path: rocm/gcloud_decoupled_test_logs
+          path: decoupled_datasets/gcloud_decoupled_test_logs
           if-no-files-found: warn
+

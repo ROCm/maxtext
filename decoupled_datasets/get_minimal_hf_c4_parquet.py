@@ -37,10 +37,13 @@ def download_object(client: Minio, obj, dest_path: Path):
         data.close(); data.release_conn()
     return dest_path
 
-def write_parquet(path: Path, rows: list[str]):
-    if path.exists():
+def write_parquet(path: Path, rows: list[str], force: bool = False):
+    if not force and path.exists():
         print(f"[skip] {path} exists")
         return
+    # If force is set and path exists, remove it first
+    if force and path.exists():
+        path.unlink()
     # Normalize & drop empties again defensively.
     rows = [r.strip() for r in rows if isinstance(r, str) and r.strip()]
     table = pa.Table.from_pydict({"text": rows})
@@ -68,6 +71,8 @@ def main():
     p.add_argument("--train-rows", type=int, default=800)
     p.add_argument("--val-rows", type=int, default=160)
     p.add_argument("--output-dir", default=str(SCRIPT_DIR / "c4_en_dataset_minimal" / "hf" / "c4"))
+    p.add_argument("--force", action="store_true", default=False,
+                   help="Force overwrite existing parquet files")
     a = p.parse_args()
 
     # Resolve output paths first so we can early stop.
@@ -76,8 +81,10 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
     train_out = out_dir / "c4-train-00000-of-01637.parquet"
     val_out = out_dir / "c4-validation-00000-of-01637.parquet"
-    if train_out.exists() and val_out.exists():
+    
+    if not a.force and train_out.exists() and val_out.exists():
         print("Both output parquet files already exist; skipping (no MinIO connection needed).")
+        print("Use --force to regenerate the files.")
         return
 
     client = Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=MINIO_SECURE)
@@ -122,8 +129,8 @@ def main():
     except Exception: pass
 
     print(f"Rows: train={len(rows_train)} val={len(rows_val)}")
-    write_parquet(train_out, rows_train)
-    write_parquet(val_out, rows_val)
+    write_parquet(train_out, rows_train, force=a.force)
+    write_parquet(val_out, rows_val, force=a.force)
 
 if __name__ == "__main__":
     main()

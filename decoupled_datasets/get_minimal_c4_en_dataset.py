@@ -22,6 +22,7 @@ Note: Replace the MINIO_ACCESS_KEY and MINIO_SECRET_KEY with your keys.
 import os
 import glob
 import sys
+import argparse
 from typing import List, Tuple
 
 from minio import Minio
@@ -196,8 +197,43 @@ def compute_dir_size_bytes(dir_path: str, patterns: List[str]) -> int:
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Create minimal c4/en dataset shards from MinIO Instance"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Force overwrite all existing dataset files without prompting"
+    )
+    args = parser.parse_args()
+
     # Use TF v1-style record iterator
     tf.compat.v1.disable_eager_execution()
+
+    # Check which versions already exist
+    existing_versions = []
+    for ver in VERSIONS:
+        local_version_dir = os.path.join(LOCAL_BASE, ver)
+        # Check if directory exists and has ArrayRecord files
+        if os.path.exists(local_version_dir):
+            shard_files = glob.glob(os.path.join(local_version_dir, "c4-*.array_record-*"))
+            if shard_files:
+                existing_versions.append(ver)
+
+    if existing_versions:
+        if args.force:
+            print(f"Force mode: Will overwrite existing versions: {existing_versions}")
+        else:
+            print(f"Found existing versions: {existing_versions}")
+            # Check if all versions exist to avoid MinIO connection
+            if set(existing_versions) == set(VERSIONS):
+                print("All versions already exist. Nothing to do.")
+                print("Use --force to regenerate all versions.")
+                sys.exit(0)
+            print(f"Will skip these and only generate missing versions.")
+            print(f"Use --force to overwrite all versions.\n")
 
     client = Minio(
         MINIO_ENDPOINT,
@@ -226,8 +262,14 @@ def main():
         if i >= 200: break
 
     for ver in VERSIONS:
-        print(f"\nProcessing c4/en:{ver}")
         local_version_dir = os.path.join(LOCAL_BASE, ver)
+        
+        # Skip existing versions unless force mode is enabled
+        if not args.force and ver in existing_versions:
+            print(f"\nSkipping existing version {ver}")
+            continue
+            
+        print(f"\nProcessing c4/en:{ver}")
         ensure_dir(local_version_dir)
 
         # Find source shards for train/validation (prefer ArrayRecord)
@@ -337,5 +379,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
