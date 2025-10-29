@@ -114,6 +114,7 @@ jobs:
           set -euo pipefail
           CONTAINER_NAME="decouple_maxtext_tests"
           docker exec ${CONTAINER_NAME} bash -euo pipefail -c '
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
             echo "Collecting tests" >> "${LOCAL_BASE_OUTPUT}/ci.log"
             pytest tests -m decoupled --collect-only -q | tee "${LOCAL_BASE_OUTPUT}/collect.txt"
             TEST_COUNT="$(grep -v "^$" "${LOCAL_BASE_OUTPUT}/collect.txt" | wc -l)"

@@ -123,7 +123,7 @@ def write_sharded_with_byte_caps_from_arrayrecord(src_path, dst_dir, split_name,
     shard_bytes = [0] * num_shards
     for i in range(num_shards):
         shard_name = f"c4-{split_name}.array_record-{i:05d}-of-{num_shards:05d}"
-        writers.append(ArrayRecordWriter(os.path.join(dst_dir, shard_name)))
+        writers.append(ArrayRecordWriter(os.path.join(dst_dir, shard_name), "group_size:1"))
 
     reader = ArrayRecordReader(src_path)
     n = min(max_total_records, reader.num_records())
@@ -160,7 +160,7 @@ def write_sharded_with_byte_caps_from_tfrecord(src_path, dst_dir, split_name,
     shard_bytes = [0] * num_shards
     for i in range(num_shards):
         shard_name = f"c4-{split_name}.array_record-{i:05d}-of-{num_shards:05d}"
-        writers.append(ArrayRecordWriter(os.path.join(dst_dir, shard_name)))
+        writers.append(ArrayRecordWriter(os.path.join(dst_dir, shard_name), "group_size:1"))
 
     shard_idx = 0
     count = 0
