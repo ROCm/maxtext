@@ -1249,6 +1249,7 @@ class AttentionOp(nnx.Module):
     # These imports are only meant to work in a GPU build.
     # pylint: disable=import-outside-toplevel
     from transformer_engine.jax.flax.transformer import DotProductAttention  # pytype: disable=import-error
+    from transformer_engine.jax.attention import SequenceDescriptor
 
     _, _, _, head_dim = query.shape  # pylint: disable=unused-variable
 
