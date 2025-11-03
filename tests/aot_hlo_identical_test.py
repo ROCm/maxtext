@@ -22,7 +22,7 @@ import tempfile
 import unittest
 import pytest
 import os
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 import shutil
 import hashlib
 import re
@@ -46,7 +46,7 @@ class AotHloIdenticalTest(unittest.TestCase):
       logs_root = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "decoupled_datasets",
+          "datasets",
           "gcloud_decoupled_test_logs",
           "aot_hlo_identical_test",
       )

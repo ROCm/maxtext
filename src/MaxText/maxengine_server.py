@@ -17,7 +17,7 @@
 import os
 import sys
 
-from MaxText.decouple import jetstream, is_decoupled
+from MaxText.gcloud_stub import jetstream, is_decoupled
 server_lib, config_lib, _token_utils, _tokenizer_api, _token_params_ns = jetstream()
 import pathwaysutils  # pylint: disable=unused-import
 

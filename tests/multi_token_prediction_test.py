@@ -24,7 +24,7 @@ from flax import linen as nn
 from MaxText.common_types import Config
 from MaxText import max_logging, pyconfig
 from MaxText import maxtext_utils
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 from MaxText.globals import MAXTEXT_PKG_DIR
 from maxtext.tests.test_utils import get_test_config_path
 from MaxText.layers.decoders import Decoder, DecoderLayer

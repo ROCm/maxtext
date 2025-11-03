@@ -1,7 +1,7 @@
 """Generate minimal TFDS metadata (features.json, dataset_info.json) for existing local C4 array_record shards.
 
 Usage:
-    cd decoupled_datasets && python generate_tfds_metadata.py --root c4_en_dataset_minimal --version 3.1.0 --source-version 3.0.1 --force
+    cd datasets && python generate_tfds_metadata.py --root c4_en_dataset_minimal --version 3.1.0 --source-version 3.0.1 --force
 
 Instead of hand-crafting JSON (which is brittle to TFDS proto changes), this script
 creates a tiny in-memory TFDS builder and uses DatasetInfo.write_to_dir() to emit

@@ -18,7 +18,7 @@ import subprocess
 import sys
 import os.path
 import tempfile
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 import unittest
 
 import jax
@@ -49,7 +49,7 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
       grain_train_files = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "decoupled_datasets",
+          "datasets",
           "c4_en_dataset_minimal",
           "c4",
           "en",
@@ -59,7 +59,7 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
       base_output_directory = os.path.join(
         MAXTEXT_PKG_DIR,
         "..",
-        "decoupled_datasets",
+        "datasets",
         "gcloud_decoupled_test_logs",
       )
       config_file = get_test_config_path()
@@ -152,7 +152,7 @@ class GrainArrayRecordProcessingWithMultiSourceBlendingTest(GrainArrayRecordProc
       base_pattern = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "decoupled_datasets",
+          "datasets",
           "c4_en_dataset_minimal",
           "c4",
           "en",
@@ -162,7 +162,7 @@ class GrainArrayRecordProcessingWithMultiSourceBlendingTest(GrainArrayRecordProc
       base_output_directory = os.path.join(
         MAXTEXT_PKG_DIR,
         "..",
-        "decoupled_datasets",
+        "datasets",
         "gcloud_decoupled_test_logs",
       )
       config_file = get_test_config_path()
@@ -216,7 +216,7 @@ class GrainParquetProcessingTest(unittest.TestCase):
       grain_train_file = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "decoupled_datasets",
+          "datasets",
           "c4_en_dataset_minimal",
           "hf",
           "c4",
@@ -225,7 +225,7 @@ class GrainParquetProcessingTest(unittest.TestCase):
       base_output_directory = os.path.join(
         MAXTEXT_PKG_DIR,
         "..",
-        "decoupled_datasets",
+        "datasets",
         "gcloud_decoupled_test_logs",
       )
       config_file = get_test_config_path()
@@ -312,7 +312,7 @@ def mount_gcsfuse():
   Mounts a GCS bucket (gs://maxtext-dataset) to a local directory (/tmp/gcsfuse)
   using gcsfuse if not already mounted.
   """
-  from MaxText.decouple import is_decoupled
+  from MaxText.gcloud_stub import is_decoupled
   if is_decoupled():
     return  # No-op when decoupled.
   temp_dir = tempfile.gettempdir()

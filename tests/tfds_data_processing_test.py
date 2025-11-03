@@ -21,7 +21,7 @@ import jax
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 
-from maxtext.src.MaxText.decouple import is_decoupled
+from maxtext.src.MaxText.gcloud_stub import is_decoupled
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
@@ -40,8 +40,8 @@ class TfdsDataProcessingTest(unittest.TestCase):
     decoupled = is_decoupled()
     if decoupled:
       local_dataset_name = "c4/en:3.1.0"
-      _dataset_path = os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "c4_en_dataset_minimal")
-      _base_output_directory = os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "gcloud_decoupled_test_logs")
+      _dataset_path = os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "c4_en_dataset_minimal")
+      _base_output_directory = os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "gcloud_decoupled_test_logs")
     else:
       local_dataset_name = None
       _dataset_path = "gs://maxtext-dataset"

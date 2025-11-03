@@ -37,7 +37,7 @@ from MaxText import maxtext_utils
 from MaxText import model_creation_utils
 from MaxText.kernels.megablox import gmm
 from MaxText.common_types import DECODING_ACTIVE_SEQUENCE_INDICATOR
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 
 _QUERY_REGEX = ".*/query"
 _VALUE_REGEX = ".*/value"

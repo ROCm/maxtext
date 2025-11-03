@@ -32,7 +32,7 @@ from MaxText.globals import MAXTEXT_PKG_DIR
 from maxtext.tests.test_utils import get_test_config_path
 from MaxText.layers import models
 from MaxText.layers import quantizations
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 
 MAX_PREFILL_PREDICT_LENGTH = 4
 

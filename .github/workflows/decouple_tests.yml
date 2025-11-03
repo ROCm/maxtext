@@ -23,8 +23,8 @@ jobs:
     env:
       DECOUPLE_GCLOUD: TRUE
       LOCAL_GCLOUD_PROJECT: ci-decoupled
-      LOCAL_BASE: decoupled_datasets
-      LOCAL_BASE_OUTPUT: decoupled_datasets/gcloud_decoupled_test_logs
+      LOCAL_BASE: datasets
+      LOCAL_BASE_OUTPUT: datasets/gcloud_decoupled_test_logs
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,12 +52,12 @@ jobs:
           set -euo pipefail
           CONTAINER_NAME="decouple_maxtext_tests"
           docker exec ${CONTAINER_NAME} bash -euo pipefail -c '
-            python -m pip install --upgrade pip
-            pip install . --no-cache-dir
+            apt install -y git vim
+            pip install . --no-cache-dir --break-system-packages
             mkdir -p "${LOCAL_BASE_OUTPUT}"
             echo "Maxtext package installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
-            pip install -r requirements_decoupled_rocm_jax_0_6_0.txt --no-cache-dir
-            pip install pytest pytest-html pytest-csv minio array-record
+            pip install -r requirements_decoupled_rocm_jax_0_6_0.txt --no-cache-dir --break-system-packages
+            pip install pytest pytest-html pytest-csv minio array-record --break-system-packages
             echo "Requirements installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
           '
 
@@ -83,7 +83,7 @@ jobs:
             export NVTE_BUILD_MAX_JOBS=180
             export CU_NUM=304
             python3 setup.py bdist_wheel
-            python3 -m pip install dist/transformer_engine-*.whl --no-cache-dir
+            python3 -m pip install dist/transformer_engine-*.whl --no-cache-dir --break-system-packages
             echo "TE built and installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
           '
 
@@ -129,7 +129,7 @@ jobs:
             echo "Reports: CSV & HTML attached as artifacts." >> $GITHUB_STEP_SUMMARY
           '
 
-          echo "Container ${CONTAINER_NAME} still alive." >> decoupled_datasets/gcloud_decoupled_test_logs/ci.log
+          echo "Container ${CONTAINER_NAME} still alive." >> datasets/gcloud_decoupled_test_logs/ci.log
           echo "Attach to container with: docker exec -it ${CONTAINER_NAME} bash" >> $GITHUB_STEP_SUMMARY
           echo "Remove when done: docker rm -f ${CONTAINER_NAME}" >> $GITHUB_STEP_SUMMARY
 
@@ -158,6 +158,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: decoupled-logs
-          path: decoupled_datasets/gcloud_decoupled_test_logs
+          path: datasets/gcloud_decoupled_test_logs
           if-no-files-found: warn
 

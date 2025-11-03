@@ -28,7 +28,7 @@ import jax.numpy as jnp
 
 from flax import nnx
 
-from MaxText.decouple import tunix as _tunix
+from MaxText.gcloud_stub import tunix as _tunix
 peft_trainer, _tunix_hooks = _tunix()
 # Ensure hook bases are proper types (class objects). Some stub implementations might supply instances.
 _raw_data_hooks = getattr(_tunix_hooks, "DataHooks", object)

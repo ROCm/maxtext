@@ -15,7 +15,7 @@
 """Utilities for Tensorboard in Vertex AI."""
 
 import os
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 
 import jax
 

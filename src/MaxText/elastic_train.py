@@ -43,7 +43,7 @@ import logging
 import time
 import os
 from absl import app
-from MaxText.decouple import cloud_diagnostics as _cloud_diag
+from MaxText.gcloud_stub import cloud_diagnostics as _cloud_diag
 diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration = _cloud_diag()
 
 import jax

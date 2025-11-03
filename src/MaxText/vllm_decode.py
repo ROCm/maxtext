@@ -34,7 +34,7 @@ import transformers
 from MaxText import model_creation_utils
 from MaxText import pyconfig
 from MaxText.common_types import Config
-from MaxText.decouple import is_decoupled, tunix as _tunix
+from MaxText.gcloud_stub import is_decoupled, tunix as _tunix
 _tunix_mod, _tunix_hooks = _tunix()
 if hasattr(_tunix_mod, "rl"):
   from MaxText.integration.tunix.tunix_adapter import TunixMaxTextAdapter  # type: ignore
