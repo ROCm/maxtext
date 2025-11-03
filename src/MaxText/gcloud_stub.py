@@ -56,15 +56,14 @@ def _cloud_diag_stubs():
     )
 
 def cloud_diagnostics():
-    if _DECOUPLE:
-        return _cloud_diag_stubs()
+    """Return cloud diagnostics modules if installed; otherwise lightweight stubs."""
     try:
         from cloud_tpu_diagnostics import diagnostic  # type: ignore
-        from cloud_tpu_diagnostics.configuration import (
+        from cloud_tpu_diagnostics.configuration import (  # type: ignore
             debug_configuration,
             diagnostic_configuration,
             stack_trace_configuration,
-        )  # type: ignore
+        )
         return diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration
     except ModuleNotFoundError:
         return _cloud_diag_stubs()
