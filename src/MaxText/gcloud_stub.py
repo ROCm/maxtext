@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Centralized decoupling helpers for JetStream / Tunix / cloud diagnostics / GCS.
 
 Set DECOUPLE_GCLOUD=TRUE in the environment to disable optional Google Cloud / JetStream / Tunix
@@ -366,4 +367,3 @@ def vertex_tensorboard_components():
         return _vertex_tb_stub()
 
 __all__.append("vertex_tensorboard_components")
-

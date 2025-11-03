@@ -18,10 +18,9 @@ import subprocess
 import sys
 import os.path
 import tempfile
-import os
+from MaxText.gcloud_stub import is_decoupled
 import unittest
 import pytest
-from MaxText.gcloud_stub import is_decoupled
 
 import jax
 from jax.sharding import Mesh
