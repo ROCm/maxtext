@@ -28,7 +28,7 @@ from flax.linen import partitioning as nn_partitioning
 
 from MaxText import maxtext_utils
 from MaxText import pyconfig
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 from MaxText.common_types import Config, DType
 from MaxText.globals import MAXTEXT_PKG_DIR
 from maxtext.tests.test_utils import get_test_config_path

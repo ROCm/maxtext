@@ -37,7 +37,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 
-from MaxText.decouple import cloud_diagnostics as _cloud_diag
+from MaxText.gcloud_stub import cloud_diagnostics as _cloud_diag
 diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration = _cloud_diag()
 
 from MaxText import checkpointing

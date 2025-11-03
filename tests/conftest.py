@@ -6,7 +6,7 @@
 # easily.
 
 import pytest
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 import jax
 
 # Configure JAX to use unsafe_rbg PRNG implementation to match main scripts

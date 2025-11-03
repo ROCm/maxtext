@@ -10,7 +10,7 @@ Fails only on missing core imports or device query failure; alias test asserts m
 """
 from __future__ import annotations
 import os, time, importlib
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 
 CORE_IMPORTS = ["jax", "jax.numpy", "flax", "numpy"]
 OPTIONAL_IMPORTS = ["transformers", "MaxText", "MaxText.pyconfig", "MaxText.maxengine"]

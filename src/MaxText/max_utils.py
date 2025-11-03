@@ -37,7 +37,7 @@ import psutil
 from tensorboardX import writer
 
 from MaxText import max_logging
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 from MaxText.common_types import MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN
 
 initialize_multi_tier_checkpointing = initialization.initialize_multi_tier_checkpointing

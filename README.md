@@ -80,10 +80,10 @@ When enabled:
 * All tests that previously hard-coded `configs/base.yml` now use the helper `get_test_config_path()` from `tests/test_utils.py`. This helper ensures usage of `decoupled_base_test.yml`
 
 Minimal datasets included (checked into the repo):
-* ArrayRecord shards: generated via `python decoupled_datasets/get_minimal_c4_en_dataset.py`, 
-  located in `decoupled_datasets/c4_en_dataset_minimal/c4/en/3.0.1/c4-{train,validation}.array_record-*`
-* Parquet (HF style): generated via `python decoupled_datasets/get_minimal_hf_c4_parquet.py`, 
-  located in `decoupled_datasets/c4_en_dataset_minimal/hf/c4`
+* ArrayRecord shards: generated via `python datasets/get_minimal_c4_en_dataset.py`, 
+  located in `datasets/c4_en_dataset_minimal/c4/en/3.0.1/c4-{train,validation}.array_record-*`
+* Parquet (HF style): generated via `python datasets/get_minimal_hf_c4_parquet.py`, 
+  located in `datasets/c4_en_dataset_minimal/hf/c4`
 
 
 Run a local smoke test fully offline:
@@ -96,12 +96,12 @@ Optional environment variables:
 * `LOCAL_GCLOUD_PROJECT` - placeholder project string (default: `local-maxtext-project`).
 * `LOCAL_BASE_OUTPUT` - override default local output directory used in tests.
 
-#### Centralized Decoupling API (`decouple.py`)
+#### Centralized Decoupling API (`gcloud_stub.py`)
 
-MaxText exposes a single module `MaxText.decouple` to avoid scattering environment checks:
+MaxText exposes a single module `MaxText.gcloud_stub` to avoid scattering environment checks:
 
 ```python
-from MaxText.decouple import is_decoupled, cloud_diagnostics, jetstream, tunix
+from MaxText.gcloud_stub import is_decoupled, cloud_diagnostics, jetstream, tunix
 
 if is_decoupled():
   # Skip optional integrations or use local fallbacks

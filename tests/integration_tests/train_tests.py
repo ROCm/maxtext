@@ -14,7 +14,7 @@
 
 """Tests for train.py with various configs"""
 import os
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 import unittest
 import pytest
 from MaxText.train import main as train_main
@@ -28,7 +28,7 @@ class TrainTests(unittest.TestCase):
 
   decoupled = is_decoupled()
   _base_output_directory = (
-    os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "gcloud_decoupled_test_logs")
+    os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "gcloud_decoupled_test_logs")
     if decoupled
     else "gs://runner-maxtext-logs"
   )

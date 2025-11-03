@@ -42,7 +42,7 @@ from MaxText.layers.attentions import Attention
 from MaxText.layers.attention_op import ChunkedCausalMask, _make_bidirectional_block_mask, _generate_chunk_attention_mask
 from MaxText.layers.attention_mla import MLA
 from maxtext.tests.test_utils import get_test_config_path
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 
 
 class BidirectionalBlockMaskTest(unittest.TestCase):

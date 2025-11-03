@@ -18,7 +18,7 @@ from typing import Any, Type
 
 import jax
 
-from MaxText.decouple import jetstream, is_decoupled
+from MaxText.gcloud_stub import jetstream, is_decoupled
 config_lib, engine_api, _token_utils, _tokenizer_api, _token_params_ns = jetstream()
 
 from MaxText import maxengine

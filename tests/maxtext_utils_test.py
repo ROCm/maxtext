@@ -39,7 +39,7 @@ from MaxText.common_types import MODEL_MODE_TRAIN
 from MaxText.globals import MAXTEXT_PKG_DIR
 from maxtext.tests.test_utils import get_test_config_path
 from MaxText.layers import models
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 from MaxText.layers import quantizations
 from MaxText.maxtext_utils import assert_params_sufficiently_sharded, get_formatted_sharding_annotations
 

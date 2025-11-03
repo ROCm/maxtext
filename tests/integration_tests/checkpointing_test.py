@@ -28,7 +28,7 @@ from datetime import datetime
 import json
 from math import isclose
 import os.path
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 import glob
 import pytest as _pytest
 import jax
@@ -40,7 +40,7 @@ from MaxText.train import main as train_main
 
 def get_checkpointing_command(run_date, hardware, steps, metrics_file, attention_type, dataset_type, dataset_path):
   base_output_directory = (
-      os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "gcloud_decoupled_test_logs")
+      os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "gcloud_decoupled_test_logs")
       if is_decoupled()
       else "gs://runner-maxtext-logs"
   )
@@ -100,7 +100,7 @@ def run_checkpointing(hardware, attention_type):
   
   # Determine dataset path/pattern depending on decoupled mode.
   gcsfuse_pattern = "/tmp/gcsfuse/array-record/c4/en/3.0.1/c4-train.array_record*"
-  local_decoupled_root = os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets", "c4_en_dataset_minimal", "c4", "en", "3.0.1")
+  local_decoupled_root = os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "c4_en_dataset_minimal", "c4", "en", "3.0.1")
   local_pattern = os.path.join(local_decoupled_root, "c4-train.array_record*")
   selected_pattern = gcsfuse_pattern
   dataset_path = "/tmp/gcsfuse"
@@ -109,7 +109,7 @@ def run_checkpointing(hardware, attention_type):
     # Prefer local minimal dataset if gcsfuse data absent
     if not glob.glob(gcsfuse_pattern) and glob.glob(local_pattern):
       selected_pattern = local_pattern
-      dataset_path = os.path.join(MAXTEXT_PKG_DIR, "..", "decoupled_datasets")
+      dataset_path = os.path.join(MAXTEXT_PKG_DIR, "..", "datasets")
     elif not glob.glob(gcsfuse_pattern) and not glob.glob(local_pattern):
       _pytest.skip("No grain ArrayRecord shards found for checkpointing test in decoupled mode.")
   grain_command = [

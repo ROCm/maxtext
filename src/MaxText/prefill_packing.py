@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from MaxText.decouple import jetstream, is_decoupled
+from MaxText.gcloud_stub import jetstream, is_decoupled
 
 # Get JetStream namespaces via decouple
 config_lib, engine_api, token_utils, tokenizer_api, token_params_ns = jetstream()

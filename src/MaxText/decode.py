@@ -22,7 +22,7 @@ import jax.numpy as jnp
 
 from absl import app
 
-from MaxText.decouple import jetstream, is_decoupled
+from MaxText.gcloud_stub import jetstream, is_decoupled
 _config_lib, engine_api, _token_utils, _tokenizer_api, _token_params_ns = jetstream()
 
 from MaxText import max_utils

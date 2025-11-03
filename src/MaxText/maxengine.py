@@ -33,7 +33,7 @@ from flax import struct
 from flax.linen import partitioning as nn_partitioning
 import flax
 
-from MaxText.decouple import jetstream, is_decoupled
+from MaxText.gcloud_stub import jetstream, is_decoupled
 config_lib, engine_api, token_utils, tokenizer_api, _token_params_ns = jetstream()
 TokenizerParameters = getattr(_token_params_ns, "TokenizerParameters", object)  # type: ignore[assignment]
 TokenizerType = getattr(_token_params_ns, "TokenizerType", object)  # type: ignore[assignment]

@@ -28,7 +28,7 @@ from MaxText.layers import quantizations
 from MaxText import maxtext_utils
 from MaxText.globals import MAXTEXT_PKG_DIR
 from maxtext.tests.test_utils import get_test_config_path
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 
 Transformer = models.transformer_as_linen
 

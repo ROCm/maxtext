@@ -1,5 +1,5 @@
 import os
-from MaxText.decouple import is_decoupled
+from MaxText.gcloud_stub import is_decoupled
 from MaxText.globals import MAXTEXT_PKG_DIR
 
 def get_test_config_path():
