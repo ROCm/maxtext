@@ -121,7 +121,7 @@ peft_trainer, tunix_hooks = tunix()
 Behavior when `DECOUPLE_GCLOUD=TRUE`:
 * `is_decoupled()` returns True.
 * Each helper returns lightweight stubs whose attributes are safe to access; calling methods raises a clear `RuntimeError` only when actually invoked.
-* Prevents import-time failures for optional dependencies (JetStream, Tunix, `cloud_tpu_diagnostics`).
+* Prevents import-time failures for optional dependencies (JetStream, Tunix).
 
 #### Guidelines:
 * Prefer calling `jetstream()` / `tunix()` once at module import and branching on `is_decoupled()` for functionality that truly requires the dependency.
