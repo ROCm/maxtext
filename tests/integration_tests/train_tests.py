@@ -14,6 +14,7 @@
 
 """Tests for train.py with various configs"""
 import os
+import jax
 from MaxText.gcloud_stub import is_decoupled
 import unittest
 import pytest
@@ -160,7 +161,7 @@ class TrainTests(unittest.TestCase):
           "enable_checkpointing=False",
           "enable_goodput_recording=False",
           rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
-      ],
+      ] + ([f"ici_fsdp_parallelism={dev_count}"] if decoupled else []),
       "dropout": [  # tests base config with dropout
           None,
           get_test_config_path(),
