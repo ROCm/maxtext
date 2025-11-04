@@ -29,6 +29,7 @@ from flax.core import meta
 from flax import linen as nn
 
 from MaxText import maxtext_utils
+from MaxText.gcloud_stub import is_decoupled
 from MaxText import pyconfig
 from MaxText.common_types import MODEL_MODE_TRAIN
 from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT
@@ -407,7 +408,7 @@ class PipelineParallelismTest(unittest.TestCase):
             "quantization=fp8",
             "scan_layers_per_stage=False",
             "attention=dot_product",
-        ]
+        ] + ([f"ici_fsdp_parallelism={jax.device_count()}"] if is_decoupled() else [])
     )
 
   @pytest.mark.integration_test
@@ -439,9 +440,10 @@ class PipelineParallelismTest(unittest.TestCase):
             "quantization=nanoo_fp8",
             "scan_layers_per_stage=False",
             "attention=dot_product",
-        ]
+        ] + ([f"ici_fsdp_parallelism={jax.device_count()}"] if is_decoupled() else [])
     )
 
 
 if __name__ == "__main__":
   unittest.main()
+
