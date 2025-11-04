@@ -17,10 +17,8 @@ from types import SimpleNamespace
 import importlib.util
 import os
 
-_DECOUPLE = os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
-
-def is_decoupled() -> bool:
-    return _DECOUPLE
+def is_decoupled() -> bool:  # dynamic check so setting env after initial import still works
+    return os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
 
 # ---------------- Cloud Diagnostics -----------------
 
@@ -71,20 +69,52 @@ def cloud_diagnostics():
 # ---------------- JetStream -----------------
 
 def _jetstream_stubs():
-    class _MissingCallable:
-        def __init__(self, name: str):
-            self._name = name
-        def __call__(self, *a, **k):
-            raise RuntimeError(f"JetStream dependency '{self._name}' unavailable (DECOUPLE_GCLOUD=TRUE)")
-    class _StubModule(SimpleNamespace):
-        def __getattr__(self, item):  # pragma: no cover
-            return _MissingCallable(item)
-    return _StubModule(), _StubModule(), _StubModule(), _StubModule(), _StubModule()
+    # Provide class-based stubs to allow subclassing and instantiation without import-time errors.
+    class Engine:  # minimal base class stub
+        def __init__(self, *a, **k):  # accept any signature
+            pass
+
+    class ResultTokens:
+        def __init__(
+            self,
+            *,
+            data=None,
+            tokens_idx=None,
+            valid_idx=None,
+            length_idx=None,
+            log_prob=None,
+            samples_per_slot: int | None = None,
+        ):
+            self.data = data
+            self.tokens_idx = tokens_idx
+            self.valid_idx = valid_idx
+            self.length_idx = length_idx
+            self.log_prob = log_prob
+            self.samples_per_slot = samples_per_slot
+
+    # Tokenizer placeholders (unused in decoupled tests due to runtime guard).
+    class TokenizerParameters:  # pragma: no cover - placeholder
+        def __init__(self, *a, **k):
+            pass
+
+    class _FakeDescriptorValues:
+        def __init__(self):
+            self.values_by_name = {}
+
+    class TokenizerType:  # emulate enum descriptor access pattern
+        DESCRIPTOR = SimpleNamespace(values_by_name={})
+
+    config_lib = SimpleNamespace()  # not used directly in decoupled tests
+    engine_api = SimpleNamespace(Engine=Engine, ResultTokens=ResultTokens)
+    token_utils = SimpleNamespace()  # build_tokenizer guarded in MaxEngine when decoupled
+    tokenizer_api = SimpleNamespace()  # placeholder
+    token_params_ns = SimpleNamespace(TokenizerParameters=TokenizerParameters, TokenizerType=TokenizerType)
+    return config_lib, engine_api, token_utils, tokenizer_api, token_params_ns
 
 def jetstream():
-    if _DECOUPLE:
+    # In decoupled mode always return stubs to allow import-time success.
+    if is_decoupled():
         return _jetstream_stubs()
-    # Only import if modules are discoverable.
     needed = [
         "jetstream.core.config_lib",
         "jetstream.engine.engine_api",
@@ -93,12 +123,18 @@ def jetstream():
         "jetstream.engine.tokenizer_pb2",
     ]
     for mod in needed:
-        if importlib.util.find_spec(mod) is None:
+        try:
+            if importlib.util.find_spec(mod) is None:
+                return _jetstream_stubs()
+        except ModuleNotFoundError:
             return _jetstream_stubs()
-    from jetstream.core import config_lib  # type: ignore
-    from jetstream.engine import engine_api, token_utils, tokenizer_api  # type: ignore
-    from jetstream.engine.tokenizer_pb2 import TokenizerParameters, TokenizerType  # type: ignore
-    return config_lib, engine_api, token_utils, tokenizer_api, SimpleNamespace(TokenizerParameters=TokenizerParameters, TokenizerType=TokenizerType)
+    try:
+        from jetstream.core import config_lib  # type: ignore
+        from jetstream.engine import engine_api, token_utils, tokenizer_api  # type: ignore
+        from jetstream.engine.tokenizer_pb2 import TokenizerParameters, TokenizerType  # type: ignore
+        return config_lib, engine_api, token_utils, tokenizer_api, SimpleNamespace(TokenizerParameters=TokenizerParameters, TokenizerType=TokenizerType)
+    except ModuleNotFoundError:
+        return _jetstream_stubs()
 
 # ---------------- Tunix -----------------
 
@@ -117,9 +153,12 @@ def _tunix_stubs():
     return peft_trainer, hooks
 
 def tunix():
-    if _DECOUPLE:
+    if is_decoupled():
         return _tunix_stubs()
-    if importlib.util.find_spec("tunix") is None:
+    try:
+        if importlib.util.find_spec("tunix") is None:
+            return _tunix_stubs()
+    except ModuleNotFoundError:
         return _tunix_stubs()
     try:
         from tunix.sft import peft_trainer  # type: ignore
@@ -129,3 +168,4 @@ def tunix():
         return _tunix_stubs()
 
 __all__ = ["is_decoupled", "cloud_diagnostics", "jetstream", "tunix"]
+
