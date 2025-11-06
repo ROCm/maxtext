@@ -25,6 +25,7 @@ jobs:
       LOCAL_GCLOUD_PROJECT: ci-decoupled
       LOCAL_BASE: datasets
       LOCAL_BASE_OUTPUT: datasets/gcloud_decoupled_test_logs
+      KEEPALIVE: sleep infinity
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,7 +45,7 @@ jobs:
           MOUNT="-v ${{ github.workspace }}:${WORKDIR}"
           ENV_VARS="-e DECOUPLE_GCLOUD=${DECOUPLE_GCLOUD} -e LOCAL_GCLOUD_PROJECT=${LOCAL_GCLOUD_PROJECT} -e LOCAL_BASE_OUTPUT=${LOCAL_BASE_OUTPUT}"
           docker rm -f ${CONTAINER_NAME} >/dev/null 2>&1 || true
-          docker run -d -it --name ${CONTAINER_NAME} -w ${WORKDIR} ${ENV_VARS} ${RUNTIME_FLAGS} ${DEVICE_FLAGS} ${MOUNT} ${DOCKER_IMAGE}
+          docker run -d -it --name ${CONTAINER_NAME} -w ${WORKDIR} ${ENV_VARS} ${RUNTIME_FLAGS} ${DEVICE_FLAGS} ${MOUNT} ${DOCKER_IMAGE} bash -c "${KEEPALIVE}"
           echo "Container ${CONTAINER_NAME} started with centralized env vars." >> "${LOCAL_BASE_OUTPUT}/ci.log"
 
       - name: Install Requirements and Maxtext Package
@@ -140,6 +141,10 @@ jobs:
           CONTAINER_NAME="decouple_maxtext_tests"
           IMAGE_TAG="maxtext-decoupled-tests:latest"
           IMAGE_FILE="maxtext-decoupled-tests-image.tar.gz"
+          if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "Container ${CONTAINER_NAME} not found; skipping snapshot." >> "${LOCAL_BASE_OUTPUT}/ci.log"
+            exit 0
+          fi
           docker commit ${CONTAINER_NAME} ${IMAGE_TAG}
           docker save ${IMAGE_TAG} | gzip -c > ${IMAGE_FILE}
           ls -lh ${IMAGE_FILE} >> "${LOCAL_BASE_OUTPUT}/ci.log" || true
@@ -160,4 +165,5 @@ jobs:
           name: decoupled-logs
           path: datasets/gcloud_decoupled_test_logs
           if-no-files-found: warn
+
 
