@@ -18,9 +18,10 @@ import subprocess
 import sys
 import os.path
 import tempfile
-from MaxText.gcloud_stub import is_decoupled
+import os
 import unittest
 import pytest
+from MaxText.gcloud_stub import is_decoupled
 
 import jax
 from jax.sharding import Mesh
@@ -314,7 +315,6 @@ def mount_gcsfuse():
   Mounts a GCS bucket (gs://maxtext-dataset) to a local directory (/tmp/gcsfuse)
   using gcsfuse if not already mounted.
   """
-  from MaxText.gcloud_stub import is_decoupled
   if is_decoupled():
     return  # No-op when decoupled.
   temp_dir = tempfile.gettempdir()
