@@ -18,8 +18,10 @@ import subprocess
 import sys
 import os.path
 import tempfile
-from MaxText.gcloud_stub import is_decoupled
+import os
 import unittest
+import pytest
+from MaxText.gcloud_stub import is_decoupled
 
 import jax
 from jax.sharding import Mesh
@@ -117,6 +119,7 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
         },
     )
 
+  @pytest.mark.external_serving #Skipped in decoupled mode due to rocBLAS scratch buffer TF issues on GPU
   def test_batch_determinism(self):
     batch1 = next(self.train_iter)
     train_iter = _grain_data_processing.make_grain_train_iterator(self.config, self.mesh, self.process_indices)
@@ -223,12 +226,11 @@ class GrainParquetProcessingTest(unittest.TestCase):
           "c4-train-00000-of-01637.parquet",
       )
       base_output_directory = os.path.join(
-        MAXTEXT_PKG_DIR,
-        "..",
-        "datasets",
-        "gcloud_decoupled_test_logs",
+          MAXTEXT_PKG_DIR,
+          "..",
+          "datasets",
+          "gcloud_decoupled_test_logs",
       )
-      config_file = get_test_config_path()
     else:
       grain_train_file = os.path.join(
           temp_dir,
@@ -237,7 +239,8 @@ class GrainParquetProcessingTest(unittest.TestCase):
           "c4",
           "c4-train-00000-of-01637.parquet",
       )
-    base_output_directory = "gs://max-experiments/"
+      base_output_directory = "gs://max-experiments/"
+
     config_file = get_test_config_path()
 
     self.config = pyconfig.initialize(
@@ -283,6 +286,7 @@ class GrainParquetProcessingTest(unittest.TestCase):
         },
     )
 
+  #@pytest.mark.external_serving #Skipped in decoupled mode due to rocBLAS scratch buffer TF issues on GPU
   def test_batch_determinism(self):
     batch1 = next(self.train_iter)
     train_iter = _grain_data_processing.make_grain_train_iterator(self.config, self.mesh, self.process_indices)
@@ -312,7 +316,6 @@ def mount_gcsfuse():
   Mounts a GCS bucket (gs://maxtext-dataset) to a local directory (/tmp/gcsfuse)
   using gcsfuse if not already mounted.
   """
-  from MaxText.gcloud_stub import is_decoupled
   if is_decoupled():
     return  # No-op when decoupled.
   temp_dir = tempfile.gettempdir()
@@ -334,4 +337,5 @@ def mount_gcsfuse():
 if __name__ == "__main__":
   mount_gcsfuse()
   unittest.main()
+
 

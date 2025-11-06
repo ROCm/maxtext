@@ -290,9 +290,17 @@ class ToNNX(Module):
         if hasattr(self, attr_name) and isinstance(value, dict):
           original_value = getattr(self, attr_name)
           new_values = _recursive_merge(original_value, value)
-          setattr(self, attr_name, nnx.data(new_values))
+          # TODO(gulsumgudukbay): remove this fallback later
+          #flax.nnx.data was removed in newer Flax versions; fall back to raw value if unavailable.
+          if hasattr(nnx, "data"):
+            setattr(self, attr_name, nnx.data(new_values))
+          else:
+            setattr(self, attr_name, new_values)
         else:
-          setattr(self, attr_name, nnx.data(value))
+          if hasattr(nnx, "data"):
+            setattr(self, attr_name, nnx.data(value))
+          else:
+            setattr(self, attr_name, value)
 
     return out
 
@@ -622,3 +630,4 @@ def to_linen_class(
   ToLinenPartial.__init__ = __init__
 
   return ToLinenPartial
+
