@@ -6,7 +6,7 @@ on:
       - rocm-main
     paths:
       - 'maxtext/**'
-      - '.github/workflows/decoupled_tests.yml'
+      - '.github/workflows/decouple_tests.yml'
       - 'pyproject.toml'
       - 'README.md'
   push:
@@ -14,7 +14,7 @@ on:
       - rocm-main
     paths:
       - 'maxtext/**'
-      - '.github/workflows/decoupled_tests.yml'
+      - '.github/workflows/decouple_tests.yml'
   workflow_dispatch:
 
 jobs:
@@ -53,12 +53,19 @@ jobs:
           set -euo pipefail
           CONTAINER_NAME="decouple_maxtext_tests"
           docker exec ${CONTAINER_NAME} bash -euo pipefail -c '
-            apt install -y git vim
-            pip install . --no-cache-dir --break-system-packages
             mkdir -p "${LOCAL_BASE_OUTPUT}"
+            apt-get update
+            apt-get install -y git vim python3.12-venv python3-pip python3-dev build-essential
+            python3 -m venv .venv || { echo "venv creation failed"; exit 10; }
+            . .venv/bin/activate
+            python -m ensurepip --upgrade || true
+            python -m pip install --upgrade pip
+            python -m pip install wheel setuptools cmake
+            python -m pip install -r requirements_decoupled_rocm_jax_0_6_0.txt --no-cache-dir || { echo "Requirements install failed"; exit 13; }
+            python -m pip install . --no-cache-dir || { echo "Package install failed"; exit 11; }
             echo "Maxtext package installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
-            pip install -r requirements_decoupled_rocm_jax_0_6_0.txt --no-cache-dir --break-system-packages
-            pip install pytest pytest-html pytest-csv minio array-record --break-system-packages
+            python -m pip install pytest pytest-html pytest-csv minio array-record || { echo "Test deps failed"; exit 12; }
+            python -m pip list >> "${LOCAL_BASE_OUTPUT}/pip_freeze.txt"
             echo "Requirements installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
           '
 
@@ -67,9 +74,10 @@ jobs:
           set -euo pipefail
           CONTAINER_NAME="decouple_maxtext_tests"
           docker exec ${CONTAINER_NAME} bash -euo pipefail -c '
-            apt-get update
-            apt-get install -y cmake git
-            git clone https://github.com/ROCm/TransformerEngine.git
+            . .venv/bin/activate
+            if [ ! -e "TransformerEngine" ]; then
+              git clone https://github.com/ROCm/TransformerEngine.git
+            fi
             cd TransformerEngine
             git reset --hard ec21e1f35f5a36c1def9c89c4865eba3947f0665
             git submodule update --init --recursive
@@ -83,8 +91,13 @@ jobs:
             export NVTE_FUSED_ATTN_AOTRITON=0
             export NVTE_BUILD_MAX_JOBS=180
             export CU_NUM=304
-            python3 setup.py bdist_wheel
-            python3 -m pip install dist/transformer_engine-*.whl --no-cache-dir --break-system-packages
+            if find dist -maxdepth 1 -name "*.whl" -print -quit | grep -q .; then
+              echo "TE wheels exist, skip building"
+            else
+              python setup.py bdist_wheel || { echo "TransformerEngine build failed"; exit 20; }
+            fi
+            python -m pip install dist/transformer_engine-*.whl --no-cache-dir || { echo "TE wheel install failed"; exit 21; }
+            cd ..
             echo "TE built and installed." >> "${LOCAL_BASE_OUTPUT}/ci.log"
           '
 
@@ -93,8 +106,7 @@ jobs:
           set -euo pipefail
           CONTAINER_NAME="decouple_maxtext_tests"
           docker exec ${CONTAINER_NAME} bash -euo pipefail -c '
-            echo "Installing minio and array-record deps for minimal data generation." >> "${LOCAL_BASE_OUTPUT}/ci.log"
-            pip install minio array-record
+            . .venv/bin/activate
             echo "Generating minimal ArrayRecord shards" >> "${LOCAL_BASE_OUTPUT}/ci.log"
             python ${LOCAL_BASE}/get_minimal_c4_en_dataset.py --force || { echo "ArrayRecord generation failed"; exit 3; }
             echo "Generating minimal parquet shards" >> "${LOCAL_BASE_OUTPUT}/ci.log"
@@ -115,6 +127,7 @@ jobs:
           set -euo pipefail
           CONTAINER_NAME="decouple_maxtext_tests"
           docker exec ${CONTAINER_NAME} bash -euo pipefail -c '
+            . .venv/bin/activate
             echo "Collecting tests" >> "${LOCAL_BASE_OUTPUT}/ci.log"
             pytest tests -m decoupled --collect-only -q | tee "${LOCAL_BASE_OUTPUT}/collect.txt"
             TEST_COUNT="$(grep -v "^$" "${LOCAL_BASE_OUTPUT}/collect.txt" | wc -l)"
@@ -152,7 +165,7 @@ jobs:
 
       - name: Upload snapshot image
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: decoupled-docker-image
           path: maxtext-decoupled-tests-image.tar.gz
@@ -160,10 +173,11 @@ jobs:
 
       - name: Upload decoupled logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: decoupled-logs
           path: datasets/gcloud_decoupled_test_logs
           if-no-files-found: warn
+
 
 
