@@ -39,6 +39,14 @@ from MaxText.train import main as train_main
 from MaxText.layers import deepseek
 from maxtext.tests.test_utils import get_test_config_path
 
+# Helper to fix pipeline parallelism in test_full_train_fp8 and test_full_train_nanoo_fp8
+def _adapt_parallelism(args, pipeline_stages=4):
+  dc = jax.device_count()
+  args.append(f"ici_pipeline_parallelism={pipeline_stages}")
+  if dc >= pipeline_stages:
+    data_par = dc // pipeline_stages
+    if data_par > 1:
+      args.append(f"ici_data_parallelism={data_par}")
 
 def assert_same_output_and_grad(f1, f2, *inputs):
   """check that the output and gradient are the same"""
@@ -383,67 +391,92 @@ class PipelineParallelismTest(unittest.TestCase):
   def test_full_train_fp8(self):
     # Run a full train.py call with fp8 quantization, which adds extra
     # variable collections that need to be handled
-    train_main(
-        [
-            None,
-            get_test_config_path(),
-            "base_output_directory=gs://runner-maxtext-logs",
-            "run_name=runner_pipeline_parallelism_fp8_test",
-            "dataset_path=gs://maxtext-dataset",
-            "base_emb_dim=28",
-            "base_num_query_heads=4",
-            "base_num_kv_heads=4",
-            "base_mlp_dim=32",
-            "base_num_decoder_layers=4",
-            "head_dim=128",
-            "per_device_batch_size=2",
-            "max_target_length=1024",
-            "vocab_size=32",
-            "dataset_type=synthetic",
-            "steps=3",
-            "enable_checkpointing=False",
-            "enable_goodput_recording=False",
-            "ici_pipeline_parallelism=4",
-            rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
-            "quantization=fp8",
-            "scan_layers_per_stage=False",
-            "attention=dot_product",
-        ] + ([f"ici_fsdp_parallelism={jax.device_count()}"] if is_decoupled() else [])
+    base_output_directory = (
+        os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "gcloud_decoupled_test_logs")
+        if is_decoupled()
+        else "gs://runner-maxtext-logs"
     )
+    dataset_path = (
+        os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "c4_en_dataset_minimal") if is_decoupled() else "gs://maxtext-dataset"
+    )
+    args = [
+        None,
+        get_test_config_path(),
+        f"base_output_directory={base_output_directory}",
+        "run_name=runner_pipeline_parallelism_fp8_test",
+        f"dataset_path={dataset_path}",
+        "base_emb_dim=28",
+        "base_num_query_heads=4",
+        "base_num_kv_heads=4",
+        "base_mlp_dim=32",
+        "base_num_decoder_layers=4",
+        "head_dim=128",
+        "per_device_batch_size=2",
+        "max_target_length=1024",
+        "vocab_size=32",
+        "dataset_type=synthetic",
+        "steps=3",
+        "enable_checkpointing=False",
+        "enable_goodput_recording=False",
+        "ici_pipeline_parallelism=4",
+        rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
+        "quantization=fp8",
+        "scan_layers_per_stage=False",
+        "attention=dot_product",
+    ]
+    _adapt_parallelism(args, pipeline_stages=4)
+    pyconfig.initialize(args)  # initialization ensures config valid; no assert needed.
+    train_main(args)
 
   @pytest.mark.integration_test
   def test_full_train_nanoo_fp8(self):
     # Run a full train.py call with NANOO fp8 quantization, which adds extra
-    # variable collections that need to be handled
-    train_main(
-        [
-            None,
-            get_test_config_path(),
-            "base_output_directory=gs://runner-maxtext-logs",
-            "run_name=runner_pipeline_parallelism_nanoo_fp8_test",
-            "dataset_path=gs://maxtext-dataset",
-            "base_emb_dim=28",
-            "base_num_query_heads=4",
-            "base_num_kv_heads=4",
-            "base_mlp_dim=32",
-            "base_num_decoder_layers=4",
-            "head_dim=128",
-            "per_device_batch_size=2",
-            "max_target_length=1024",
-            "vocab_size=32",
-            "dataset_type=synthetic",
-            "steps=3",
-            "enable_checkpointing=False",
-            "enable_goodput_recording=False",
-            "ici_pipeline_parallelism=4",
-            rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
-            "quantization=nanoo_fp8",
-            "scan_layers_per_stage=False",
-            "attention=dot_product",
-        ] + ([f"ici_fsdp_parallelism={jax.device_count()}"] if is_decoupled() else [])
+    # variable collections that need to be handled. Use lighter settings only
+    # when decoupled to avoid long compile times.
+    base_output_directory = (
+        os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "gcloud_decoupled_test_logs")
+        if is_decoupled()
+        else "gs://runner-maxtext-logs"
     )
+    dataset_path = (
+        os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "c4_en_dataset_minimal") if is_decoupled() else "gs://maxtext-dataset"
+    )
+    per_device_batch_size = "per_device_batch_size=1" if is_decoupled() else "per_device_batch_size=2"
+    max_target_length = "max_target_length=512" if is_decoupled() else "max_target_length=1024"
+    steps = "steps=1" if is_decoupled() else "steps=3"
+    ici_data_parallelism = ["ici_data_parallelism=1"] if is_decoupled() else []
+    args = [
+        None,
+        get_test_config_path(),
+        f"base_output_directory={base_output_directory}",
+        "run_name=runner_pipeline_parallelism_nanoo_fp8_test",
+        f"dataset_path={dataset_path}",
+        "base_emb_dim=28",
+        "base_num_query_heads=4",
+        "base_num_kv_heads=4",
+        "base_mlp_dim=32",
+        "base_num_decoder_layers=4",
+        "head_dim=128",
+        per_device_batch_size,
+        max_target_length,
+        "vocab_size=32",
+        "dataset_type=synthetic",
+        steps,
+        "enable_checkpointing=False",
+        "enable_goodput_recording=False",
+        "ici_pipeline_parallelism=4",
+        rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizer.llama2')}",
+        "quantization=nanoo_fp8",
+        "scan_layers_per_stage=False",
+        "attention=dot_product",
+    ]
+    args.extend(ici_data_parallelism)
+    _adapt_parallelism(args, pipeline_stages=4)
+    pyconfig.initialize(args)
+    train_main(args)
 
 
 if __name__ == "__main__":
   unittest.main()
+
 
