@@ -25,6 +25,7 @@ from MaxText.common_types import Config
 from MaxText import max_logging, pyconfig
 from MaxText import maxtext_utils
 from MaxText.globals import MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import get_test_config_path
 from MaxText.layers.decoders import Decoder, DecoderLayer
 from MaxText.layers import multi_token_prediction  # The class under test
 from MaxText.layers import embeddings
@@ -40,7 +41,7 @@ class MultiTokenPredictionLayerTest(unittest.TestCase):
   def setUp(self):
     super().setUp()
     self.cfg = pyconfig.initialize(
-        [None, os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [None, get_test_config_path()],
         run_name="multi_token_prediction_layer_test",
         skip_jax_distributed_system=True,
     )
@@ -176,7 +177,7 @@ class MultiTokenPredictionBlockTest(unittest.TestCase):
   def setUp(self):
     super().setUp()
     self.cfg = pyconfig.initialize(
-        [None, os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [None, get_test_config_path()],
         run_name="mtp_block_test",
         skip_jax_distributed_system=True,
         mtp_num_layers=2,

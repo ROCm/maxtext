@@ -15,26 +15,39 @@
 """Tests for decode with various configs."""
 
 import os
+from MaxText.gcloud_stub import is_decoupled
 import unittest
 
 import pytest
 
 from absl.testing import absltest
 
+pytestmark = [pytest.mark.tpu_only, pytest.mark.external_serving]
+
 from MaxText.decode import main as decode_main
 from MaxText.globals import MAXTEXT_PKG_DIR, MAXTEXT_ASSETS_ROOT
+from maxtext.tests.test_utils import get_test_config_path
 
 
 class DecodeTests(unittest.TestCase):
   """Tests decode with various configs."""
+  decoupled = is_decoupled()
+  _dataset_path = (
+    os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "c4_en_dataset_minimal") if decoupled else "gs://maxtext-dataset"
+  )
+  _base_output_directory = (
+      os.path.join(MAXTEXT_PKG_DIR, "..", "datasets", "gcloud_decoupled_test_logs")
+      if decoupled
+      else "gs://runner-maxtext-logs"
+  )
 
   CONFIGS = {
       "base": [  # tests decode
           None,
-          os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+          get_test_config_path(),
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
-          "dataset_path=gs://maxtext-dataset",
+          f"dataset_path={_dataset_path}",
           "steps=2",
           "enable_checkpointing=False",
           "ici_tensor_parallelism=4",
@@ -44,10 +57,10 @@ class DecodeTests(unittest.TestCase):
       ],
       "int8": [  # tests decode with int8 quantization
           None,
-          os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+          get_test_config_path(),
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
-          "dataset_path=gs://maxtext-dataset",
+          f"dataset_path={_dataset_path}",
           "steps=2",
           "enable_checkpointing=False",
           "ici_tensor_parallelism=4",
@@ -59,10 +72,10 @@ class DecodeTests(unittest.TestCase):
       ],
       "pdb_lt_1": [  # tests decode with per_device_batch_size < 1
           None,
-          os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
-          "base_output_directory=gs://runner-maxtext-logs",
+          get_test_config_path(),
+          f"base_output_directory={_base_output_directory}",
           "run_name=runner_test",
-          "dataset_path=gs://maxtext-dataset",
+          f"dataset_path={_dataset_path}",
           "steps=2",
           "enable_checkpointing=False",
           "ici_tensor_parallelism=4",
