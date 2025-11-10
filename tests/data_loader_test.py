@@ -28,6 +28,7 @@ from MaxText.data_loader import DataLoader, RampUpDataLoader
 from MaxText import exceptions
 from MaxText import pyconfig
 from MaxText.globals import MAXTEXT_PKG_DIR
+from maxtext.tests.test_utils import get_test_config_path
 
 
 class DataLoaderTest(unittest.TestCase):
@@ -60,7 +61,7 @@ class DataLoaderTest(unittest.TestCase):
     }
     args.update(kwargs)
     return pyconfig.initialize(
-        [None, os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")],
+        [None, get_test_config_path()],
         **args,
     )
 
