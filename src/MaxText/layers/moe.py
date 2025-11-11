@@ -35,8 +35,19 @@ from MaxText import max_utils
 from MaxText.kernels import megablox as mblx
 from MaxText.layers import attentions, linears, quantizations, nnx_wrappers
 from MaxText.layers.initializers import NdInitializer, nd_dense_init, default_bias_init, variable_to_logically_partitioned
+from MaxText.gcloud_stub import is_decoupled  # needed for tokamax gating regardless of availability
 
-from tokamax._src.ops.ragged_dot import api as tokamax_api
+try:  # optional tokamax ragged_dot kernels
+  from tokamax._src.ops.ragged_dot import api as tokamax_api  # type: ignore
+  _TOKAMAX_RD_AVAILABLE = True
+except ModuleNotFoundError:
+  tokamax_api = None  # type: ignore
+  _TOKAMAX_RD_AVAILABLE = False
+  # Decoupled or missing tokamax: notice if in decoupled mode (prints each invocation)
+  if is_decoupled():
+    max_logging.log(
+        "[DECOUPLED TOKAMAX FALLBACK] ragged_dot kernels not installed; MoE will use standard JAX ops."
+    )
 
 set_xla_metadata = xla_metadata.set_xla_metadata
 
@@ -811,8 +822,17 @@ class RoutedMoE(nnx.Module):
           min(tiling[1], k),
           min(tiling[2], n),
       )
-      if self.config.use_tokamax_gmm:
-        output = tokamax_api.ragged_dot(
+      # Decide whether to use tokamax ragged_dot kernels:
+      #  - Never in decoupled mode
+      #  - Only if config flag enabled AND kernels imported successfully.
+      use_tokamax_gmm = (
+          (not is_decoupled())
+          and self.config.use_tokamax_gmm
+          and _TOKAMAX_RD_AVAILABLE
+          and tokamax_api is not None
+      )
+      if use_tokamax_gmm:
+        output = tokamax_api.ragged_dot(  # type: ignore[arg-type]
             lhs=inputs,
             rhs=kernel,
             group_sizes=group_sizes,
@@ -821,6 +841,17 @@ class RoutedMoE(nnx.Module):
             implementation="mosaic",
         )
       else:
+        if self.config.use_tokamax_gmm:
+          reason_parts = []
+          if is_decoupled():
+            reason_parts.append("decoupled mode")
+          if not _TOKAMAX_RD_AVAILABLE:
+            reason_parts.append("tokamax not installed")
+          if tokamax_api is None:
+            reason_parts.append("import returned None")
+          max_logging.log(
+              f"[TOKAMAX GMM FALLBACK] Using standard path (megablox/jax); reasons: {', '.join(reason_parts)}"
+          )
         if self.config.megablox:
           output = mblx.gmm(
               lhs=inputs,
@@ -1939,3 +1970,4 @@ def get_routed_and_shared_moe(
       abstract_init=False,
   )
   return module
+
