@@ -1089,9 +1089,13 @@ class MLATest(parameterized.TestCase):
 
   def init_mla(self, config_arguments, rope_type):
     """Helper function to initialize MLA with different model names."""
+    merged_args = dict(config_arguments)
+    if is_decoupled():
+        merged_args.setdefault("ici_fsdp_parallelism", jax.device_count())
+
     cfg = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
-        **config_arguments,
+        **merged_args,
         rope_type=rope_type,
     )
 
