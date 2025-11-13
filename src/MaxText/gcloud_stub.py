@@ -120,6 +120,12 @@ def _jetstream_stubs():
     token_utils = SimpleNamespace()  # build_tokenizer guarded in MaxEngine when decoupled
     tokenizer_api = SimpleNamespace()  # placeholder
     token_params_ns = SimpleNamespace(TokenizerParameters=TokenizerParameters, TokenizerType=TokenizerType)
+    # Mark these stub namespaces so callers can detect stubbed jetstream components.
+    setattr(config_lib, "_IS_STUB", True)
+    setattr(engine_api, "_IS_STUB", True)
+    setattr(token_utils, "_IS_STUB", True)
+    setattr(tokenizer_api, "_IS_STUB", True)
+    setattr(token_params_ns, "_IS_STUB", True)
     return config_lib, engine_api, token_utils, tokenizer_api, token_params_ns
 
 def jetstream():
@@ -140,7 +146,26 @@ def jetstream():
         from jetstream.core import config_lib  # type: ignore
         from jetstream.engine import engine_api, token_utils, tokenizer_api  # type: ignore
         from jetstream.engine.tokenizer_pb2 import TokenizerParameters, TokenizerType  # type: ignore
-        return config_lib, engine_api, token_utils, tokenizer_api, SimpleNamespace(TokenizerParameters=TokenizerParameters, TokenizerType=TokenizerType)
+        # Mark real modules as not stubs so consumers can detect the difference.
+        try:
+            setattr(config_lib, "_IS_STUB", False)
+        except Exception:
+            pass
+        try:
+            setattr(engine_api, "_IS_STUB", False)
+        except Exception:
+            pass
+        try:
+            setattr(token_utils, "_IS_STUB", False)
+        except Exception:
+            pass
+        try:
+            setattr(tokenizer_api, "_IS_STUB", False)
+        except Exception:
+            pass
+        token_params_ns = SimpleNamespace(TokenizerParameters=TokenizerParameters, TokenizerType=TokenizerType)
+        setattr(token_params_ns, "_IS_STUB", False)
+        return config_lib, engine_api, token_utils, tokenizer_api, token_params_ns
     except ModuleNotFoundError:
         if is_decoupled():
             print("[DECOUPLED NO-OP] jetstream: dependency missing; using stubs.")
@@ -161,6 +186,8 @@ def _tunix_stubs():
             pass
     peft_trainer = SimpleNamespace(PeftTrainer=_StubPeftTrainer)
     hooks = SimpleNamespace(DataHooks=DataHooks, TrainingHooks=TrainingHooks)
+    setattr(peft_trainer, "_IS_STUB", True)
+    setattr(hooks, "_IS_STUB", True)
     return peft_trainer, hooks
 
 def tunix():
@@ -172,6 +199,14 @@ def tunix():
             raise ModuleNotFoundError("tunix")
         from tunix.sft import peft_trainer  # type: ignore
         from tunix.sft import hooks as tunix_hooks  # type: ignore
+        try:
+            setattr(peft_trainer, "_IS_STUB", False)
+        except Exception:
+            pass
+        try:
+            setattr(tunix_hooks, "_IS_STUB", False)
+        except Exception:
+            pass
         return peft_trainer, tunix_hooks
     except ModuleNotFoundError:
         if is_decoupled():
