@@ -34,23 +34,9 @@ import transformers
 from MaxText import model_creation_utils
 from MaxText import pyconfig
 from MaxText.common_types import Config
-from MaxText.gcloud_stub import is_decoupled, tunix as _tunix
-
-_tunix_mod, _tunix_hooks = _tunix()
-if hasattr(_tunix_mod, "rl"):
-  from MaxText.integration.tunix.tunix_adapter import TunixMaxTextAdapter  # type: ignore
-  base_rollout = _tunix_mod.rl.rollout.base_rollout  # type: ignore[attr-defined]
-  VllmRollout = _tunix_mod.rl.rollout.vllm_rollout.VllmRollout  # type: ignore[attr-defined]
-else:  # decoupled stub path (no tunix available)
-  class TunixMaxTextAdapter:  # pragma: no cover
-    def __init__(self, *a, **k):
-      pass
-  class VllmRollout:  # pragma: no cover
-    def __init__(self, *a, **k):
-      pass
-    def generate(self, prompts, cfg):  # mimic interface subset
-      return type("_StubOut", (), {"text": ["<decoupled: no tunix>"]})()
-  base_rollout = type("base_rollout", (), {"RolloutConfig": lambda **k: type("RC", (), k)})()
+from MaxText.integration.tunix.tunix_adapter import TunixMaxTextAdapter
+from tunix.rl.rollout import base_rollout
+from tunix.rl.rollout.vllm_rollout import VllmRollout
 
 os.environ["SKIP_JAX_PRECOMPILE"] = "1"
 
@@ -120,9 +106,6 @@ def decode(
 
 
 def main(argv: Sequence[str]) -> None:
-  if is_decoupled():
-    raise RuntimeError(
-        "Tunix / vLLM disabled by DECOUPLE_GCLOUD=TRUE; vLLM decode requires tunix. "
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
   if "xla_tpu_spmd_rng_bit_generator_unsafe" not in os.environ.get("LIBTPU_INIT_ARGS", ""):
