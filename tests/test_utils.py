@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
- 
+
 """Test utilities file for helper for test configuration path selection.
 
 Provides a single helper to return the absolute path to a test config. When
@@ -25,14 +25,14 @@ from MaxText.globals import MAXTEXT_PKG_DIR
 
 
 def get_test_config_path():
-    """Return absolute path to the chosen test config file.
+  """Return absolute path to the chosen test config file.
 
-    Returns `decoupled_base_test.yml` when decoupled, otherwise `base.yml`.
-    """
-    base_cfg = "base.yml"
-    if is_decoupled():
-        base_cfg = "decoupled_base_test.yml"
-    return os.path.join(MAXTEXT_PKG_DIR, "configs", base_cfg)
+  Returns `decoupled_base_test.yml` when decoupled, otherwise `base.yml`.
+  """
+  base_cfg = "base.yml"
+  if is_decoupled():
+    base_cfg = "decoupled_base_test.yml"
+  return os.path.join(MAXTEXT_PKG_DIR, "configs", base_cfg)
 
 
 __all__ = ["get_test_config_path"]
