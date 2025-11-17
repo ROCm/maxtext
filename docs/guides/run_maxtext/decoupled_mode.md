@@ -15,7 +15,7 @@
 -->
 
 
-### Decoupled Mode (No Google Cloud Dependencies)
+# Decoupled Mode (No Google Cloud Dependencies)
 
 Set `DECOUPLE_GCLOUD=TRUE` to run MaxText tests and local development without any Google Cloud SDK, `gs://` buckets, JetStream, or Vertex AI integrations.
 
@@ -47,7 +47,7 @@ Optional environment variables:
 * `LOCAL_GCLOUD_PROJECT` - placeholder project string (default: `local-maxtext-project`).
 * `LOCAL_BASE_OUTPUT` - override default local output directory used in tests.
 
-#### Centralized Decoupling API (`gcloud_stub.py`)
+## Centralized Decoupling API (`gcloud_stub.py`)
 
 MaxText exposes a single module `MaxText.gcloud_stub` to avoid scattering environment checks:
 
@@ -71,7 +71,7 @@ Behavior when `DECOUPLE_GCLOUD=TRUE`:
 * Each helper returns lightweight stubs whose attributes are safe to access; calling methods raises a clear `RuntimeError` only when actually invoked.
 * Prevents import-time failures for optional dependencies (JetStream).
 
-#### Guidelines:
+## Guidelines:
 * Prefer calling `jetstream()` / `cloud_diagnostics()` once at module import and branching on `is_decoupled()` for functionality that truly requires the dependency.
 * Use `is_decoupled()` to avoid direct `os.environ["DECOUPLE_GCLOUD"]` checking.
 * Use `get_test_config_path()` instead of hard-coded `base.yml`.
