@@ -38,8 +38,8 @@ def ensure_symlink(root: str, source_version: str, version: str) -> str:
 
   Returns the target version directory path.
   """
-  src = os.path.join(root, 'c4', 'en', source_version)
-  dst = os.path.join(root, 'c4', 'en', version)
+  src = os.path.join(root, "c4", "en", source_version)
+  dst = os.path.join(root, "c4", "en", version)
   if not os.path.isdir(src):
     raise FileNotFoundError(f"Source version directory not found: {src}")
   if not os.path.lexists(dst):
@@ -55,9 +55,9 @@ def ensure_symlink(root: str, source_version: str, version: str) -> str:
 
 def write_metadata(root: str, version_dir: str, dataset_version: str, force: bool = False) -> None:
   """Write TFDS ``dataset_info.json`` and ``features.json`` for local C4 shards."""
-  info_path = os.path.join(version_dir, 'dataset_info.json')
+  info_path = os.path.join(version_dir, "dataset_info.json")
   if os.path.exists(info_path) and not force:
-    print('dataset_info.json already exists; skipping overwrite (use --force to regenerate).')
+    print("dataset_info.json already exists; skipping overwrite (use --force to regenerate).")
     return
 
   # Discover shards (we assume they exist and are correct; counts are fixed)
@@ -71,32 +71,24 @@ def write_metadata(root: str, version_dir: str, dataset_version: str, force: boo
   train_shard_lengths = [train_records_per_shard] * num_shards_train
   val_shard_lengths = [val_records_per_shard] * num_shards_val
 
-  train_split = tfds.core.SplitInfo(
-      name='train', shard_lengths=train_shard_lengths, num_bytes=0
-  )
-  val_split = tfds.core.SplitInfo(
-      name='validation', shard_lengths=val_shard_lengths, num_bytes=0
-  )
+  train_split = tfds.core.SplitInfo(name="train", shard_lengths=train_shard_lengths, num_bytes=0)
+  val_split = tfds.core.SplitInfo(name="validation", shard_lengths=val_shard_lengths, num_bytes=0)
 
   class _LocalC4Builder(tfds.core.GeneratorBasedBuilder):
     """Tiny builder used only to materialize TFDS metadata on disk."""
 
     VERSION = tfds.core.Version(dataset_version)
-    BUILDER_CONFIGS = [
-        tfds.core.BuilderConfig(
-            name='en', version=VERSION, description='Local minimal C4 EN subset'
-        )
-    ]
+    BUILDER_CONFIGS = [tfds.core.BuilderConfig(name="en", version=VERSION, description="Local minimal C4 EN subset")]
 
     def _info(self) -> tfds.core.DatasetInfo:  # type: ignore[override]
       info = tfds.core.DatasetInfo(
           builder=self,
-          description='Local minimal C4 English subset.',
-          features=tfds.features.FeaturesDict({'text': tfds.features.Text()}),
-          homepage='https://www.tensorflow.org/datasets/catalog/c4',
-          citation='',
+          description="Local minimal C4 English subset.",
+          features=tfds.features.FeaturesDict({"text": tfds.features.Text()}),
+          homepage="https://www.tensorflow.org/datasets/catalog/c4",
+          citation="",
       )
-      info.set_splits({'train': train_split, 'validation': val_split})
+      info.set_splits({"train": train_split, "validation": val_split})
       return info
 
     def _split_generators(self, dl_manager):  # type: ignore[override]
@@ -120,28 +112,31 @@ def main() -> None:
   """CLI entry point for generating TFDS metadata."""
   ap = argparse.ArgumentParser()
   ap.add_argument(
-      '--root', required=True,
-      help='Root directory containing c4/en/<version> shards',
+      "--root",
+      required=True,
+      help="Root directory containing c4/en/<version> shards",
   )
   ap.add_argument(
-      '--version', default='3.1.0',
-      help='Target version to expose via TFDS',
+      "--version",
+      default="3.1.0",
+      help="Target version to expose via TFDS",
   )
   ap.add_argument(
-      '--source-version', default='3.0.1',
-      help='Existing version directory with shards',
+      "--source-version",
+      default="3.0.1",
+      help="Existing version directory with shards",
   )
   ap.add_argument(
-      '--force', action='store_true',
-      help='Overwrite existing dataset_info.json if present',
+      "--force",
+      action="store_true",
+      help="Overwrite existing dataset_info.json if present",
   )
   args = ap.parse_args()
 
   target_dir = ensure_symlink(args.root, args.source_version, args.version)
   write_metadata(args.root, target_dir, args.version, force=args.force)
-  print('Done.')
+  print("Done.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
   main()
-

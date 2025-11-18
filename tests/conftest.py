@@ -41,6 +41,7 @@ except Exception:  # pragma: no cover  pylint: disable=broad-exception-caught
 
 GCE_MARKERS = {"external_serving", "external_training"}
 
+
 def pytest_collection_modifyitems(config, items):
   """Customize pytest collection behavior.
 
@@ -92,12 +93,13 @@ def pytest_collection_modifyitems(config, items):
     for item in remaining:
       item.add_marker(pytest.mark.decoupled)
 
+
 def pytest_configure(config):
   for m in [
-    "gpu_only: tests that require GPU hardware",
-    "tpu_only: tests that require TPU hardware",
-    "external_serving: JetStream / serving / decode server components",
-    "external_training: goodput integrations",
-    "decoupled: marked on tests that are not skipped due to GCE deps, when DECOUPLE_GCLOUD=TRUE",
+      "gpu_only: tests that require GPU hardware",
+      "tpu_only: tests that require TPU hardware",
+      "external_serving: JetStream / serving / decode server components",
+      "external_training: goodput integrations",
+      "decoupled: marked on tests that are not skipped due to GCE deps, when DECOUPLE_GCLOUD=TRUE",
   ]:
     config.addinivalue_line("markers", m)
