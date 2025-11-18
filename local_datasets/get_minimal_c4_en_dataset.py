@@ -46,7 +46,7 @@ MINIO_SECURE = os.environ.get("MINIO_SECURE", "true").lower() == "true"
 BUCKET = os.environ.get("MINIO_C4_BUCKET", "datasets.dl")
 
 # Versions of c4/en to sample
-#VERSIONS = ["3.0.1", "3.0.5", "3.0.7", "3.0.8", "3.0.9"]
+# VERSIONS = ["3.0.1", "3.0.5", "3.0.7", "3.0.8", "3.0.9"]
 VERSIONS = ["3.0.1"]
 
 # Local output base
@@ -72,13 +72,14 @@ MAX_TEMP_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200 MiB
 
 # Prefixes in MinIO
 ARRAY_RECORD_TRAIN_PREFIX = "c4/en/{ver}/c4-train.array_record-"
-ARRAY_RECORD_VAL_PREFIX   = "c4/en/{ver}/c4-validation.array_record-"
-TFRECORD_TRAIN_PREFIX     = "c4/en/{ver}/c4-train.tfrecord-"
-TFRECORD_VAL_PREFIX       = "c4/en/{ver}/c4-validation.tfrecord-"
+ARRAY_RECORD_VAL_PREFIX = "c4/en/{ver}/c4-validation.array_record-"
+TFRECORD_TRAIN_PREFIX = "c4/en/{ver}/c4-train.tfrecord-"
+TFRECORD_VAL_PREFIX = "c4/en/{ver}/c4-validation.tfrecord-"
 
 
 def ensure_dir(path: str) -> None:
   os.makedirs(path, exist_ok=True)
+
 
 def list_matching(client: Minio, bucket: str, prefix: str) -> List:
   """Return a sorted list of objects under prefix."""
@@ -87,12 +88,14 @@ def list_matching(client: Minio, bucket: str, prefix: str) -> List:
       key=lambda o: o.object_name,
   )
 
+
 def pick_smallest(objects):
   """Pick the smallest object by size.
 
   Falls back gracefully if size is unavailable.
   """
   return min(objects, key=lambda o: getattr(o, "size", float("inf")))
+
 
 def download_shard_with_optional_range(
     client,
@@ -337,8 +340,7 @@ def main() -> None:
       continue
     if not val_src_objs:
       print(
-          "Warning: No validation shards found for "
-          f"{ver}. Skipping validation for this version.",
+          "Warning: No validation shards found for " f"{ver}. Skipping validation for this version.",
       )
       continue
 
@@ -419,8 +421,7 @@ def main() -> None:
 
       # Post-write size check.
       total_bytes = compute_dir_size_bytes(
-          local_version_dir,
-          patterns=["c4-train.array_record-*", "c4-validation.array_record-*"]
+          local_version_dir, patterns=["c4-train.array_record-*", "c4-validation.array_record-*"]
       )
       mb = total_bytes / (1024 * 1024)
       print(f"Total size for {ver}: {mb:.2f} MiB")
@@ -452,4 +453,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-

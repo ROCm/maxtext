@@ -39,7 +39,9 @@ def is_decoupled() -> bool:  # dynamic check so setting env after initial import
   """Return True when DECOUPLE_GCLOUD environment variable is set to TRUE."""
   return os.environ.get("DECOUPLE_GCLOUD", "").upper() == "TRUE"
 
+
 # ---------------- Cloud Diagnostics -----------------
+
 
 def _cloud_diag_stubs():
   """Return lightweight stubs for cloud TPU diagnostics."""
@@ -59,9 +61,7 @@ def _cloud_diag_stubs():
         try:
           yield
         except Exception as exc:  # pylint: disable=broad-exception-caught
-          print(
-              "Warning: using stubs for cloud_diagnostics diagnose() - "
-              f"caught: {exc}")
+          print("Warning: using stubs for cloud_diagnostics diagnose() - " f"caught: {exc}")
 
       return _graceful_diagnose()
 
@@ -91,6 +91,7 @@ def _cloud_diag_stubs():
       SimpleNamespace(StackTraceConfig=_StubStackTraceConfig),
   )
 
+
 def cloud_diagnostics():
   """Return real cloud diagnostics modules or stubs.
 
@@ -104,6 +105,7 @@ def cloud_diagnostics():
         diagnostic_configuration,
         stack_trace_configuration,
     )
+
     return diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration
   except ModuleNotFoundError:
     if is_decoupled():
@@ -111,7 +113,9 @@ def cloud_diagnostics():
       return _cloud_diag_stubs()
     raise
 
+
 # ---------------- JetStream -----------------
+
 
 def _jetstream_stubs():
   """Return lightweight stubs for JetStream modules."""
@@ -229,14 +233,15 @@ def jetstream():
   token_params_ns = SimpleNamespace(TokenizerParameters=TokenizerParameters, TokenizerType=TokenizerType)
   return config_lib, engine_api, token_utils, tokenizer_api, token_params_ns
 
+
 def jetstream():
   """Return JetStream modules or stubs based on availability and decoupling."""
   needed = [
-    "jetstream.core.config_lib",
-    "jetstream.engine.engine_api",
-    "jetstream.engine.token_utils",
-    "jetstream.engine.tokenizer_api",
-    "jetstream.engine.tokenizer_pb2",
+      "jetstream.core.config_lib",
+      "jetstream.engine.engine_api",
+      "jetstream.engine.token_utils",
+      "jetstream.engine.tokenizer_api",
+      "jetstream.engine.tokenizer_pb2",
   ]
   try:
     for mod in needed:
@@ -267,8 +272,10 @@ def jetstream():
 
 # ---------------- GCS -----------------
 
+
 def _gcs_stubs():  # pragma: no cover - simple no-op placeholders
   """Return stub implementations of the google.cloud.storage API."""
+
   class _StubBlob:
     """Stub GCS blob with no-op operations."""
 
@@ -319,6 +326,7 @@ def _gcs_stubs():  # pragma: no cover - simple no-op placeholders
 
   return SimpleNamespace(Client=_StubClient, _IS_STUB=True)
 
+
 def gcs_storage():
   """Return google.cloud.storage module or stub when decoupled or missing."""
   # In decoupled mode always prefer the stub, even if the library is installed,
@@ -329,16 +337,20 @@ def gcs_storage():
 
   try:  # pragma: no cover - attempt real import when not decoupled
     from google.cloud import storage  # type: ignore  # pylint: disable=import-outside-toplevel
+
     setattr(storage, "_IS_STUB", False)
     return storage
   except Exception:  # ModuleNotFoundError / ImportError for partial installs  # pylint: disable=broad-exception-caught
     print("[DECOUPLED NO-OP] gcs_storage: dependency missing; using stubs.")
     return _gcs_stubs()
 
+
 # ---------------- Goodput (ml_goodput_measurement) -----------------
+
 
 def _goodput_stubs():
   """Return stubs for ml_goodput_measurement integration."""
+
   class _StubGoodputRecorder:
     """Recorder stub exposing no-op methods and disabled flag."""
 
@@ -373,10 +385,12 @@ def _goodput_stubs():
   goodput_ns = SimpleNamespace(GoodputRecorder=_StubGoodputRecorder)
   return goodput_ns, monitoring_ns, True
 
+
 def goodput_modules():
   """Return real goodput modules or stubs when missing and decoupled."""
   try:
     from ml_goodput_measurement import goodput, monitoring  # type: ignore  # pylint: disable=import-outside-toplevel
+
     return goodput, monitoring, False
   except ModuleNotFoundError:
     if is_decoupled():
@@ -384,9 +398,11 @@ def goodput_modules():
       return _goodput_stubs()
     raise
 
+
 __all__ = ["is_decoupled", "cloud_diagnostics", "jetstream", "gcs_storage", "goodput_modules"]
 
 # ---------------- Cloud Monitoring (monitoring_v3 / metric_pb2) -----------------
+
 
 def _monitoring_stubs():  # pragma: no cover - simple placeholders
   """Return stub implementations for Cloud Monitoring APIs."""
@@ -396,23 +412,29 @@ def _monitoring_stubs():  # pragma: no cover - simple placeholders
 
   class _DummyMonitoringV3:
     """Dummy monitoring module providing minimal types."""
+
     class TimeSeries:
+
       def __init__(self, *a, **k):  # pylint: disable=unused-argument
         del a, k
 
     class Point:
+
       def __init__(self, *a, **k):  # pylint: disable=unused-argument
         del a, k
 
     class TimeInterval:
+
       def __init__(self, *a, **k):  # pylint: disable=unused-argument
         del a, k
 
     class TypedValue:
+
       def __init__(self, *a, **k):  # pylint: disable=unused-argument
         del a, k
 
     class MetricServiceClient:
+
       def __init__(self, *a, **k):  # pylint: disable=unused-argument
         del a, k
 
@@ -423,6 +445,7 @@ def _monitoring_stubs():  # pragma: no cover - simple placeholders
     """Dummy metric_pb2 module namespace."""
 
     class Metric:
+
       def __init__(self, *a, **k):  # pylint: disable=unused-argument
         del a, k
 
@@ -430,10 +453,12 @@ def _monitoring_stubs():  # pragma: no cover - simple placeholders
     """Dummy monitored_resource_pb2 module namespace."""
 
     class MonitoredResource:
+
       def __init__(self, *a, **k):  # pylint: disable=unused-argument
         del a, k
 
   return _DummyMonitoringV3(), _DummyMetricPB2(), _DummyMonitoredResourcePB2(), GoogleAPIError, True
+
 
 def monitoring_modules():
   """Return monitoring modules or stubs.
@@ -445,6 +470,7 @@ def monitoring_modules():
     from google.cloud import monitoring_v3  # type: ignore  # pylint: disable=import-outside-toplevel
     from google.api import metric_pb2, monitored_resource_pb2  # type: ignore  # pylint: disable=import-outside-toplevel
     from google.api_core.exceptions import GoogleAPIError  # type: ignore  # pylint: disable=import-outside-toplevel
+
     return monitoring_v3, metric_pb2, monitored_resource_pb2, GoogleAPIError, False
   except (ModuleNotFoundError, ImportError):  # broaden to handle partial google installs
     if is_decoupled():
@@ -452,12 +478,15 @@ def monitoring_modules():
       return _monitoring_stubs()
     raise
 
+
 __all__.append("monitoring_modules")
 
 # ---------------- Workload Monitor (GCPWorkloadMonitor) -----------------
 
+
 def _workload_monitor_stub():  # pragma: no cover - simple placeholder
   """Return stub GCPWorkloadMonitor implementation and stub flag."""
+
   class GCPWorkloadMonitor:
     """Stub of GCPWorkloadMonitor exposing no-op methods."""
 
@@ -472,6 +501,7 @@ def _workload_monitor_stub():  # pragma: no cover - simple placeholder
 
   return GCPWorkloadMonitor, True
 
+
 def workload_monitor():
   """Return (GCPWorkloadMonitor, is_stub) centralizing stub logic.
 
@@ -483,17 +513,21 @@ def workload_monitor():
 
   try:
     from MaxText.gcp_workload_monitor import GCPWorkloadMonitor  # type: ignore  # pylint: disable=import-outside-toplevel
+
     return GCPWorkloadMonitor, False
   except Exception:  # ModuleNotFoundError / ImportError  # pylint: disable=broad-exception-caught
     print("[NO-OP] workload_monitor dependency missing; using stub.")
     return _workload_monitor_stub()
 
+
 __all__.append("workload_monitor")
 
 # ---------------- Vertex Tensorboard -----------------
 
+
 def _vertex_tb_stub():  # pragma: no cover - simple placeholder
   """Return stub VertexTensorboardManager implementation and stub flag."""
+
   class VertexTensorboardManager:
     """Stub VertexTensorboardManager with no-op configure method."""
 
@@ -506,6 +540,7 @@ def _vertex_tb_stub():  # pragma: no cover - simple placeholder
 
   return VertexTensorboardManager, True
 
+
 def vertex_tensorboard_components():
   """Return (VertexTensorboardManager, is_stub).
 
@@ -517,10 +552,12 @@ def vertex_tensorboard_components():
 
   try:
     from MaxText.vertex_tensorboard import VertexTensorboardManager  # type: ignore  # pylint: disable=import-outside-toplevel
+
     return VertexTensorboardManager, False
   except Exception:  # pylint: disable=broad-exception-caught
     print("[NO-OP] vertex_tensorboard dependency missing; using stub.")
     return _vertex_tb_stub()
+
 
 __all__.append("vertex_tensorboard_components")
 
@@ -529,6 +566,7 @@ __all__.append("vertex_tensorboard_components")
 try:
   if not is_decoupled():  # Only attempt real import when not decoupled
     from tensorboardX import writer  # type: ignore  # pylint: disable=import-outside-toplevel,unused-import
+
     _TENSORBOARDX_AVAILABLE = True
   else:
     raise ModuleNotFoundError("Decoupled mode skips tensorboardX import")
@@ -559,7 +597,6 @@ except Exception:  # pragma: no cover - provide stub fallback  # pylint: disable
   class writer:  # pylint: disable=too-few-public-methods
     SummaryWriter = _DummySummaryWriter
 
+
 __all__.append("writer")
 __all__.append("_TENSORBOARDX_AVAILABLE")
-
-
