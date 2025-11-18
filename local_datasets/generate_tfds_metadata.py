@@ -15,8 +15,8 @@
 """Generate minimal TFDS metadata for existing local C4 ArrayRecord shards.
 
 Usage:
-  python datasets/generate_tfds_metadata.py \
-      --root datasets/c4_en_dataset_minimal \
+  python local_datasets/generate_tfds_metadata.py \
+      --root local_datasets/c4_en_dataset_minimal \
       --version 3.1.0 \
       --source-version 3.0.1 \
       --force
