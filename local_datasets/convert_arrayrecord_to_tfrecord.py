@@ -18,8 +18,8 @@ This script scans a version directory that contains ArrayRecord shards
 and produces TFRecord files with TFDS-compatible shard names.
 
 Example usage:
-    python datasets/convert_arrayrecord_to_tfrecord.py \
-        --version-dir datasets/c4_en_dataset_minimal/c4/en/3.0.1 \
+    python local_datasets/convert_arrayrecord_to_tfrecord.py \
+        --version-dir local_datasets/c4_en_dataset_minimal/c4/en/3.0.1 \
         --builder-name __local_c4_builder \
         --force
 

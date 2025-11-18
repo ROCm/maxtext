@@ -31,10 +31,10 @@ When enabled:
 * All tests that previously hard-coded `configs/base.yml` now use the helper `get_test_config_path()` from `tests/test_utils.py`. This helper ensures usage of `decoupled_base_test.yml`
 
 Minimal datasets included (checked into the repo):
-* ArrayRecord shards: generated via `python datasets/get_minimal_c4_en_dataset.py`, 
-  located in `datasets/c4_en_dataset_minimal/c4/en/3.0.1/c4-{train,validation}.array_record-*`
-* Parquet (HF style): generated via `python datasets/get_minimal_hf_c4_parquet.py`, 
-  located in `datasets/c4_en_dataset_minimal/hf/c4`
+* ArrayRecord shards: generated via `python local_datasets/get_minimal_c4_en_dataset.py`, 
+  located in `local_datasets/c4_en_dataset_minimal/c4/en/3.0.1/c4-{train,validation}.array_record-*`
+* Parquet (HF style): generated via `python local_datasets/get_minimal_hf_c4_parquet.py`, 
+  located in `local_datasets/c4_en_dataset_minimal/hf/c4`
 
 
 Run a local smoke test fully offline:
