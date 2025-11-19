@@ -51,7 +51,7 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
       grain_train_files = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "datasets",
+          "local_datasets",
           "c4_en_dataset_minimal",
           "c4",
           "en",
@@ -61,7 +61,7 @@ class GrainArrayRecordProcessingTest(unittest.TestCase):
       base_output_directory = os.path.join(
         MAXTEXT_PKG_DIR,
         "..",
-        "datasets",
+        "local_datasets",
         "gcloud_decoupled_test_logs",
       )
     else:
@@ -155,7 +155,7 @@ class GrainArrayRecordProcessingWithMultiSourceBlendingTest(GrainArrayRecordProc
       base_pattern = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "datasets",
+          "local_datasets",
           "c4_en_dataset_minimal",
           "c4",
           "en",
@@ -165,7 +165,7 @@ class GrainArrayRecordProcessingWithMultiSourceBlendingTest(GrainArrayRecordProc
       base_output_directory = os.path.join(
         MAXTEXT_PKG_DIR,
         "..",
-        "datasets",
+        "local_datasets",
         "gcloud_decoupled_test_logs",
       )
       config_file = get_test_config_path()
@@ -219,7 +219,7 @@ class GrainParquetProcessingTest(unittest.TestCase):
       grain_train_file = os.path.join(
           MAXTEXT_PKG_DIR,
           "..",
-          "datasets",
+          "local_datasets",
           "c4_en_dataset_minimal",
           "hf",
           "c4",
@@ -228,7 +228,7 @@ class GrainParquetProcessingTest(unittest.TestCase):
       base_output_directory = os.path.join(
         MAXTEXT_PKG_DIR,
         "..",
-        "datasets",
+        "local_datasets",
         "gcloud_decoupled_test_logs",
       )
       config_file = get_test_config_path()
