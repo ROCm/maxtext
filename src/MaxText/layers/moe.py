@@ -34,7 +34,6 @@ from MaxText.kernels import megablox as mblx
 from MaxText.layers import attentions, linears, nnx_wrappers, quantizations
 from MaxText.layers.initializers import NdInitializer, default_bias_init, nd_dense_init, variable_to_logically_partitioned
 import numpy as np
-import tokamax
 from MaxText.gcloud_stub import is_decoupled  # needed for tokamax gating
 
 try:  # optional tokamax ragged_dot kernels
