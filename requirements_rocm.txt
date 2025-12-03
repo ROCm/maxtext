@@ -45,3 +45,5 @@ urllib3>=2.5.0
 # jax-rocm7-pjrt==0.7.1
 # jax-rocm7-plugin==0.7.1
 git+https://github.com/google/tunix.git
+cloud_tpu_diagnostics
+ml_goodput_measurement
