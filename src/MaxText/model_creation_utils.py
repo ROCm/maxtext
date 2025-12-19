@@ -1,4 +1,5 @@
 # Copyright 2023–2025 Google LLC
+# Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +31,9 @@ from MaxText.layers import models
 from orbax import checkpoint as ocp
 from functools import partial
 from etils import epath
+
+# jaxpp
+import jaxpp.api as jaxpp
 
 
 @overload
@@ -80,16 +84,20 @@ def from_config(
   """
   devices_array = maxtext_utils.create_device_mesh(config, devices)
 
-  if mesh is None:
+  if not config.use_jaxpp:
     if config.shard_mode == ShardMode.EXPLICIT:
       axis_types = tuple([AxisType.Explicit] * len(config.mesh_axes))
     else:
       axis_types = tuple([AxisType.Auto] * len(config.mesh_axes))
-
     mesh = Mesh(devices_array, config.mesh_axes, axis_types=axis_types)
+  else:
+    mesh = jaxpp.MpmdMesh(Mesh(devices_array, config.mesh_axes), 'stage')
+  model = create_model(config, mesh.lowering_mesh() if config.use_jaxpp else mesh, model_mode=model_mode, rngs=rngs)
 
-  model = create_model(config, mesh, model_mode=model_mode, rngs=rngs)
-
+  if config.use_jaxpp:
+    # At this point, model.mesh has mesh.lowering_mesh() as its value, but we need to set it to the original mesh
+    # so that the caller can have access to the original mesh.
+    model.mesh = mesh
   # Return only the model
   return model
 

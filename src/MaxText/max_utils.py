@@ -1,4 +1,5 @@
 # Copyright 2023–2025 Google LLC
+# Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,11 +44,24 @@ from MaxText import max_logging
 from MaxText.gcloud_stub import is_decoupled
 from MaxText.common_types import MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN
 
+import tensorflow as tf
+import jaxpp.api as jaxpp
+import optax
+
+# jaxpp related imports
+import jaxpp.api as jaxpp
+
 initialize_multi_tier_checkpointing = initialization.initialize_multi_tier_checkpointing
 HYBRID_RING_64X4 = "hybrid_ring_64x4"
 HYBRID_RING_32X8 = "hybrid_ring_32x8"
 
 # pylint: disable=too-many-positional-arguments
+
+
+def maybe_unwrap(a: jaxpp.MpmdArray | jax.Array):
+  if isinstance(a, jaxpp.MpmdArray):
+    return v if (v := a.first_mpmd_replica) is not None else 0
+  return a
 
 
 def with_memory_kind(t, memory_kind):
@@ -69,7 +83,8 @@ def find_nans_and_infs(pytree):
 
 def l2norm_pytree(x):
   """L2 norm of a pytree of arrays."""
-  return jnp.sqrt(jax.tree_util.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), x, initializer=0.0))
+  per_param_sum = [jnp.sum(jnp.square(x)) for x in jax.tree.leaves(x)]
+  return jnp.sqrt(jaxpp.cross_mpmd_all_reduce(*(e.astype(jnp.float32) for e in per_param_sum)))
 
 
 def calculate_num_params_from_pytree(params):
@@ -635,6 +650,23 @@ def _cross_entropy_with_logits_bwd(
 cross_entropy_with_logits.defvjp(_cross_entropy_with_logits_fwd, _cross_entropy_with_logits_bwd)
 
 
+def maybe_update_params_sharding_with_opt(config, state_mesh_shardings):
+  prev_params_shardings = state_mesh_shardings.params
+  if config.shard_optimizer_over_data:
+    if isinstance(state_mesh_shardings.opt_state, optax.ScaleByAdamState):
+      sharded_fp32_params = state_mesh_shardings.opt_state.mu
+    elif isinstance(state_mesh_shardings.opt_state, tuple) and isinstance(state_mesh_shardings.opt_state[0], optax.ScaleByAdamState):
+      sharded_fp32_params = state_mesh_shardings.opt_state[0].mu
+    else:
+      raise NotImplementedError(f"Could not find optimizer state shardings from optimizer of type {type(state_mesh_shardings.opt_state)}")
+    if "params" not in sharded_fp32_params.keys():
+      # When quantization=fp8 is enabled the sharded_fp32_params
+      # are not wrapped in `params`. Here we wrap them back.
+      sharded_fp32_params = {"params": sharded_fp32_params}
+    state_mesh_shardings = state_mesh_shardings.replace(params=dict(prev_params_shardings, **sharded_fp32_params))
+  return prev_params_shardings, state_mesh_shardings
+
+
 def print_pytree_shape(print_str, ptree):
   print("\n")
   print(print_str)
@@ -701,7 +733,8 @@ def print_mem_stats(label: str):
       stats = d.memory_stats()
       used = round(stats["bytes_in_use"] / 2**30, 2)
       limit = round(stats["bytes_limit"] / 2**30, 2)
-      max_logging.log(f"\tUsing (GB) {used} / {limit} ({used/limit:%}) on {d}")
+      peak_size = round(stats["peak_bytes_in_use"] / 2**30, 2)
+      max_logging.log(f"\tUsing (GB) {used} / {limit} ({used/limit:%}) ({peak_size=} GiB) on {d}")
   except (RuntimeError, KeyError, TypeError) as ex:
     max_logging.log(f"\tMemstats unavailable, error: {ex}")
 

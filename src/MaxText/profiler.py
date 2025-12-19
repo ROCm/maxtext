@@ -40,8 +40,9 @@ class Profiler:
     self.finished_initial_profile_step = self._set_last_profiler_step(config.profiler_steps, config.steps)
     if config.profiler != "" and self.start_initial_profile_step >= config.steps:
       raise ValueError("Profiling requested but initial profiling step set past training final step")
+    self.use_jaxpp = config.use_jaxpp
 
-  def maybe_activate_profiler(self, step, state):
+  def maybe_activate_profiler(self, step, state, maybe_mpmd_mesh=None, profiling_process_ids=None):
     """Conditionally activates the profiler based on the current step.
     This method checks if the current training step matches the step designated
     for starting an initial profile, or if it meets the criteria for
@@ -49,14 +50,21 @@ class Profiler:
     """
     if self.mode != "" and (step == self.start_initial_profile_step or self.should_activate_periodic_profile(step)):
       optional_postfix = f"step_{step}" if self.profile_period > 0 else ""
-      self.activate(blocking_object=state, optional_postfix=optional_postfix)
+      if self.use_jaxpp:
+        assert maybe_mpmd_mesh is not None
+        assert profiling_process_ids is not None
+        if maybe_mpmd_mesh.jax_mesh.is_multi_process and jax.process_index() in profiling_process_ids:
+          optional_postfix = f"mpmd_{maybe_mpmd_mesh.my_mpmd_axis_index:02}_gpu_{profiling_process_ids[jax.process_index()].id:06}_{optional_postfix}"
+      optional_postfix = f"proc_{jax.process_index():06}_{optional_postfix}"
+      profile = profiling_process_ids is None or jax.process_index() in profiling_process_ids
+      self.activate(blocking_object=state, optional_postfix=optional_postfix, profile=profile)
 
-  def activate(self, blocking_object=None, optional_postfix=""):
+  def activate(self, blocking_object=None, optional_postfix="", profile=True):
     """Start the profiler.
     nsys profiler becomes no-op when libcudart.so is not available on the system."""
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
-    if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    if not (self.upload_all_profiler_results or jax.process_index() == 0) or not profile:
       return
     if self.mode != "":
       self.output_path = os.path.join(self.base_output_dir, optional_postfix)
@@ -70,21 +78,22 @@ class Profiler:
     elif self.mode == "xplane":
       jax.profiler.start_trace(self.output_path)
 
-  def maybe_deactivate_profiler(self, step, state):
+  def maybe_deactivate_profiler(self, step, state, profiling_process_ids=None):
     """Conditionally deactivates the profiler based on the current step.
     This method checks if the current training step matches the step designated
     for finishing the initial profile, or if it meets the criteria for
     deactivating a periodic profile.
     """
     if self.mode != "" and (step == self.finished_initial_profile_step or self.should_deactivate_periodic_profile(step)):
-      self.deactivate(blocking_object=state)
+      profile = profiling_process_ids is None or jax.process_index() in profiling_process_ids
+      self.deactivate(blocking_object=state, profile=profile)
 
-  def deactivate(self, blocking_object=None):
+  def deactivate(self, blocking_object=None, profile=True):
     """End the profiler.
     The result is uploaded to the output bucket."""
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
-    if not (self.upload_all_profiler_results or jax.process_index() == 0):
+    if not (self.upload_all_profiler_results or jax.process_index() == 0) or not profile:
       return
     if self.mode == "nsys":
       if self.libcudart is not None:

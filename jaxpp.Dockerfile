@@ -1,11 +1,10 @@
-# Copyright 2023–2025 Google LLC
 # Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    https://www.apache.org/licenses/LICENSE-2.0
+#      https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# model config for llama2-70b
+ARG BASE_IMAGE
+FROM $BASE_IMAGE AS base
+ARG JAX_INSTALL_URL
 
-base_emb_dim: 8192
-base_num_query_heads: 64
-base_num_kv_heads: 8
-base_mlp_dim: 28672
-base_num_decoder_layers: 80
-head_dim: 128
-mlp_activations: ["silu","linear"]
-vocab_size: 32000
-logits_via_embedding: False
-normalization_layer_epsilon: 1.0e-5
-decoder_block: "llama2"
+COPY requirements.txt /tmp/requirements.txt
+RUN uv pip install -U pip && uv pip install --no-cache-dir -U -r /tmp/requirements.txt
+
+COPY --chown=$USER_UID:$USER_GID . maxtext
+
+RUN uv pip install --no-cache-dir -e '/workdir/jaxpp[dev]'
+RUN uv pip install --no-cache-dir -e /workdir/maxtext[cuda_12] --resolution=lowest && \
+    if [[ -n "$JAX_INSTALL_URL" ]]; then uv pip install $JAX_INSTALL_URL; fi

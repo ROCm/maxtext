@@ -92,6 +92,6 @@
         "quantization=int8",
         "quantize_kvcache=True"
       ]
-    }
+    },
   ]
 }

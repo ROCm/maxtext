@@ -92,6 +92,7 @@ class MetricLogger:
   def write_metrics(self, metrics, step, is_training=True):
     """Entry point for all metrics writing in Train's Main."""
     if metrics:
+      metrics = jax.tree.map(max_utils.maybe_unwrap, metrics)
       self.log_metrics(metrics, step, is_training)
 
       if self.config.enable_tensorboard:
@@ -293,21 +294,21 @@ class MetricLogger:
     """Records eval metrics and writes the metrics to GCS and/or to TensorBoard."""
     if metrics:
       self.cumulative_eval_metrics["scalar"]["eval/total_loss"] += float(
-          metrics["scalar"].get("evaluation/total_loss", 0.0)
+          max_utils.maybe_unwrap(metrics["scalar"].get("evaluation/total_loss", 0.0))
       )
       self.cumulative_eval_metrics["scalar"]["eval/total_weights"] += float(
-          metrics["scalar"].get("evaluation/total_weights", 0.0)
+          max_utils.maybe_unwrap(metrics["scalar"].get("evaluation/total_weights", 0.0))
       )
       self.cumulative_eval_metrics["scalar"]["eval/moe_lb_loss"] += float(
-          metrics["scalar"].get("evaluation/moe_lb_loss", 0.0)
+          max_utils.maybe_unwrap(metrics["scalar"].get("evaluation/moe_lb_loss", 0.0))
       )
-      self.cumulative_eval_metrics["scalar"]["eval/mtp_loss"] += float(metrics["scalar"].get("evaluation/mtp_loss", 0.0))
+      self.cumulative_eval_metrics["scalar"]["eval/mtp_loss"] += float(max_utils.maybe_unwrap(metrics["scalar"].get("evaluation/mtp_loss", 0.0)))
       self.cumulative_eval_metrics["scalar"]["eval/mtp_acceptance_rate_percent"] += float(
-          metrics["scalar"].get("evaluation/mtp_acceptance_rate_percent", 0.0)
+          max_utils.maybe_unwrap(metrics["scalar"].get("evaluation/mtp_acceptance_rate_percent", 0.0))
       )
       if self.config.use_dpo:
         self.cumulative_eval_metrics["scalar"]["eval/dpo_reward_accuracy"] += float(
-            metrics["scalar"].get("evaluation/dpo_reward_accuracy", 0.0)
+            max_utils.maybe_unwrap(metrics["scalar"].get("evaluation/dpo_reward_accuracy", 0.0))
         )
 
     if eval_step_count:

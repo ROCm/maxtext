@@ -28,6 +28,7 @@ from MaxText.utils.goodput_utils import GoodputEvent
 from MaxText.utils.goodput_utils import maybe_record_goodput
 from MaxText import model_creation_utils
 
+import jaxpp.api as jaxpp
 
 def create_training_tools(config, model, mesh):
   """Creates the init_rng, optimizer, learning rate schedule, and checkpoint manager."""
@@ -76,7 +77,7 @@ def create_training_tools(config, model, mesh):
   return init_rng, checkpoint_manager, learning_rate_schedule, tx
 
 
-def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings):
+def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, maybe_mpmd_mesh, params_shardings):
   """Returns a JIT-compiled train step function, which is loaded from a file if specified in the config."""
   (
       functional_train,
@@ -96,18 +97,27 @@ def jit_train_step(config, model, state, state_mesh_shardings, data_sharding, tr
     p_train_step = maxtext_utils.load_compiled(config, functional_train, state, execution_devices)
     max_logging.log("Loaded compiled function!")
   else:
-    p_train_step = jax.jit(
+    if not config.use_jaxpp:
+      p_train_step = jax.jit(
         functional_train,
         in_shardings=in_shardings,
         out_shardings=out_shardings,
         static_argnums=static_argnums,
+        donate_argnums=donate_argnums)
+    else:
+      max_logging.log("Running with jaxpp")
+      p_train_step = jaxpp.mpmd_jit_with_loop(
+        functional_train,
+        mpmd_mesh=maybe_mpmd_mesh,
         donate_argnums=donate_argnums,
-    )
+        in_shardings=in_shardings,
+        out_shardings=out_shardings,
+      )
 
   return p_train_step
 
 
-def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step):
+def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step, maybe_mpmd_mesh):
   """Returns a JIT-compiled eval step function."""
   (
       functional_eval,
@@ -119,13 +129,23 @@ def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step)
 
   p_eval_step = None
   if config.compiled_trainstep_file == "":
-    p_eval_step = jax.jit(
+    if not config.use_jaxpp:
+      p_eval_step = jax.jit(
+          functional_eval,
+          in_shardings=in_shardings,
+          out_shardings=out_shardings,
+          static_argnums=static_argnums,
+          donate_argnums=donate_argnums,
+      )
+    else:
+      p_eval_step = jaxpp.mpmd_jit_by_yield(
         functional_eval,
+        mpmd_mesh=maybe_mpmd_mesh,
         in_shardings=in_shardings,
         out_shardings=out_shardings,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
-    )
+      )
 
   return p_eval_step
 
@@ -133,7 +153,7 @@ def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step)
 def jit_train_and_eval_step(
     config,
     model,
-    mesh,
+    maybe_mpmd_mesh,
     state,
     state_mesh_shardings,
     train_step,
@@ -142,11 +162,12 @@ def jit_train_and_eval_step(
     params_shardings=None,
 ):
   """Returns a JIT-compiled train and eval step function."""
+  mesh = maybe_mpmd_mesh.lowering_mesh() if config.use_jaxpp else maybe_mpmd_mesh
   data_sharding = sharding.get_input_data_sharding(config, mesh)
-  p_train_step = jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings)
+  p_train_step = jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, maybe_mpmd_mesh, params_shardings)
   p_eval_step = None
   if eval_data_iterator:
-    p_eval_step = jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step)
+    p_eval_step = jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step, maybe_mpmd_mesh)
 
   return p_train_step, p_eval_step
 
@@ -172,7 +193,13 @@ def setup_train_loop(config, recorder, devices=None):
 
   with maybe_record_goodput(recorder, GoodputEvent.TPU_INIT):
     model = model_creation_utils.from_config(config, devices)
-    mesh = model.mesh
+    maybe_mpmd_mesh = model.mesh
+    if config.use_jaxpp:
+      assert isinstance(maybe_mpmd_mesh, jaxpp.MpmdMesh)
+      model.mesh = mesh = maybe_mpmd_mesh.lowering_mesh()
+    else:
+      assert isinstance(maybe_mpmd_mesh, jax.sharding.Mesh)
+      mesh = maybe_mpmd_mesh
     init_rng, checkpoint_manager, learning_rate_schedule, tx = create_training_tools(config, model, mesh)
 
   with maybe_record_goodput(recorder, GoodputEvent.TRAINING_PREPARATION):
@@ -197,8 +224,16 @@ def setup_train_loop(config, recorder, devices=None):
           )
 
     state, _, state_mesh_shardings, data_iterator = maxtext_utils.setup_training_state(
-        model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
+        model, data_iterator, tx, config, init_rng, maybe_mpmd_mesh, checkpoint_manager
     )
+
+    def make_line(keypath, array_or_array_ref):
+      sharding = array_or_array_ref.sharding
+      return (f"{jax.tree_util.keystr(keypath):<120}, {str(array_or_array_ref.dtype):<10}, "
+              f"{str(array_or_array_ref.shape):<26}, {sharding._to_xla_hlo_sharding(array_or_array_ref.ndim)}")
+
+    max_logging.log("shardings/weights")
+    max_logging.log("\n".join(make_line(keypath, array_ref) for keypath, array_ref in jax.tree_util.tree_leaves_with_path(state)))
 
     # TODO(aireenmei, hengtaoguo): support sharding in vit for multimodal
     if not config.using_pipeline_parallelism and not config.use_multimodal:
@@ -242,7 +277,7 @@ def setup_train_loop(config, recorder, devices=None):
       checkpoint_manager,
       state_mesh_shardings,
       model,
-      mesh,
+      maybe_mpmd_mesh,
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,

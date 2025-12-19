@@ -1,4 +1,5 @@
 # Copyright 2023–2025 Google LLC
+# Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,6 +43,10 @@ from MaxText import multimodal_utils
 from MaxText import sharding
 from MaxText.common_types import DecoderBlockType, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
 from MaxText.inference.page_manager import PageState
+
+import chex
+from optax._src import base
+import jaxpp.api as jaxpp
 
 OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
 
@@ -668,7 +673,6 @@ def calculate_prefill_tflops_per_device(num_model_parameters, prefill_length, co
     )
   return total_tflops, learnable_weight_tflops, causal_attention_tflops
 
-
 def apply_gradient_clipping(raw_grads, state, clipping_threshold):
   """Applies gradient clipping to raw gradients, with special handing for FLAX fp8 stats.
 
@@ -824,7 +828,7 @@ def setup_initial_state(
     tx,
     config,
     rng,
-    mesh,
+    maybe_mpmd_mesh,
     checkpoint_manager,
     is_training=True,
 ):
@@ -845,12 +849,19 @@ def setup_initial_state(
     state_mesh_annotations: the mesh annotations for the train state
   """
 
+  mesh = maybe_mpmd_mesh
+  if isinstance(maybe_mpmd_mesh, jaxpp.MpmdMesh):
+    mesh = maybe_mpmd_mesh.lowering_mesh()
+
   unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
       model, tx, config, rng, mesh, is_training
   )
 
   # Initialization
   with nn_partitioning.axis_rules(config.logical_axis_rules):
+    if checkpoint_manager is not None:
+      assert not config.use_jaxpp
+
     restored, raw_params = checkpointing.load_state_if_possible(
         checkpoint_manager,
         data_iterator,
@@ -883,18 +894,89 @@ def setup_initial_state(
     else:
       init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training)
       init_state_partial.__name__ = "initialize_state"
-      # pylint: disable=not-callable
-      state = jax.jit(
-          init_state_partial,
-          in_shardings=None,
-          out_shardings=state_mesh_shardings,
-      )(rng)
-      if raw_params:  # If we loaded a partial state, we need to merge it.
-        state = state.replace(params=raw_params)
+      if config.use_jaxpp:
+        # First infer placement based on loop usage
+        # Imported here to avoid circular import errors
+        from MaxText import maxtext_utils
+        from MaxText.train import train_step
+        params_shardings, _state_mesh_shardings = max_utils.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
+        data_sharding = maxtext_utils.get_input_data_sharding(config, mesh)
+        (
+            functional_train,
+            in_shard_train,
+            out_shard_train,
+            static_argnums_train,
+            donate_argnums_train,
+        ) = maxtext_utils.get_functional_train_with_signature(train_step, data_sharding, _state_mesh_shardings, model, config, params_shardings=params_shardings)
 
-  state = max_utils.unbox_logicallypartioned(state)
+        p_train_step = jaxpp.mpmd_jit_with_loop(
+          functional_train,
+          mpmd_mesh=maybe_mpmd_mesh,
+          donate_argnums=donate_argnums_train,
+          in_shardings=in_shard_train,
+          out_shardings=out_shard_train,
+        )
+        with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          global_mpmd_train_step = p_train_step.trace_and_place(
+            unboxed_abstract_state, next(data_iterator), rng
+          )
+        unboxed_abstract_state_placements = global_mpmd_train_step.in_shardings[0][0]
+        def attach_right_mesh(shaped: jax.ShapeDtypeStruct, dist_sharding):
+          sharding: jax.sharding.NamedSharding = shaped.sharding
+          jax_mesh = maybe_mpmd_mesh.mpmd_submesh(sorted(dist_sharding.mesh_ids)).jax_mesh
+          mpmd_sharding = jax.sharding.NamedSharding(jax_mesh, sharding.spec)
+          return jax.ShapeDtypeStruct(shaped.shape, shaped.dtype, sharding=mpmd_sharding, weak_type=shaped.weak_type)
+
+        unboxed_mpmd_abstract_state = jax.tree.map(attach_right_mesh, unboxed_abstract_state, unboxed_abstract_state_placements)
+        replicated_sharding = jax.sharding.NamedSharding(
+            maybe_mpmd_mesh.lowering_mesh(), jax.sharding.PartitionSpec()
+        )
+        state = jaxpp.mpmd_jit_rev(
+            lambda rng: jax.tree.map(jax._src.numpy.lax_numpy._array_copy, max_utils.unbox_logicallypartioned(init_state_partial(rng))),
+            out_refs=jax.tree.map(lambda s: s.mesh_ids, unboxed_abstract_state_placements),
+            mpmd_mesh=maybe_mpmd_mesh,
+            in_shardings=replicated_sharding,
+            out_shardings=in_shard_train[0],
+        )(rng)
+      else:
+        # pylint: disable=not-callable
+        state = jax.jit(
+            init_state_partial,
+            in_shardings=None,
+            out_shardings=state_mesh_shardings,
+        )(rng)
+        if raw_params:  # If we loaded a partial state, we need to merge it.
+          state = state.replace(params=raw_params)
+
+        state = max_utils.unbox_logicallypartioned(state)
 
   return state, state_mesh_annotations, state_mesh_shardings, data_iterator
+
+
+def add_data_to_sharding(mesh, path, aval, sharding):
+  if not isinstance(sharding, jax.sharding.NamedSharding):
+    raise AssertionError(f"Expected NamedSharding, found {sharding} of {type(sharding)=} at {jax.tree_util.keystr(path)}")
+  try:
+    sharded_shape = sharding.shard_shape(aval.shape)
+  except Exception as e:
+    raise AssertionError(f"Could not shard value {jax.tree_util.keystr(path)} of shape={aval.shape} with {sharding=}") from e
+  pspec = sharding.spec
+
+  if 'data' in jax.tree.leaves(pspec):
+    return sharding
+
+  for idx, (size, partition) in enumerate(zip(sharded_shape, pspec)):
+    if partition is None:
+      partition = ()
+
+    if isinstance(partition, str):
+      partition = (partition,)
+
+    if size % mesh.shape['data'] == 0 and (partition is None or 'tensor' not in partition):
+      added_component = ('data',) + partition
+      new_pspec = jax.sharding.PartitionSpec(*(pspec[:idx] + (added_component,) + pspec[idx+1:]))
+      return sharding.update(spec=new_pspec)
+  return sharding
 
 
 def get_abstract_state(model, tx, config, rng, mesh, is_training=True):

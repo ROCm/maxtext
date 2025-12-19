@@ -1,4 +1,5 @@
 # Copyright 2023–2025 Google LLC
+# Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,6 +42,8 @@ from MaxText.gcloud_stub import cloud_diagnostics as _cloud_diag, is_decoupled
 _diag_modules = _cloud_diag()
 diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration = _diag_modules
 
+from packaging.version import Version
+
 from MaxText import checkpointing
 from MaxText import exceptions
 from MaxText import max_logging
@@ -71,11 +74,25 @@ from MaxText.vocabulary_tiling import vocab_tiling_linen_loss
 from MaxText.dpo_utils import _merge_dpo_state, _split_dpo_state, dpo_loss_fn
 from MaxText.train_utils import validate_train_config
 from MaxText.metric_logger import record_activation_metrics
+
+"""
+JaxPP related imports
+"""
+# system
+import subprocess
+
+from statistics import mean
+
+# jaxpp
+from jaxpp import __version__ as jaxpp_version
+from packaging.version import Version
+import jaxpp.api as jaxpp
+
 # pylint: disable=too-many-positional-arguments
 
 
 def get_first_step(state):
-  return int(state.step)
+  return int(max_utils.maybe_unwrap(state.step))
 
 
 # -----------------------------------------------------------------------------
@@ -99,7 +116,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     aux: a dictionary including intermediate_outputs, total_loss, and total_weights
   """
   # decimate proportion of data when per_device_batch_size<1
-  if is_train:
+  if is_train and not config.use_jaxpp:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_train_on, :]
   else:
@@ -213,6 +230,44 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   return loss, aux
 
 
+def load_schedule(config):
+  pipeline_parallel_dim = config.dcn_pipeline_parallelism * config.ici_pipeline_parallelism
+  num_logical_stages = config.num_pipeline_repeats * pipeline_parallel_dim
+  schedule = None
+  if config.schedule == "1f1b":
+      assert num_logical_stages <= pipeline_parallel_dim
+      schedule = jaxpp.Std1F1B(num_logical_stages)
+  elif config.schedule == "eager_1f1b":
+      assert num_logical_stages <= pipeline_parallel_dim
+      schedule = jaxpp.Eager1F1B(num_logical_stages)
+  elif config.schedule == "interleaved_1f1b":
+      if Version(jaxpp_version) > Version("0.6.1"):
+        schedule = jaxpp.Interleaved1F1B(num_logical_stages, pipeline_parallel_dim, config.fuse_steady_state)
+      else:
+        schedule = jaxpp.Interleaved1F1B(num_logical_stages, pipeline_parallel_dim)
+  elif config.schedule == "zero_bubble":
+      assert num_logical_stages <= pipeline_parallel_dim
+      schedule = jaxpp.ZeroBubble(num_logical_stages)
+  elif config.schedule == "dualpipev":
+      schedule = jaxpp.DualPipeV(num_logical_stages, pipeline_parallel_dim)
+  else:
+      raise NotImplementedError(f"Unknown schedule {config.schedule}")
+  return schedule
+
+
+def add_leading_axis(
+    axis_name: str, path: jax.tree_util.KeyPath, s: jax.sharding.NamedSharding
+):
+    assert isinstance(s, jax.sharding.NamedSharding)
+    used = {n for ns in s.spec for n in (ns if isinstance(ns, tuple) else (ns,))}
+    if axis_name in used:
+        raise ValueError(
+            f"mesh axis name {axis_name} cannot appear in "
+            f"out_shardings. Found out_shardings{jax.tree_util.keystr(path)}={s.spec}"
+        )
+    return jax.sharding.NamedSharding(s.mesh, jax.sharding.PartitionSpec(axis_name, *s.spec), memory_kind=s.memory_kind)
+
+
 def train_step(model, config, state_mesh_shardings, params_shardings, state, data, dropout_rng):
   """
 
@@ -261,24 +316,92 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
             max_utils.with_memory_kind(reference_params_sharding, "device"),
         )
         extra_dpo_args = [reference_params]
+
     if config.shard_optimizer_over_data:
       params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
-    grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
-    (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True)
+    def compute_grads(data):
+      grad_func = jax.value_and_grad(loss_fn, argnums=4, has_aux=True)
+      (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True)
+      def cast(p, a):
+        sp = jax.tree_util.keystr(p)
+        if 'token_embedder' in sp or 'position_embedder' in sp:
+          return a
+        return a.astype(jnp.dtype(config.grad_dtype))
+      raw_grads['params'] = jax.tree_util.tree_map_with_path(cast, raw_grads['params'])
+      return ((loss, aux), raw_grads)
 
+<<<<<<< HEAD
   raw_grads = jax.tree_util.tree_map(
       lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
       raw_grads,
   )
+=======
+    if not config.use_jaxpp:
+      (loss, aux), raw_grads = compute_grads(data)
+    else:
+      def microbatched(a):
+        shape = (
+          state_mesh_shardings.step.mesh.shape["data"],
+          config.num_pipeline_microbatches,
+          -1,
+          config.max_target_length,
+        )
+        if shape[0] == 1:
+          shape = shape[1:]
+        return a.reshape(*shape)
+      data = jax.tree.map(microbatched, data)
+
+      # Perform data parallelism manually through `vmap`
+      vmapped_compute_grads = compute_grads
+      if state_mesh_shardings.step.mesh.shape["data"] > 1:
+        vmapped_compute_grads = jax.vmap(compute_grads, spmd_axis_name="data")
+
+      loss_aux_sharding = jax.sharding.NamedSharding(state_mesh_shardings.step.mesh, jax.sharding.PartitionSpec())
+      param_operation = {'params': jaxpp.Add}
+      if nn.fp8_ops.OVERWRITE_WITH_GRADIENT in params:
+        param_operation[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = jaxpp.Max
+      assert all(k in param_operation for k in params.keys())
+
+      axis = 1 if state_mesh_shardings.step.mesh.shape["data"] > 1 else 0
+      (loss, aux), raw_grads = jaxpp.treduce(
+          vmapped_compute_grads,
+          data,
+          axis=axis,
+          schedule=load_schedule(config),
+          operation=(jaxpp.Concat(axis=axis), param_operation)
+      )
+
+      if state_mesh_shardings.step.mesh.shape["data"] > 1:
+        (loss, aux), raw_grads = jax.lax.with_sharding_constraint(
+            ((loss, aux), raw_grads),
+            jax.tree.map_with_path(
+                functools.partial(add_leading_axis, "data"),
+                (loss_aux_sharding, params_shardings)
+            ),
+        )
+        # reduce-scatter gradients across "data"
+        owg = raw_grads.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
+        raw_grads = jax.tree.map(functools.partial(jax.numpy.sum, axis=0), raw_grads)
+        if owg is not None:
+          owg = jax.tree.map(functools.partial(jax.numpy.max, axis=0), owg)
+          raw_grads[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = owg
+
+  raw_grads = jax.lax.with_sharding_constraint(raw_grads, state_mesh_shardings.params)
+  raw_grads = jax.tree_util.tree_map(lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x, raw_grads)
+  owg = raw_grads.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
+  raw_grad_norm = max_utils.l2norm_pytree(raw_grads)
+>>>>>>> jaxpp/main
   intermediate_outputs = aux["intermediate_outputs"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
   mtp_loss = aux["mtp_loss"]
 
   if config.gradient_clipping_threshold > 0:
-    grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
+    grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, raw_grad_norm, config.gradient_clipping_threshold)
   else:
     grads = raw_grads
+  if owg is not None:
+    grads[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = owg
   if config.optimizer_memory_host_offload:
     state = state.replace(
         opt_state=jax.device_put(
@@ -305,16 +428,36 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     )
   new_state = state.apply_gradients(grads=grads)
 
-  scalar_metrics = {
-      "learning/loss": loss,
-      "learning/moe_lb_loss": moe_lb_loss,
-      "learning/mtp_loss": mtp_loss,
-      "learning/total_weights": total_weights,
-  }
+  if config.use_jaxpp:
+    # TODO: refine logic to match the one in MaxText's gradient accumulation
+    #  or use that altogether (add support for scan instead of
+    #  treduce in JaxPP)
+    scalar_metrics = {
+        "learning/loss": loss.sum() / total_weights.sum(),
+        "learning/moe_lb_loss": moe_lb_loss.sum(),
+        "learning/mtp_loss": mtp_loss.sum(),
+        "learning/total_weights": total_weights.sum(),
+    }
+  else:
+    scalar_metrics = {
+        "learning/loss": loss,
+        "learning/moe_lb_loss": moe_lb_loss,
+        "learning/mtp_loss": mtp_loss,
+        "learning/total_weights": total_weights,
+    }
   if not config.optimizer_memory_host_offload:
-    scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
-    scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
-    scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
+    owg = grads.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
+    scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads["params"])
+    if owg is not None:
+      grads[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = owg
+    scalar_metrics["learning/raw_grad_norm"] = raw_grad_norm
+
+    new_params = new_state.params
+    owg = new_params.pop(nn.fp8_ops.OVERWRITE_WITH_GRADIENT, None)
+    scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_params)
+    if owg is not None:
+      new_params[nn.fp8_ops.OVERWRITE_WITH_GRADIENT] = owg
+    new_state = new_state.replace(params=new_params)
   if config.use_dpo:
     scalar_metrics["learning/dpo_reward_accuracy"] = aux["reward_accuracy"]
   metrics = {
@@ -364,7 +507,7 @@ def eval_step(model, config, state, data, dropout_rng):
   if config.use_dpo:
     metrics["scalar"]["evaluation/dpo_reward_accuracy"] = aux["reward_accuracy"]
 
-  return metrics
+  return jax.tree.map(jax._src.numpy.lax_numpy._array_copy, metrics)
 
 
 def train_loop(config, recorder, state=None):
@@ -374,7 +517,7 @@ def train_loop(config, recorder, state=None):
       checkpoint_manager,
       state_mesh_shardings,
       model,
-      mesh,
+      maybe_mpmd_mesh,
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,
@@ -387,6 +530,7 @@ def train_loop(config, recorder, state=None):
       state = _merge_dpo_state(state, reference_params)
     state_mesh_shardings = _merge_dpo_state(state_mesh_shardings, state_mesh_shardings.params["params"])
 
+<<<<<<< HEAD
   params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
   p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
@@ -406,6 +550,22 @@ def train_loop(config, recorder, state=None):
     if config.shard_optimizer_over_data:
       state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
     if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
+=======
+  mesh = maybe_mpmd_mesh.lowering_mesh() if config.use_jaxpp else maybe_mpmd_mesh
+  params_shardings, state_mesh_shardings = maxtext_utils.maybe_update_params_sharding_with_opt(
+      config, state_mesh_shardings
+  )
+
+  p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
+      config, model, maybe_mpmd_mesh, state, state_mesh_shardings, train_step, eval_step, eval_data_iterator, params_shardings
+  )
+
+  if not config.use_jaxpp:
+    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      shaped_batch = maxtext_utils.get_shaped_batch(config)
+      if config.shard_optimizer_over_data:
+        state = jax.lax.with_sharding_constraint(state, state_mesh_shardings)
+>>>>>>> jaxpp/main
       compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
       compiled_stats = compiled.memory_analysis()
       max_utils.print_compiled_memory_stats(compiled_stats)
@@ -419,9 +579,18 @@ def train_loop(config, recorder, state=None):
   metric_logger.write_setup_info_to_tensorboard(state.params)
 
   try:
+    step_time = []
+    step_tflops = []
+    # NOTE: The dict values are unused when use_jaxpp is False.
+    profiling_process_ids = {pid: "" for pid in jax.process_indices()}
+    if config.use_jaxpp:
+      idx = tuple(slice(None) if i == maybe_mpmd_mesh.mpmd_axis else 0 for i in range(len(maybe_mpmd_mesh.jax_mesh.shape)))
+      first_device_per_mpmd_rank = maybe_mpmd_mesh.jax_mesh.devices[idx]
+      profiling_process_ids = {d.process_index: d for d in first_device_per_mpmd_rank}
+
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):
-      prof.maybe_activate_profiler(step, state)
+      prof.maybe_activate_profiler(step, state, maybe_mpmd_mesh=maybe_mpmd_mesh, profiling_process_ids=profiling_process_ids)
 
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
         example_batch = data_loader.load_next_batch()
@@ -435,8 +604,13 @@ def train_loop(config, recorder, state=None):
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
           with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+<<<<<<< HEAD
             if config.shard_optimizer_over_data:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
+=======
+            if config.shard_optimizer_over_data and not config.use_jaxpp:
+              state = jax.lax.with_sharding_constraint(state, state_mesh_shardings)
+>>>>>>> jaxpp/main
             state, metrics = p_train_step(state, example_batch, nextrng)
 
       step_time_delta = datetime.datetime.now() - last_step_completion
@@ -467,6 +641,7 @@ def train_loop(config, recorder, state=None):
           if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
             break
           with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+            eval_batch = jax.tree_util.tree_map(lambda a: a[:2], eval_batch)
             eval_metrics = p_eval_step(state, eval_batch, nextrng)
           metric_logger.record_eval_metrics(step, metrics=eval_metrics)
           max_logging.log(f"Completed eval step {eval_step_count}")
@@ -476,12 +651,21 @@ def train_loop(config, recorder, state=None):
           prof.deactivate()
           raise exceptions.StopTraining(f"Target loss {config.target_eval_loss=} is achieved.")
 
-      prof.maybe_deactivate_profiler(step, state)
+      prof.maybe_deactivate_profiler(step, state, profiling_process_ids=profiling_process_ids)
 
       if step == start_step:
         max_utils.print_mem_stats("After params initialized")
 
       metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
+      step_time.append(metrics['scalar']['perf/step_time_seconds'])
+      step_tflops.append(metrics['scalar']['perf/per_device_tflops_per_sec'])
+
+    if config.use_jaxpp and prof.mode != "":
+      command = """find . -wholename '*proc_*_mpmd*/*.xplane.pb' | sort | awk '{line=$0; sub(/.*mpmd_/, "", line); sub(/_.*/, "", line); printf "%d:%s:0 ", line, $0}'"""
+      subprocess.run(
+        [f"merge_multihost_xplanes $({command})"],
+        shell=True, cwd=config.tensorboard_dir, check=True
+      )
 
     if config.save_checkpoint_on_completion:
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
@@ -493,6 +677,13 @@ def train_loop(config, recorder, state=None):
     max_logging.log(f"Training stopped: {str(e)}")
   finally:
     metric_logger.flush_metrics_and_cleanup()
+
+  # last_profiling_step + 2 as (1) we count steps from 0, and (2) the execution time for merge_multihost_xplanes is
+  # counted toward the execution time for the step right after the last profiling step.
+  num_warmup_steps = (prof.finished_initial_profile_step + 2) if prof.mode != "" else 6
+  max_logging.log(
+      f"excluding the first {num_warmup_steps} steps: avg time per step {mean(step_time[num_warmup_steps:])}, avg tflops per step {mean(step_tflops[num_warmup_steps:])}"
+  )
 
   return state
 
