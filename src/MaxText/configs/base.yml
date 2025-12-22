@@ -282,7 +282,7 @@ param_scan_axis: 0  # NOTE(jaxpp) we set to 0 instead of 1 to avoid flax transpo
 
 # The attention parameter dictates the specific algorithm/methodology used to compute the attention scores
 # The attention_type parameter determines the variants of attention, e.g. global or local_sliding
-attention: 'cudnn_flash_te' # Supported attention: autoselected, dot_product, flash, cudnn_flash_te
+attention: 'dot_product' # Supported attention: autoselected, dot_product, flash, cudnn_flash_te
 attention_type: 'global' # Supported attention_type: global, local_sliding, chunk, mla
 attention_bias: False # If True, adds a learnable bias to the query, key, and value projections 
 attention_sink: False
@@ -469,7 +469,7 @@ ici_expert_parallelism: 1
 
 # The number of TPU slices is automatically determined, you should not set this explicitly. For ahead of time compilation,
 # you should set compile_toplogy_num_slices, which will in turn set this value. For non-TPU environments this is set to 1.
-num_slices: -1
+num_slices: 1
 
 # Vocab Tiling Configs
 # Enables a memory-saving optimization by computing the cross-entropy loss in chunks.
