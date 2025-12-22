@@ -732,6 +732,8 @@ class Decoder(nn.Module):
                 model_mode=model_mode,
             )(y, *broadcast_args)
     else:
+      add_last_enter_stage = Version(jaxpp.__version__) > Version("0.6.1")
+      stage_id = 0
       if cfg.scan_layers:
         assert not cfg.use_jaxpp, "Layer scanning is not supported with JaxPP"
         if cfg.decoder_block == DecoderBlockType.DEEPSEEK:

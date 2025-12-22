@@ -1193,7 +1193,9 @@ def setup_initial_state(
             maybe_mpmd_mesh.lowering_mesh(), jax.sharding.PartitionSpec()
         )
         state = jaxpp.mpmd_jit_rev(
-            lambda rng: jax.tree.map(jax._src.numpy.lax_numpy._array_copy, max_utils.unbox_logicallypartioned(init_state_partial(rng))),
+            # lambda rng: jax.tree.map(jax._src.numpy.lax_numpy._array_copy, max_utils.unbox_logicallypartioned(init_state_partial(rng))),
+            lambda rng: jtu.tree_map(lambda x: jnp.array(x, copy=True) if hasattr(x, "dtype") else x, max_utils.unbox_logicallypartioned(init_state_partial(rng))),
+            # lambda rng: jax.tree.map(jax._src.numpy.lax_numpy._array_copy, max_utils.unbox_logicallypartioned(init_state_partial(rng))),
             out_refs=jax.tree.map(lambda s: s.mesh_ids, unboxed_abstract_state_placements),
             mpmd_mesh=maybe_mpmd_mesh,
             in_shardings=replicated_sharding,
