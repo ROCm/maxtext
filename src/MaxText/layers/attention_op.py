@@ -1399,6 +1399,10 @@ class AttentionOp(nnx.Module):
       attn_mask = None
       dummy_attn_mask = None
       mask_type = "causal"
+    elif self.config.dataset_type == "synthetic":
+      attn_mask = None
+      dummy_attn_mask = None
+      mask_type = "causal"
     else:
       # Default case: no packing, no context parallelism
       dummy_attn_mask = jnp.zeros((1, 1, 1, self.max_target_length, self.max_target_length), dtype=jnp.uint8)
