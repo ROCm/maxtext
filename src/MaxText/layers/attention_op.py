@@ -1420,7 +1420,6 @@ class AttentionOp(nnx.Module):
         dtype=self.dtype,
         float32_logits=self.float32_logits,
         qkv_layout=qkv_layout,
-        scale_factor=1.0,
         transpose_batch_sequence=False,
         window_size=sliding_window_size,
         context_parallel_causal_load_balanced=self.config.context_parallel_load_balance,
