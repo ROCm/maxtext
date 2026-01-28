@@ -565,8 +565,21 @@ def load_state_if_possible(
     if step is not None:
       max_logging.log(f"restoring from this run's directory step {step}")
 
+      # Check whether the mesh actually has multiple replicas along axis 0.
+      # If all devices are in a single replica, SingleReplicaArrayHandler
+      # raises InvalidShardingError — fall back to normal restore.
+      _sr_effective = enable_single_replica_ckpt_restoring
+      if _sr_effective:
+        _first_leaf = jax.tree_util.tree_leaves(abstract_unboxed_pre_state)[0]
+        if _first_leaf.sharding.mesh.devices.shape[0] <= 1:
+          max_logging.log(
+              "enable_single_replica_ckpt_restoring=True but mesh has only 1 "
+              f"replica (shape[0]={_first_leaf.sharding.mesh.devices.shape[0]}). "
+              "Falling back to normal all-replica restore.")
+          _sr_effective = False
+
       def map_to_pspec(data):
-        if not enable_single_replica_ckpt_restoring:
+        if not _sr_effective:
           return ocp.type_handlers.ArrayRestoreArgs(sharding=data.sharding)
         pspec = data.sharding.spec
         mesh = data.sharding.mesh
@@ -582,15 +595,31 @@ def load_state_if_possible(
             dtype=data.dtype,
         )
 
-      if enable_single_replica_ckpt_restoring:
-        array_handler = ocp.type_handlers.SingleReplicaArrayHandler(
+      # Cache the original ArrayHandler before potentially overriding it.
+      original_array_handler = ocp.type_handlers.get_type_handler(jax.Array)
+
+      if _sr_effective:
+        single_replica_handler = ocp.type_handlers.SingleReplicaArrayHandler(
             replica_axis_index=0,
             broadcast_memory_limit_bytes=1024 * 1024 * 1000,  # 1000 MB limit
         )
-        ocp.type_handlers.register_type_handler(jax.Array, array_handler, override=True)
+        ocp.type_handlers.register_type_handler(jax.Array, single_replica_handler, override=True)
 
       restore_args = jax.tree_util.tree_map(map_to_pspec, abstract_unboxed_pre_state)
       checkpoint_args = ocp.args.PyTreeRestore(item=abstract_unboxed_pre_state, restore_args=restore_args)
+
+      def _restore_original_array_handler():
+        """Restore the original ArrayHandler after SingleReplicaArrayHandler restore.
+
+        This is critical because SingleReplicaArrayHandler is designed for restore only.
+        Using it for saves will cause missing array_metadatas files and checkpoint failures.
+        We restore the EXACT handler that was in place before, not a new instance.
+        """
+        if _sr_effective:
+          max_logging.log("Restoring original ArrayHandler after SingleReplicaArrayHandler restore...")
+          # Re-register the original handler that was cached before the override
+          ocp.type_handlers.register_type_handler(jax.Array, original_array_handler, override=True)
+          max_logging.log("Original ArrayHandler restored successfully.")
 
       match (checkpoint_manager, dataset_type, data_iterator):
         # Case 1: Matches if 'checkpoint_manager' is an instance of either EmergencyCheckpointManager
@@ -599,10 +628,12 @@ def load_state_if_possible(
         case (checkpoint_manager, _, _) if isinstance(
             checkpoint_manager, (EmergencyCheckpointManager, EmergencyReplicatorCheckpointManager)
         ):
-          return (
+          result = (
               checkpoint_manager.restore(step, args=Composite(state=checkpoint_args)).state,
               None,
           )
+          _restore_original_array_handler()
+          return result
         # Case 2: Matches if dataset type is "grain" and the data iterator is not a
         # PlaceHolderDataIterator or RemoteIterator and a specific checkpoint file exists for the iterator
         case (
@@ -616,13 +647,17 @@ def load_state_if_possible(
             and not _is_remote_iterator(data_iterator)
             and (checkpoint_manager.directory / str(step) / "iter").exists()
         ):
-          return _restore_grain_iterator(
+          result = _restore_grain_iterator(
               checkpoint_manager, step, data_iterator, checkpoint_args, expansion_factor_real_data
           )
+          _restore_original_array_handler()
+          return result
         # Case 3: Default/Fallback case.
         # This case acts as a wildcard ('_') and matches if none of the preceding cases were met.
         case _:
-          return (checkpoint_manager.restore(step, args=Composite(items=checkpoint_args)), None)
+          result = (checkpoint_manager.restore(step, args=Composite(items=checkpoint_args)), None)
+          _restore_original_array_handler()
+          return result
 
   if load_parameters_from_path != "":
     restored_params = load_params_from_path(
