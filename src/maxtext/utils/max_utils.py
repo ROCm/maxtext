@@ -285,10 +285,16 @@ def maybe_initialize_jax_distributed_system(raw_keys):
   if raw_keys["hardware"] == "gpu_multiprocess":
     max_logging.log("Attempting to initialize the jax distributed system for gpu_multiprocess hardware...")
     if not raw_keys["enable_emergency_checkpoint"]:
-      jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
+      jax.distributed.initialize(
+          initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+          heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
+      )
     else:
       max_logging.log("Initializing jax distributed to support local checkpointing with GPUs...")
-      jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
+      jax.distributed.initialize(
+          initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+          heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
+      )
       ocp.multihost.initialize_runtime_to_distributed_ids()
       ocp.multihost.initialize_distributed_to_device_ids()
       max_logging.log("Jax distributed system initialized!")
@@ -309,7 +315,10 @@ def maybe_initialize_jax_distributed_system(raw_keys):
     max_logging.log("Jax distributed system initialized on TPUs for multi-tier checkpointing!")
   elif raw_keys["enable_checkpointing"] and raw_keys["compile_topology_num_slices"] == -1:
     if not raw_keys["enable_emergency_checkpoint"]:
-      jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
+      jax.distributed.initialize(
+          initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+          heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
+      )
     else:
       initialize_jax_for_tpu_with_emergency_checkpointing(raw_keys)
     max_logging.log("Jax distributed system initialized on TPUs!")
@@ -343,6 +352,7 @@ def initialize_jax_for_gpu(raw_keys):
         process_id=int(os.getenv("NODE_RANK")),  # pyrefly: ignore[bad-argument-type]
         initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
         local_device_ids=devices,
+        heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
     )
     max_logging.log(f"JAX global devices: {jax.devices()}")
 
@@ -363,6 +373,7 @@ def initialize_jax_for_cpu(raw_keys):
       process_id=pid,
       num_processes=int(os.environ.get("JAX_PROCESS_COUNT")),  # pyrefly: ignore[bad-argument-type]
       initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+      heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
   )
 
 
@@ -383,6 +394,7 @@ def initialize_jax_for_tpu_with_emergency_checkpointing(raw_keys):
         coordinator_address=coordinator_address,
         process_id=int(process_id),
         initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+        heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
     )
 
     ocp.multihost.initialize_runtime_to_distributed_ids()
