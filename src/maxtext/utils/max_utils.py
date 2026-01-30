@@ -232,11 +232,17 @@ def maybe_initialize_jax_distributed_system(raw_keys):
   ] == "gpu_multiprocess":
     max_logging.log("Attempting to initialize the jax distributed system...")
     if not raw_keys["enable_emergency_checkpoint"]:
-      jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
+      jax.distributed.initialize(
+          initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+          heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
+      )
     else:
       if raw_keys["hardware"] == "gpu_multiprocess":
         max_logging.log("Initializing jax distribtued to support local checkpointing with" " GPUs...")
-        jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
+        jax.distributed.initialize(
+            initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+            heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
+        )
         ocp.multihost.initialize_runtime_to_distributed_ids()
         ocp.multihost.initialize_distributed_to_device_ids()
       else:
@@ -263,6 +269,7 @@ def initialize_jax_for_gpu(raw_keys):
         process_id=int(os.getenv("NODE_RANK")),
         initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
         local_device_ids=devices,
+        heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
     )
     max_logging.log(f"JAX global devices: {jax.devices()}")
 
@@ -283,6 +290,7 @@ def initialize_jax_for_cpu(raw_keys):
       process_id=pid,
       num_processes=int(os.environ.get("JAX_PROCESS_COUNT")),
       initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+      heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
   )
 
 
@@ -303,6 +311,7 @@ def initialize_jax_for_tpu_with_emergency_checkpointing(raw_keys):
         coordinator_address=coordinator_address,
         process_id=int(process_id),
         initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+        heartbeat_timeout_seconds=raw_keys["jax_distributed_heartbeat_timeout_seconds"],
     )
 
     ocp.multihost.initialize_runtime_to_distributed_ids()
