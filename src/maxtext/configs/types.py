@@ -1396,6 +1396,9 @@ class DevelopmentAndDebugging(BaseModel):
       description="Directory for JAX compilation cache.",
   )
   jax_distributed_initialization_timeout: int = Field(300, description="Timeout for jax.distributed.initialize.")
+  jax_distributed_heartbeat_timeout_seconds: int = Field(
+      100, description="How long before a missing heartbeat marks a task as dead. Increase for slow NFS checkpoint restores."
+  )
   jax_debug_log_modules: str = Field("", description="Set to 'jax' for verbose JAX logging.")
   skip_jax_distributed_system: bool = Field(False, description="If True, do not initialize the jax distributed system.")
   enable_single_controller: bool = Field(False, description="Enable single-controller mode (Pathways).")

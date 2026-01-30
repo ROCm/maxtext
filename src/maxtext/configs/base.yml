@@ -711,6 +711,7 @@ log_period: 100 # The frequency of Tensorboard flush, gcs metrics writing, and m
 jax_distributed_initialization_timeout: 300 # This is the default timeout in https://github.com/jax-ml/jax/blob/main/jax/_src/distributed.py
 # Note there are two separate initializations - the jax coordination service (aka jax.distributed.initialize) and the backend (e.g. PjRT), the timeout above refers
 # only to the jax coordination service.
+jax_distributed_heartbeat_timeout_seconds: 100 # How long before a missing heartbeat marks a task as dead. Increase for slow NFS checkpoint restores.
 jax_debug_log_modules: "" # Set this to "jax" to enable jax verbose logging such as for the jax coordination service initialization.
 skip_jax_distributed_system: False # If True we will not initialize the jax distributed system.
 # Currently the jax distributed is needed on cloud TPUs for async checkpointing.
