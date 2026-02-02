@@ -418,6 +418,16 @@ def train_loop(config, recorder, state=None):
   # Write train config params, num model params, and XLA flags to tensorboard
   metric_logger.write_setup_info_to_tensorboard(state.params)
 
+  # Synchronize all hosts before entering the training loop.
+  # Without this barrier, timing variance during initialization (JIT compilation,
+  # profiler/logger setup, etc.) causes hosts to enter the training loop at different
+  # times. The first collective operation (data sharding in load_next_batch) then
+  # times out waiting for straggler hosts, resulting in "collective operation timeout"
+  # or "stop sending heartbeats" errors.
+  max_logging.log("====== BARRIER: Synchronizing hosts before training loop ======")
+  jax.experimental.multihost_utils.sync_global_devices("sync_before_training_loop")
+  max_logging.log("====== BARRIER PASSED: Starting training loop ======")
+
   try:
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):
