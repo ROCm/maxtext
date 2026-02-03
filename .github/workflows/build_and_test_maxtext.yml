@@ -20,15 +20,23 @@ on:
   pull_request:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      rocm_only:
+        description: 'Run only ROCm jobs (manual runs only)'
+        type: boolean
+        required: false
+        default: false
   schedule:
-    - cron: '0 4 * * *'  # Daily 04:00 UTC
+    - cron: '0 3 * * *'  # Daily 03:00 UTC
 
 concurrency:
-  # Dedup pull requests (canceling previous runs of the same workflow for same PR), and scheduled runs but nothing else
+  # Cancel previous runs for same PR (all actors), scheduled runs,
+  # and manual runs per (branch + actor).
   group: >
     ${{
       github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) ||
       github.event_name == 'schedule' && format('{0}-schedule', github.workflow) ||
+      github.event_name == 'workflow_dispatch' && format('{0}-manual-{1}-{2}', github.workflow, github.ref, github.actor) ||
       github.run_id
     }}
   cancel-in-progress: true
@@ -92,18 +100,16 @@ jobs:
   build_and_upload_maxtext_package:
     needs: doc_only_check
     # Run if either tests or notebooks need to run
-    if: |
-      needs.doc_only_check.outputs.run_tests == 'true' || 
-      needs.doc_only_check.outputs.run_notebooks == 'true'
+    if: ${{ vars.ROCM_ONLY == 'true' || needs.doc_only_check.outputs.run_tests == 'true' || needs.doc_only_check.outputs.run_notebooks == 'true' }}
     uses: ./.github/workflows/build_package.yml
     with:
-      device_type: tpu
-      device_name: v4-8
-      cloud_runner: linux-x86-n2-16-buildkit
+      device_type: ${{ vars.ROCM_ONLY == 'true' && 'rocm' || 'tpu' }}
+      device_name: ${{ vars.ROCM_ONLY == 'true' && 'mi355' || 'v4-8' }}
+      cloud_runner: ${{ vars.ROCM_ONLY == 'true' && 'linux-x86-64-4gpu-amd' || 'linux-x86-n2-16-buildkit' }}
 
   maxtext_jupyter_notebooks:
     needs: build_and_upload_maxtext_package
-    if: needs.doc_only_check.outputs.run_notebooks == 'true'
+    if: ${{ vars.ROCM_ONLY != 'true' && ((!(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && (needs.doc_only_check.outputs.run_notebooks == 'true'))) }}
     uses: ./.github/workflows/run_jupyter_notebooks.yml
     strategy:
         fail-fast: false
@@ -120,7 +126,7 @@ jobs:
 
   maxtext_cpu_unit_tests:
     needs: build_and_upload_maxtext_package
-    if: needs.doc_only_check.outputs.run_tests == 'true'
+    if: ${{ vars.ROCM_ONLY != 'true' && (!(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && (needs.doc_only_check.outputs.run_tests == 'true')) }}
     uses: ./.github/workflows/run_tests_against_package.yml
     strategy:
         fail-fast: false # don't cancel all jobs on failure
@@ -143,7 +149,7 @@ jobs:
 
   maxtext_tpu_unit_tests:
     needs: build_and_upload_maxtext_package
-    if: needs.doc_only_check.outputs.run_tests == 'true'
+    if: ${{ vars.ROCM_ONLY != 'true' && (!(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && (needs.doc_only_check.outputs.run_tests == 'true')) }}
     uses: ./.github/workflows/run_tests_against_package.yml
     strategy:
         fail-fast: false
@@ -163,7 +169,7 @@ jobs:
 
   maxtext_tpu_integration_tests:
     needs: build_and_upload_maxtext_package
-    if: needs.doc_only_check.outputs.run_tests == 'true'
+    if: ${{ vars.ROCM_ONLY != 'true' && (!(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && (needs.doc_only_check.outputs.run_tests == 'true')) }}
     uses: ./.github/workflows/run_tests_against_package.yml
     strategy:
         fail-fast: false
@@ -183,7 +189,7 @@ jobs:
 
   maxtext_tpu_pathways_unit_tests:
     needs: build_and_upload_maxtext_package
-    if: needs.doc_only_check.outputs.run_tests == 'true'
+    if: ${{ vars.ROCM_ONLY != 'true' && ((!(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && (needs.doc_only_check.outputs.run_tests == 'true'))) }}
     uses: ./.github/workflows/run_pathways_tests.yml
     strategy:
         fail-fast: false
@@ -203,7 +209,7 @@ jobs:
 
   maxtext_tpu_pathways_integration_tests:
     needs: build_and_upload_maxtext_package
-    if: needs.doc_only_check.outputs.run_tests == 'true'
+    if: ${{ vars.ROCM_ONLY != 'true' && ((!(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && (needs.doc_only_check.outputs.run_tests == 'true'))) }}
     uses: ./.github/workflows/run_pathways_tests.yml
     strategy:
         fail-fast: false
@@ -223,7 +229,7 @@ jobs:
 
   maxtext_gpu_unit_tests:
     needs: build_and_upload_maxtext_package
-    if: needs.doc_only_check.outputs.run_tests == 'true'
+    if: ${{ vars.ROCM_ONLY != 'true' && (!(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && (needs.doc_only_check.outputs.run_tests == 'true')) }}
     uses: ./.github/workflows/run_tests_against_package.yml
     strategy:
         fail-fast: false
@@ -288,7 +294,7 @@ jobs:
 
   maxtext_gpu_integration_tests:
     needs: build_and_upload_maxtext_package
-    if: needs.doc_only_check.outputs.run_tests == 'true'
+    if: ${{ vars.ROCM_ONLY != 'true' && (!(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && (needs.doc_only_check.outputs.run_tests == 'true')) }}
     uses: ./.github/workflows/run_tests_against_package.yml
     strategy:
         fail-fast: false
@@ -307,9 +313,31 @@ jobs:
       is_scheduled_run: ${{ github.event_name == 'schedule' }}
       maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
 
+  maxtext_rocm_decoupled_unit_tests:
+    needs: build_and_upload_maxtext_package
+    if: ${{ vars.ROCM_ONLY == 'true' || (github.event_name == 'workflow_dispatch' && inputs.rocm_only) || needs.doc_only_check.outputs.run_tests == 'true' }}
+    uses: ./.github/workflows/run_tests_against_package.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        image_type: ["py312"]
+    with:
+      device_type: rocm
+      device_name: mi355
+      image_type: ${{ matrix.image_type }}
+      cloud_runner: linux-x86-64-4gpu-amd
+      pytest_marker: 'decoupled'
+      xla_python_client_mem_fraction: 0.9
+      tf_force_gpu_allow_growth: true
+      container_resource_option: "--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size 64g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --privileged"
+      requirements_file: "src/dependencies/requirements/requirements_decoupled_rocm_jax_0_8_2.txt"
+      decoupled_mode: true
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
   all_tests_passed:
     name: All Required Tests Passed
-    needs: [doc_only_check, build_and_upload_maxtext_package, maxtext_cpu_unit_tests, maxtext_tpu_unit_tests, maxtext_tpu_integration_tests, maxtext_tpu_pathways_unit_tests, maxtext_tpu_pathways_integration_tests, maxtext_gpu_unit_tests, maxtext_gpu_integration_tests, maxtext_post_training_cpu_unit_tests, maxtext_post_training_tpu_unit_tests]
+    needs: [doc_only_check, build_and_upload_maxtext_package, maxtext_cpu_unit_tests, maxtext_tpu_unit_tests, maxtext_tpu_integration_tests, maxtext_tpu_pathways_unit_tests, maxtext_tpu_pathways_integration_tests, maxtext_gpu_unit_tests, maxtext_gpu_integration_tests, maxtext_post_training_cpu_unit_tests, maxtext_post_training_tpu_unit_tests, maxtext_rocm_decoupled_unit_tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -332,6 +360,7 @@ jobs:
           echo "GPU integration: ${NEEDS_MAXTEXT_GPU_INTEGRATION_TESTS_RESULT}"
           echo "Post-training CPU tests: ${NEEDS_MAXTEXT_POST_TRAINING_CPU_UNIT_TESTS_RESULT}"
           echo "Post-training TPU tests: ${NEEDS_MAXTEXT_POST_TRAINING_TPU_UNIT_TESTS_RESULT}"
+          echo "ROCm decoupled tests: ${NEEDS_MAXTEXT_ROCM_DECOUPLED_UNIT_TESTS_RESULT}"
 
           # Fail only if any job failed or was cancelled (skipped is OK)
           if [ "${{ contains(needs.*.result, 'failure') }}" == "true" ] || [ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]; then
@@ -352,11 +381,12 @@ jobs:
           NEEDS_MAXTEXT_GPU_INTEGRATION_TESTS_RESULT: ${{ needs.maxtext_gpu_integration_tests.result }}
           NEEDS_MAXTEXT_POST_TRAINING_CPU_UNIT_TESTS_RESULT: ${{ needs.maxtext_post_training_cpu_unit_tests.result }}
           NEEDS_MAXTEXT_POST_TRAINING_TPU_UNIT_TESTS_RESULT: ${{ needs.maxtext_post_training_tpu_unit_tests.result }}
+          NEEDS_MAXTEXT_ROCM_DECOUPLED_UNIT_TESTS_RESULT: ${{ needs.maxtext_rocm_decoupled_unit_tests.result }}
 
   all_notebooks_passed:
     name: All Notebooks Passed
     needs: [doc_only_check, build_and_upload_maxtext_package, maxtext_jupyter_notebooks]
-    if: always()
+    if: ${{ vars.ROCM_ONLY != 'true' && ((!(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && (always()))) }}
     runs-on: ubuntu-latest
     steps:
       - name: Check notebooks results
@@ -384,7 +414,7 @@ jobs:
 
   notify_failure:
     name: Notify failed build # creates an issue or modifies last open existing issue for failed build
-    needs: [maxtext_jupyter_notebooks, maxtext_cpu_unit_tests, maxtext_tpu_unit_tests, maxtext_tpu_integration_tests, maxtext_tpu_pathways_unit_tests, maxtext_tpu_pathways_integration_tests, maxtext_gpu_unit_tests, maxtext_gpu_integration_tests, maxtext_post_training_cpu_unit_tests, maxtext_post_training_tpu_unit_tests]
+    needs: [maxtext_jupyter_notebooks, maxtext_cpu_unit_tests, maxtext_tpu_unit_tests, maxtext_tpu_integration_tests, maxtext_tpu_pathways_unit_tests, maxtext_tpu_pathways_integration_tests, maxtext_gpu_unit_tests, maxtext_gpu_integration_tests, maxtext_post_training_cpu_unit_tests, maxtext_post_training_tpu_unit_tests, maxtext_rocm_decoupled_unit_tests]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
