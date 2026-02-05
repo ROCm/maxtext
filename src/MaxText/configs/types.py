@@ -561,6 +561,7 @@ class SplashAttention(BaseModel):
       0,
       description="the number of reduction steps. For now, only 3 or all the kv steps are supported.",
   )
+  use_splash_scheduler: bool = Field(False, description="Use experimental splash attention scheduler.")
 
 
 class PagedAttention(BaseModel):
@@ -659,6 +660,13 @@ class MoEKernels(BaseModel):
   )
   wo_tile_drhs_embed_dim: int = Field(1024, description="bwd pass drhs tiling dimension for embedding in GMM for wo.")
   wo_tile_drhs_mlp_dim: int = Field(1024, description="bwd pass drhs tiling dimension for MLP in GMM for wo.")
+
+  wi_tile_fwd_buffer_count: int = Field(2, description="forward pass tiling buffer count in GMM for wi.")
+  wi_tile_dlhs_buffer_count: int = Field(2, description="bwd pass dlhs tiling buffer count in GMM for wi.")
+  wi_tile_drhs_buffer_count: int = Field(2, description="bwd pass drhs tiling buffer count in GMM for wi.")
+  wo_tile_fwd_buffer_count: int = Field(2, description="forward pass tiling buffer count in GMM for wo.")
+  wo_tile_dlhs_buffer_count: int = Field(2, description="bwd pass dlhs tiling buffer count in GMM for wo.")
+  wo_tile_drhs_buffer_count: int = Field(2, description="bwd pass drhs tiling buffer count in GMM for wo.")
 
 
 class DeepSeekMoE(BaseModel):
@@ -1055,6 +1063,10 @@ class Optimizer(BaseModel):
   gradient_accumulation_steps: PositiveInt = Field(
       1, description="Number of steps to accumulate gradients before updating."
   )
+  use_tunix_gradient_accumulation: bool = Field(
+      False,
+      description="Whether to use the Tunix implementation for gradient accumulation.",
+  )
   gradient_clipping_threshold: NonNegativeFloat = Field(
       1.0, description="The threshold for gradient clipping. 0 disables clipping."
   )
@@ -1394,6 +1406,9 @@ class MultimodalGeneral(BaseModel):
   video_path: PathStr = Field("", description="Path to a video for decoding.")
   audio_path: PathStr = Field("", description="Path to an audio file for decoding.")
   use_audio_in_video: bool = Field(False, description="Extract and use audio from video files.")
+  use_mrope: bool = Field(False, description="Enable Multi-dimensional RoPE for Qwen3-Omni models.")
+  mrope_section: list[int] = Field([24, 20, 20], description="Dimensions for temporal, height, width in MRoPE.")
+  position_id_per_seconds: int = Field(25, description="Temporal granularity for MRoPE (tokens per second).")
 
 
 class VisionTower(BaseModel):

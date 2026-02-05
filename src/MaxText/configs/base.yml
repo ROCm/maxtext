@@ -203,6 +203,14 @@ wo_tile_dlhs_mlp_dim: 1024
 wo_tile_drhs_batch_seq: 512
 wo_tile_drhs_embed_dim: 1024
 wo_tile_drhs_mlp_dim: 1024
+
+wi_tile_fwd_buffer_count: 2
+wi_tile_dlhs_buffer_count: 2
+wi_tile_drhs_buffer_count: 2
+wo_tile_fwd_buffer_count: 2
+wo_tile_dlhs_buffer_count: 2
+wo_tile_drhs_buffer_count: 2
+
 norm_topk_prob: false # boolean to enable the top-k probability normalization. qwen3-specific normalization of router weights.
 
 # how the expert axis is used to shard attention weights and activations
@@ -455,6 +463,7 @@ logical_axis_rules: [
                       ["kv_lora_up_proj",[]],
                       ['norm', ['tensor', 'tensor_transpose']],
                       ['layers', 'stage'],
+                      ['qkv', []],
                       ['kv', []],
                       ['kv_head_dim', []],
                       ['cache_batch_prefill', []],
@@ -908,6 +917,7 @@ use_max_logit_estimate: -1 # -1 means no estimate, any > 0 value will be used as
 cost_estimate_flops_fwd: -1 # -1 means using splash default cost estmiation, any >= 0 value will be used as cost estmiation for splash to overlap for communication (forward)
 cost_estimate_flops_bwd: -1 # -1 means using splash default cost estmiation, any >= 0 value will be used as cost estmiation for splash to overlap for communication (backward)
 dq_reduction_steps: 0 #the number of reduction steps. For now, only 3 or all the kv steps are supported.
+use_splash_scheduler: False # to use tokamax splash attention scheduler.
 ### Determine if we want to use load balance for context parallelism
 context_parallel_load_balance: True
 context_parallel_strategy: "all_gather" # "all_gather" or "ring"
@@ -1012,6 +1022,10 @@ output_dim_for_audio: 512
 num_conv_layers_for_audio: 3
 max_timescale_for_audio: 10000.0
 max_sample_len_for_audio: 10000
+
+use_mrope: false
+mrope_section: [24, 20, 20]
+position_id_per_seconds: 25
 
 # Subslice shape in the form of "x,y,z" when using pathways (single controller). 
 # Example: "8,8" to use a 8x8 subgrid (64 chips) of a full pod (16x16) of trillium.
