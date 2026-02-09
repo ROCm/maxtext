@@ -18,6 +18,7 @@ import unittest
 import pytest
 import jax
 
+from jax._src import test_util as jtu
 from absl.testing import absltest
 from maxtext.common.gcloud_stub import is_decoupled
 from maxtext.trainers.pre_train.train import main as train_main
