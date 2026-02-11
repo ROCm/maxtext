@@ -21,8 +21,7 @@ on:
   workflow_call:
   workflow_dispatch:
   schedule:
-    # Run the job every 4 hours
-    - cron:  '0 */4 * * *'
+    - cron: '0 4 * * *'  # Daily 04:00 UTC
 
 concurrency:
   # Dedup pull requests (canceling previous runs of the same workflow for same PR), and scheduled runs but nothing else
