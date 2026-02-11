@@ -21,42 +21,22 @@ import math
 import os
 import unittest
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
-import numpy as np
-import torch
-import torch.nn.functional as F
-from flax import nnx
 from jax.sharding import Mesh
-
-# Vision encoder imports from transformers
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoderConfig,
-    Qwen3OmniMoeVisionEncoderConfig,
-)
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioAttention as TorchQwen3OmniMoeAudioAttention,
-    Qwen3OmniMoeAudioEncoder as TorchQwen3OmniMoeAudioEncoder,
-    Qwen3OmniMoeAudioEncoderLayer as TorchQwen3OmniMoeAudioEncoderLayer,
-    Qwen3OmniMoeVisionEncoder as TorchQwen3OmniMoeVisionEncoder,
-    Qwen3OmniMoeVisionMLP as TorchQwen3OmniMoeVisionMLP,
-    Qwen3OmniMoeVisionPatchEmbed as TorchQwen3OmniMoeVisionPatchEmbed,
-    Qwen3OmniMoeVisionPatchMerger as TorchQwen3OmniMoeVisionPatchMerger,
-    SinusoidsPositionEmbedding as TorchSinusoidsPositionEmbedding,
-    apply_rotary_pos_emb_vision,
-)
-
 from MaxText import common_types
+from MaxText import maxengine
 from MaxText import pyconfig
 from MaxText.globals import MAXTEXT_REPO_ROOT
-from MaxText.layers.attentions import Attention
-from MaxText.layers.embeddings import (
+from maxtext.layers.attentions import Attention
+from maxtext.layers.embeddings import (
     PositionalEmbedding,
     Qwen3OmniMoeVisionPosEmbedInterpolate as JaxQwen3OmniMoeVisionPosEmbedInterpolate,
     Qwen3OmniMoeVisionRotaryEmbedding as JaxQwen3OmniMoeVisionRotaryEmbedding,
 )
-from MaxText.layers.encoders import AudioEncoder
-from MaxText.layers.qwen3 import (
+from maxtext.layers.encoders import AudioEncoder
+from maxtext.models.qwen3 import (
     Qwen3OmniAudioEncoder,
     Qwen3OmniAudioEncoderLayer,
     Qwen3OmniMoeVisionAttention as JaxQwen3OmniMoeVisionAttention,
@@ -80,6 +60,25 @@ from tests.utils.multimodal_test_utils import (
     create_block_diagonal_attention_mask,
     create_random_jax_torch,
     split_into_patches,
+)
+import numpy as np
+import torch
+import torch.nn.functional as F
+# Vision encoder imports from transformers
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoderConfig,
+    Qwen3OmniMoeVisionEncoderConfig,
+)
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioAttention as TorchQwen3OmniMoeAudioAttention,
+    Qwen3OmniMoeAudioEncoderLayer as TorchQwen3OmniMoeAudioEncoderLayer,
+    Qwen3OmniMoeAudioEncoder as TorchQwen3OmniMoeAudioEncoder,
+    Qwen3OmniMoeVisionEncoder as TorchQwen3OmniMoeVisionEncoder,
+    Qwen3OmniMoeVisionMLP as TorchQwen3OmniMoeVisionMLP,
+    Qwen3OmniMoeVisionPatchEmbed as TorchQwen3OmniMoeVisionPatchEmbed,
+    Qwen3OmniMoeVisionPatchMerger as TorchQwen3OmniMoeVisionPatchMerger,
+    SinusoidsPositionEmbedding as TorchSinusoidsPositionEmbedding,
+    apply_rotary_pos_emb_vision,
 )
 
 # Initialize config once for all tests
@@ -587,18 +586,40 @@ class TestQwen3OmniPreprocessing(unittest.TestCase):
     self.base_config_path = os.path.join(MAXTEXT_REPO_ROOT, "src", "maxtext", "configs", "base.yml")
     self.image_path = os.path.join(MAXTEXT_REPO_ROOT, "tests", "assets", "test_image.jpg")
     self.video_path = os.path.join(MAXTEXT_REPO_ROOT, "tests", "assets", "test_video.mp4")
+    self.prompt = "What can you see and hear? Answer in one short sentence."
     self.maxtext_config = pyconfig.initialize(
         ["", self.base_config_path],
         model_name="qwen3-omni-30b-a3b",
+        tokenizer_type="huggingface",
+        tokenizer_path="Qwen/Qwen3-Omni-30B-A3B-Instruct",
         use_multimodal=True,
         image_path=self.image_path,
         video_path=self.video_path,
         use_audio_in_video=True,
+        max_prefill_predict_length=2048,
     )
 
   def test_preprocess_mm_data(self):
     # MaxText preprocessor
     mt_processor_outputs = mm_processor.preprocess_mm_data(self.maxtext_config)
+    mt_prompt = mm_processor.reformat_prompt(
+        prompt=self.prompt,
+        image_placeholder=self.maxtext_config.image_placeholder,
+        video_placeholder=self.maxtext_config.video_placeholder,
+        model_name=self.maxtext_config.model_name,
+        num_images=mt_processor_outputs.num_images,
+        num_videos=mt_processor_outputs.num_videos,
+    )
+
+    engine = maxengine.MaxEngine(self.maxtext_config)
+    metadata = engine.get_tokenizer()
+    tokenizer_model = engine.build_tokenizer(metadata)
+    mt_input_ids, _ = tokenizer_model.encode(
+        mt_prompt, is_bos=False, prefill_lengths=[self.maxtext_config.max_prefill_predict_length]
+    )
+    mt_input_ids = mm_processor.prepare_text_for_image_fusion(
+        mt_input_ids, config=self.maxtext_config, processor_output=mt_processor_outputs
+    )
 
     # HuggingFace preprocessor
     from transformers import Qwen3OmniMoeProcessor  # pylint: disable=import-outside-toplevel
@@ -612,15 +633,15 @@ class TestQwen3OmniPreprocessing(unittest.TestCase):
             "content": [
                 {"type": "image", "image": self.image_path},
                 {"type": "video", "video": self.video_path},
-                {"type": "text", "text": "What can you see and hear? Answer in one short sentence."},
+                {"type": "text", "text": self.prompt},
             ],
         },
     ]
     USE_AUDIO_IN_VIDEO = True
-    text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+    hf_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
     audios, images, videos = process_mm_info(conversation, use_audio_in_video=USE_AUDIO_IN_VIDEO)
     hf_processor_outputs = processor(
-        text=text,
+        text=hf_prompt,
         audio=audios,
         images=images,
         videos=videos,
@@ -628,9 +649,15 @@ class TestQwen3OmniPreprocessing(unittest.TestCase):
         padding=True,
         use_audio_in_video=USE_AUDIO_IN_VIDEO,
     )
+    hf_input_ids = np.array(hf_processor_outputs["input_ids"][0, :]).astype(np.float32)
 
     # Add assertions to check the output
     self.assertIsNotNone(mt_processor_outputs)
+    # Check the formatted prompts are the same
+    self.assertEqual(mt_prompt, hf_prompt, "Formatted prompts should match")
+    # Check the tokenized IDs are the same (with multimodal paddings)
+    assert np.array_equal(mt_input_ids[: hf_input_ids.shape[0]], hf_input_ids)
+    # Check the image/video/audio values are close (allow some tolerance due to preprocessing differences)
     assert np.allclose(
         mt_processor_outputs.pixel_values,
         np.array(hf_processor_outputs["pixel_values"]).astype(np.float32),
