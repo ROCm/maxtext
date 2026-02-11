@@ -148,3 +148,8 @@ dmypy.json
 # Gemini CLI
 .gemini/
 gha-creds-*.json
+
+device_info.json
+events.out.tfevents*
+log/*
+.rocprofv3/*
