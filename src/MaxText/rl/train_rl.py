@@ -23,7 +23,7 @@ GSM8K math reasoning benchmark. The script is also flexible enough to run Group 
 Usage Examples:
 
 # GRPO on Llama3.1-8B-Instruct
-python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
+python3 -m src.MaxText.rl.train_rl src/maxtext/configs/post_train/rl.yml \
   model_name=llama3.1-8b \
   tokenizer_path=meta-llama/Llama-3.1-8B-Instruct \
   load_parameters_path=gs://path/to/checkpoint/0/items \
@@ -32,7 +32,7 @@ python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
   hf_access_token=$HF_TOKEN
 
 # GSPO on Llama3.1-70B-Instruct
-python3 -m src.MaxText.rl.train_rl src/MaxText/configs/rl.yml \
+python3 -m src.MaxText.rl.train_rl src/maxtext/configs/post_train/rl.yml \
   model_name=llama3.1-70b \
   tokenizer_path=meta-llama/Llama-3.1-70B-Instruct \
   load_parameters_path=gs://path/to/checkpoint/0/items \
@@ -358,10 +358,18 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
     )
 
   # TODO: @mazumdera: change this to use lora
-  # TODO: @xfgu: instead of restoring a second time from GCS, can we just copy reference_model
-  # Load policy model
-  max_logging.log("Creating policy model with same config as reference model on trainer mesh")
-  actor_model, actor_mesh = get_maxtext_model(trainer_config, trainer_devices)
+  if trainer_config.load_checkpoint_only_once:
+    max_logging.log("Creating policy model by copying reference model instead of restoring from checkpoint again.")
+    with reference_mesh:
+      actor_base_model = nnx.clone(reference_model.base)
+      use_no_op_mappings = "maxtext_config" in trainer_config.vllm_additional_config
+      actor_model = TunixMaxTextAdapter(base_model=actor_base_model, use_no_op_mappings=use_no_op_mappings)
+      actor_model.config = None
+    actor_mesh = reference_mesh
+  else:
+    max_logging.log("Creating policy model with same config as reference model on trainer mesh")
+    actor_model, actor_mesh = get_maxtext_model(trainer_config, trainer_devices)
+
 
   if trainer_config.debug.rl:
     max_logging.log("Policy Model initialized successfully")
@@ -487,8 +495,8 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
           "enable_tunix_perf_metrics is True but tunix.perf modules are not available, skipping Tunix-managed metrics."
       )
 
-  pkg_dir = os.environ.get("MAXTEXT_PKG_DIR", MAXTEXT_PKG_DIR)
-  vllm_config_path = epath.Path(pkg_dir) / "configs" / "vllm.yml"
+  configs_dir = os.environ.get("MAXTEXT_CONFIGS_DIR", os.path.join(MAXTEXT_PKG_DIR, "configs"))
+  vllm_config_path = epath.Path(configs_dir) / "vllm.yml"
   argv_list = ["", str(vllm_config_path), "log_config=False"]
   vllm_config = pyconfig.initialize(argv_list)
 
@@ -530,10 +538,22 @@ def rl_train(trainer_config, sampler_config, trainer_devices, sampler_devices):
 
   # Start training
 
+  if trainer_config.load_checkpoint_only_once:
+    max_logging.log("Capturing reference model state before training.")
+    ref_state_before = nnx.to_pure_dict(nnx.state(reference_model.base, nnx.Param))
+
   max_logging.warning("Starting RL training...")
 
   with reference_mesh, nn_partitioning.axis_rules(trainer_config.logical_axis_rules):
     rl_trainer.train(train_dataset)
+
+  if trainer_config.load_checkpoint_only_once:
+    max_logging.log("Checking if reference model state changed during training.")
+    ref_state_after = nnx.to_pure_dict(nnx.state(reference_model.base, nnx.Param))
+    check = jax.tree_util.tree_map(jax.numpy.array_equal, ref_state_before, ref_state_after)
+    if not jax.tree_util.tree_all(check):
+      raise ValueError("Reference model parameters changed during training!")
+    max_logging.log("Reference model parameters verified to be unchanged during training.")
 
   max_logging.warning("RL Training Completed Successfully!")
 

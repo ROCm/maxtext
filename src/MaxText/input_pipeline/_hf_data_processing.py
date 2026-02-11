@@ -18,8 +18,6 @@ import ml_collections
 
 import jax
 
-import datasets
-
 import transformers
 
 import grain.python as grain
@@ -61,8 +59,16 @@ def vision_sft_preprocessing_pipeline(
   else:
     batch_size = global_batch_size // jax.process_count()
 
-  if config.enable_data_shuffling:
+  # for multi-epoch with shuffle, shuffle each epoch with different seeds then concat
+  import datasets  # pylint: disable=import-outside-toplevel
+
+  if config.enable_data_shuffling and config.num_epoch > 1:
+    epoch_datasets = [dataset.shuffle(seed=config.data_shuffle_seed + i) for i in range(config.num_epoch)]
+    dataset = datasets.concatenate_datasets(epoch_datasets)
+  elif config.enable_data_shuffling:
     dataset = dataset.shuffle(seed=config.data_shuffle_seed)
+  elif config.num_epoch > 1:
+    dataset = dataset.repeat(config.num_epoch)
 
   # If multiple image columns are provided, merge them into a single 'images' column.
   if isinstance(image_column, list):
@@ -206,8 +212,10 @@ def preprocessing_pipeline(
     sft_train_on_completion_only=True,
     grain_worker_count=1,  # only support 0 or 1
     max_segments_per_seq=None,
+    num_epoch=1,
 ):
   """pipeline for preprocessing HF dataset"""
+  import datasets  # pylint: disable=import-outside-toplevel
 
   assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible by number of global devices."
   # Tunix GA requires per-micro-batch slicing at the data level,
@@ -217,8 +225,14 @@ def preprocessing_pipeline(
   else:
     batch_size = global_batch_size // jax.process_count()
 
-  if shuffle:
+  # for multi-epoch with shuffle, shuffle each epoch with different seeds then concat
+  if shuffle and num_epoch > 1:
+    epoch_datasets = [dataset.shuffle(seed=data_shuffle_seed + i) for i in range(num_epoch)]
+    dataset = datasets.concatenate_datasets(epoch_datasets)
+  elif shuffle:
     dataset = dataset.shuffle(seed=data_shuffle_seed)
+  elif num_epoch > 1:
+    dataset = dataset.repeat(num_epoch)
 
   tokenizer = transformers.AutoTokenizer.from_pretrained(
       tokenizer_path,
@@ -364,6 +378,8 @@ def make_hf_train_iterator(
     process_indices_train,
 ):
   """Load, preprocess dataset and return iterators"""
+  import datasets  # pylint: disable=import-outside-toplevel
+
   train_ds = datasets.load_dataset(
       config.hf_path,
       name=config.hf_name,
@@ -409,6 +425,7 @@ def make_hf_train_iterator(
         sft_train_on_completion_only=config.sft_train_on_completion_only,
         chat_template_path=config.chat_template_path,
         max_segments_per_seq=config.max_segments_per_seq,
+        num_epoch=config.num_epoch,
     )
   return train_iter
 
@@ -419,6 +436,8 @@ def make_hf_eval_iterator(
     process_indices_eval,
 ):
   """Make Hugging Face evaluation iterator. Load and preprocess eval dataset: and return iterator."""
+  import datasets  # pylint: disable=import-outside-toplevel
+
   eval_ds = datasets.load_dataset(
       config.hf_path,
       name=config.hf_name,
