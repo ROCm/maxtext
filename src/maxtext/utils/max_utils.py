@@ -249,10 +249,10 @@ def initialize_jax_for_gpu(raw_keys):
     coordinator_ip = str(os.getenv("JAX_COORDINATOR_IP"))
     coordinator_port = str(os.getenv("JAX_COORDINATOR_PORT"))
     devices = os.getenv("CUDA_VISIBLE_DEVICES")
-    if (devices is not None):
+    if devices is not None:
       try:
         devices = [int(x) for x in devices.split(",")]
-      except Exception as e:
+      except (ValueError, TypeError) as e:
         max_logging.log(f"Error parsing CUDA_VISIBLE_DEVICES: {e}")
         devices = None
 

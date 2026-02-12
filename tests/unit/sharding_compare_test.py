@@ -22,7 +22,6 @@ import jax
 import jax.numpy as jnp
 # import optax
 
-from MaxText.globals import MAXTEXT_PKG_DIR
 from MaxText.train_compile import get_shaped_inputs, get_topology_mesh, validate_config
 from MaxText import pyconfig
 from MaxText import maxtext_utils
@@ -31,6 +30,7 @@ from MaxText.layers import quantizations
 from MaxText import optimizers
 
 from tests.utils.sharding_dump import load_json, TEST_CASES, named_shardings_to_json, partition_specs_to_json
+from tests.utils.test_helpers import get_test_config_path
 
 Transformer = models.transformer_as_linen
 
@@ -118,7 +118,7 @@ def test_sharding_dump_for_model(model_name: str, topology: str, num_slice: str)
   """
   params = [
       "/deps/MaxText/tests/unit/sharding_compare_test",
-      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      get_test_config_path(),
       f"compile_topology={topology}",
       f"compile_topology_num_slices={num_slice}",
       f"model_name={model_name}",
@@ -184,7 +184,7 @@ def abstract_state_and_shardings(request):
   print(f"Testing model: {model_name}, topology: {topology}, num_slices: {num_slice}", flush=True)
   params = [
       "/deps/MaxText/tests/unit/sharding_compare_test",
-      os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+      get_test_config_path(),
       f"compile_topology={topology}",
       f"compile_topology_num_slices={num_slice}",
       f"model_name={model_name}",
