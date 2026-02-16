@@ -14,6 +14,9 @@
 
 """Create an Orbax CheckpointManager with specified (Async or not) Checkpointer."""
 
+import base64
+import ctypes
+import gc
 import time
 from typing import Any, Optional
 
@@ -32,9 +35,10 @@ from orbax.checkpoint import v1 as ocp_v1
 from orbax.checkpoint._src.arrays import sharding as sharding_utils
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
 import orbax.checkpoint.experimental.emergency.replicator_checkpoint_manager as emergency_replicator_checkpoint_manager
-# pylint: disable=too-many-positional-arguments
+import orbax.checkpoint._src.multihost.multislice as _orbax_multislice
 import dataclasses
 import json
+# pylint: disable=too-many-positional-arguments
 
 import grain
 from grain.python import PyGrainCheckpointHandler
@@ -47,6 +51,7 @@ EmergencyCheckpointManager = emergency_checkpoint_manager.CheckpointManager
 LocalCheckpointOptions = emergency_checkpoint_manager.LocalCheckpointOptions
 PersistentCheckpointOptions = emergency_checkpoint_manager.PersistentCheckpointOptions
 EmergencyReplicatorCheckpointManager = emergency_replicator_checkpoint_manager.ReplicatorCheckpointManager
+_original_broadcast_one_replica_to_all = _orbax_multislice.broadcast_one_replica_to_all
 
 
 class GrainCheckpointHandler(PyGrainCheckpointHandler, ocp.CheckpointHandler):
@@ -332,6 +337,363 @@ def print_save_message(step, async_checkpointing):
     max_logging.log(f"Saved a checkpoint at step {step}.")
 
 
+# ── Custom broadcast (avoids RCCL communicator leak) ────────────────────────
+#
+# Orbax's broadcast_one_replica_to_all creates RCCL communicators cached in
+# XLA's GPU clique system with persistent proxy threads that cannot be released
+# from Python, degrading training TGS.
+#
+# PRIMARY: Direct RCCL via ctypes (ncclCommInitRank / ncclBroadcast /
+#   ncclCommDestroy + gc.collect()).  Uses the RDMA backend network; no CPU
+#   copies.  Communicators are destroyed and Python references cleared
+#   immediately so proxy threads do not survive into the training loop.
+# FALLBACK: Orbax default broadcast (leaks threads but is correct/portable).
+# ────────────────────────────────────────────────────────────────────────────
+
+_NCCL_UNIQUE_ID_BYTES = 128
+_NCCL_INT8 = 0  # ncclInt8: treat all data as raw bytes
+_BROADCAST_BARRIER_TIMEOUT_MS = 1_800_000  # 30 min
+
+
+class _NcclUniqueId(ctypes.Structure):
+  # c_ubyte (not c_char) avoids null-terminated string semantics: bytes()
+  # returns all 128 bytes and ctypes.memmove targets the struct's memory.
+  _fields_ = [("internal", ctypes.c_ubyte * _NCCL_UNIQUE_ID_BYTES)]
+
+
+class _NativeLibsNotFoundError(RuntimeError):
+  """Raised when RCCL/NCCL or HIP/CUDA runtime libraries are unavailable."""
+
+
+# Lazy-loaded native library handles (populated by _get_native_libs).
+_cached_nccl_lib = None
+_cached_gpu_rt_ops = None  # (set_device, stream_create, stream_sync, stream_destroy)
+
+
+def _load_shared_lib(candidates):
+  """Try loading the first available shared library from *candidates*."""
+  for name in candidates:
+    try:
+      return ctypes.CDLL(name)
+    except OSError:
+      continue
+  return None
+
+
+def _setup_nccl_bindings(lib):
+  """Set argtypes/restype for the NCCL/RCCL functions we call."""
+  lib.ncclGetUniqueId.restype = ctypes.c_int
+  lib.ncclGetUniqueId.argtypes = [ctypes.POINTER(_NcclUniqueId)]
+
+  lib.ncclCommInitRank.restype = ctypes.c_int
+  lib.ncclCommInitRank.argtypes = [
+      ctypes.POINTER(ctypes.c_void_p),  # ncclComm_t* comm
+      ctypes.c_int,                      # int nranks
+      _NcclUniqueId,                     # ncclUniqueId commId (by value)
+      ctypes.c_int,                      # int rank
+  ]
+
+  lib.ncclBroadcast.restype = ctypes.c_int
+  lib.ncclBroadcast.argtypes = [
+      ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+      ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+  ]
+
+  for fn_name in ("ncclGroupStart", "ncclGroupEnd"):
+    fn = getattr(lib, fn_name)
+    fn.restype = ctypes.c_int
+    fn.argtypes = []
+
+  lib.ncclCommDestroy.restype = ctypes.c_int
+  lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
+
+
+def _setup_gpu_runtime_bindings(lib):
+  """Set up ctypes bindings for device/stream ops (HIP or CUDA)."""
+  prefix = "hip" if hasattr(lib, "hipSetDevice") else "cuda"
+  set_device = getattr(lib, f"{prefix}SetDevice")
+  stream_create = getattr(lib, f"{prefix}StreamCreate")
+  stream_sync = getattr(lib, f"{prefix}StreamSynchronize")
+  stream_destroy = getattr(lib, f"{prefix}StreamDestroy")
+
+  set_device.restype = ctypes.c_int
+  set_device.argtypes = [ctypes.c_int]
+  stream_create.restype = ctypes.c_int
+  stream_create.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+  stream_sync.restype = ctypes.c_int
+  stream_sync.argtypes = [ctypes.c_void_p]
+  stream_destroy.restype = ctypes.c_int
+  stream_destroy.argtypes = [ctypes.c_void_p]
+
+  return set_device, stream_create, stream_sync, stream_destroy
+
+
+def _get_native_libs():
+  """Load and configure NCCL + GPU runtime libs (cached after first call).
+
+  Raises:
+    _NativeLibsNotFoundError: if either library is unavailable.
+  """
+  global _cached_nccl_lib, _cached_gpu_rt_ops
+  if _cached_nccl_lib is not None:
+    return _cached_nccl_lib, _cached_gpu_rt_ops
+
+  nccl = _load_shared_lib(("librccl.so.1", "librccl.so",
+                            "libnccl.so.2", "libnccl.so"))
+  gpu_rt = _load_shared_lib(("libamdhip64.so", "libcudart.so"))
+  if nccl is None or gpu_rt is None:
+    raise _NativeLibsNotFoundError(
+        "RCCL/NCCL or HIP/CUDA runtime not found; cannot use direct broadcast")
+
+  _setup_nccl_bindings(nccl)
+  _cached_gpu_rt_ops = _setup_gpu_runtime_bindings(gpu_rt)
+  _cached_nccl_lib = nccl
+  return nccl, _cached_gpu_rt_ops
+
+
+def _gpu_check(ret, msg="GPU operation"):
+  """Raise RuntimeError if an NCCL/HIP/CUDA call returns a non-zero code."""
+  if ret != 0:
+    raise RuntimeError(f"{msg} failed with error code {ret}")
+
+
+def _build_rccl_group_mapping(global_mesh, replica_axis_index):
+  """Compute per-GPU replica ranks and group IDs for NCCL communicators.
+
+  Each local GPU is assigned:
+    - **replica_rank**: its position along the replica axis (0 = source).
+    - **group_id**: the device ID of the corresponding source-replica GPU,
+      used as a unique key for the NCCL communicator group.
+
+  Returns:
+    (dp, num_local, local_ranks, source_dev_ids)
+  """
+  devices = global_mesh.devices
+  dp = devices.shape[replica_axis_index]
+
+  dev_to_pos = {}
+  for idx, dev in np.ndenumerate(devices):
+    dev_to_pos[dev.id] = idx
+
+  local_devs = sorted(jax.local_devices(), key=lambda d: d.id)
+  num_local = len(local_devs)
+
+  local_ranks = []
+  source_dev_ids = []
+  for dev in local_devs:
+    pos = dev_to_pos[dev.id]
+    local_ranks.append(pos[replica_axis_index])
+    source_pos = list(pos)
+    source_pos[replica_axis_index] = 0
+    source_dev_ids.append(devices[tuple(source_pos)].id)
+
+  return dp, num_local, local_ranks, source_dev_ids
+
+
+def _rewrap_as_global_arrays(in_tree, global_mesh):
+  """Re-wrap JAX arrays with global NamedSharding after in-place broadcast."""
+  out = []
+  for arr in in_tree:
+    sharding = jax.sharding.NamedSharding(global_mesh, arr.sharding.spec)
+    bufs = [s.data for s in sorted(
+        arr.addressable_shards, key=lambda s: s.device.id)]
+    out.append(jax.make_array_from_single_device_arrays(
+        arr.shape, sharding, bufs))
+  return out
+
+
+def _rccl_broadcast_one_replica_to_all(
+    in_tree,
+    global_mesh,
+    replica_axis_index,
+    is_source,
+    memory_limit_bytes=None,
+    memory_scaling_factor=0.75,
+):
+  """Broadcast via direct RCCL/NCCL calls on the backend RDMA network.
+
+  Creates temporary NCCL communicators, broadcasts GPU data in-place (no CPU
+  copies), then destroys the communicators so proxy threads are cleaned up.
+
+  Raises:
+    _NativeLibsNotFoundError: if RCCL/HIP libraries are unavailable.
+  """
+  del memory_limit_bytes, memory_scaling_factor  # match Orbax API signature
+  from jax._src import distributed as _jax_distributed
+
+  tree_len = len(in_tree)
+  if tree_len == 0:
+    return (), 0
+
+  pid = jax.process_index()
+  client = _jax_distributed.global_state.client
+  kv_prefix = "maxtext_rccl_bcast"
+
+  libnccl, (set_device, stream_create, stream_sync, stream_destroy) = (
+      _get_native_libs())
+
+  dp, num_local, local_ranks, source_dev_ids = _build_rccl_group_mapping(
+      global_mesh, replica_axis_index)
+
+  # ---- exchange NCCL unique IDs via JAX coordinator -------------------------
+  uids = []
+  if is_source:
+    for g in range(num_local):
+      uid = _NcclUniqueId()
+      _gpu_check(libnccl.ncclGetUniqueId(ctypes.byref(uid)),
+                  "ncclGetUniqueId")
+      client.key_value_set(
+          f"{kv_prefix}/uid/{source_dev_ids[g]}",
+          base64.b64encode(bytes(uid.internal)).decode("ascii"))
+      uids.append(uid)
+
+  client.wait_at_barrier(f"{kv_prefix}/uids_published",
+                         _BROADCAST_BARRIER_TIMEOUT_MS)
+
+  if not is_source:
+    for g in range(num_local):
+      uid_b64 = client.blocking_key_value_get(
+          f"{kv_prefix}/uid/{source_dev_ids[g]}",
+          _BROADCAST_BARRIER_TIMEOUT_MS)
+      uid = _NcclUniqueId()
+      ctypes.memmove(uid.internal, base64.b64decode(uid_b64),
+                      _NCCL_UNIQUE_ID_BYTES)
+      uids.append(uid)
+
+  max_logging.log(
+      f"RCCL broadcast: host {pid} creating {num_local} communicators "
+      f"(dp={dp}, replica_rank={local_ranks[0]})")
+
+  # ---- create communicators, broadcast, then guarantee cleanup --------------
+  comms = []
+  streams = []
+  try:
+    # Create NCCL communicators (one per local GPU).
+    _gpu_check(libnccl.ncclGroupStart(), "ncclGroupStart (init)")
+    for g in range(num_local):
+      comm = ctypes.c_void_p()
+      set_device(g)
+      _gpu_check(
+          libnccl.ncclCommInitRank(
+              ctypes.byref(comm), dp, uids[g], local_ranks[g]),
+          f"ncclCommInitRank GPU {g}")
+      comms.append(comm)
+    _gpu_check(libnccl.ncclGroupEnd(), "ncclGroupEnd (init)")
+
+    # Create GPU streams.
+    for g in range(num_local):
+      stream = ctypes.c_void_p()
+      set_device(g)
+      _gpu_check(stream_create(ctypes.byref(stream)),
+                 f"stream create GPU {g}")
+      streams.append(stream)
+
+    # Broadcast all parameters in-place.
+    t0 = time.monotonic()
+    total_bytes = 0
+
+    _gpu_check(libnccl.ncclGroupStart(), "ncclGroupStart (broadcast)")
+    for param_idx, arr in enumerate(in_tree):
+      for g, shard in enumerate(
+          sorted(arr.addressable_shards, key=lambda s: s.device.id)):
+        ptr = shard.data.unsafe_buffer_pointer()
+        nbytes = shard.data.nbytes
+        set_device(g)
+        _gpu_check(
+            libnccl.ncclBroadcast(
+                ctypes.c_void_p(ptr), ctypes.c_void_p(ptr),
+                nbytes, _NCCL_INT8, 0, comms[g], streams[g]),
+            f"ncclBroadcast param {param_idx} GPU {g}")
+        total_bytes += nbytes
+    _gpu_check(libnccl.ncclGroupEnd(), "ncclGroupEnd (broadcast)")
+
+    # Synchronize streams.
+    for g in range(num_local):
+      set_device(g)
+      _gpu_check(stream_sync(streams[g]), f"stream sync GPU {g}")
+
+    elapsed = time.monotonic() - t0
+    throughput = total_bytes / elapsed / 1e9 if elapsed > 0 else 0
+    max_logging.log(
+        f"RCCL broadcast: host {pid} transferred {total_bytes / 1e9:.2f} GB "
+        f"across {tree_len} params in {elapsed:.1f}s ({throughput:.2f} GB/s)")
+
+  finally:
+    # Destroy communicators and streams at the C level, then drop all Python
+    # references and force GC.  Without gc.collect(), ctypes c_void_p handles
+    # and internal JAX/XLA references can prevent RCCL proxy threads from
+    # being torn down until the next non-deterministic GC cycle.
+    for comm in comms:
+      libnccl.ncclCommDestroy(comm)
+    for g, stream in enumerate(streams):
+      set_device(g)
+      stream_destroy(stream)
+    comms.clear()
+    streams.clear()
+    if num_local:
+      gc.collect()
+      max_logging.log(
+          f"RCCL broadcast: host {pid} destroyed {num_local} communicators "
+          "and ran gc.collect()")
+
+  # ---- re-wrap arrays with global sharding ----------------------------------
+  out_tree = _rewrap_as_global_arrays(in_tree, global_mesh)
+
+  # ---- barrier & KV cleanup -------------------------------------------------
+  client.wait_at_barrier(f"{kv_prefix}/done", _BROADCAST_BARRIER_TIMEOUT_MS)
+  if is_source:
+    for g in range(num_local):
+      try:
+        client.key_value_delete(f"{kv_prefix}/uid/{source_dev_ids[g]}")
+      except Exception:
+        pass
+  max_logging.log(f"RCCL broadcast: host {pid} complete")
+
+  return tuple(out_tree), 1
+
+
+def _custom_broadcast_one_replica_to_all(
+    in_tree, global_mesh, replica_axis_index, is_source,
+    memory_limit_bytes=None, memory_scaling_factor=0.75,
+):
+  """Dispatch to direct RCCL broadcast, falling back to Orbax if unavailable.
+
+  The Orbax fallback uses JAX/XLA's clique-cached RCCL communicators which
+  leak persistent proxy threads (degrading training TGS), but it is correct
+  and portable.
+  """
+  try:
+    return _rccl_broadcast_one_replica_to_all(
+        in_tree, global_mesh, replica_axis_index, is_source,
+        memory_limit_bytes, memory_scaling_factor)
+  except _NativeLibsNotFoundError as e:
+    max_logging.log(
+        f"RCCL direct broadcast unavailable ({e}), "
+        "falling back to Orbax default broadcast")
+    return _original_broadcast_one_replica_to_all(
+        in_tree, global_mesh, replica_axis_index, is_source,
+        memory_limit_bytes, memory_scaling_factor)
+
+
+def _install_custom_broadcast():
+  """Monkeypatch orbax to use direct RCCL broadcast (Orbax fallback)."""
+  max_logging.log(
+      "Installing custom broadcast (RCCL direct with Orbax fallback) "
+      "to avoid RCCL communicator leak")
+  _orbax_multislice.broadcast_one_replica_to_all = (
+      _custom_broadcast_one_replica_to_all)
+
+
+def _uninstall_custom_broadcast():
+  """Restore orbax's original broadcast function."""
+  _orbax_multislice.broadcast_one_replica_to_all = (
+      _original_broadcast_one_replica_to_all)
+  max_logging.log("Restored original orbax broadcast_one_replica_to_all")
+
+
+# ── End custom broadcast ────────────────────────────────────────────────────
+
+
 def _find_idx(array: np.ndarray, replica_axis_idx: int):
   """Returns the index along given dimension that the current host belongs to."""
   idx = None
@@ -480,7 +842,7 @@ def load_state_if_possible(
       manager, load full state from a full state checkpoint at this path.
     abstract_unboxed_pre_state: an unboxed, abstract TrainState that Orbax
       matches type against.
-    enable_single_replica_ckpt_restoring: bool flag for restoring checkpoitn
+    enable_single_replica_ckpt_restoring: bool flag for restoring checkpoint
       with SingleReplicaArrayHandler
     checkpoint_storage_concurrent_gb: concurrent GB for checkpoint byte I/O.
     enable_orbax_v1: bool flag for enabling Orbax v1.
@@ -532,68 +894,65 @@ def load_state_if_possible(
             dtype=data.dtype,
         )
 
-      # Cache the original ArrayHandler before potentially overriding it.
-      original_array_handler = ocp.type_handlers.get_type_handler(jax.Array)
-
       if _sr_effective:
+        # Cache the original ArrayHandler so we can restore it after the
+        # single-replica restore completes (see finally block below).
+        original_array_handler = ocp.type_handlers.get_type_handler(jax.Array)
         single_replica_handler = ocp.type_handlers.SingleReplicaArrayHandler(
             replica_axis_index=0,
             broadcast_memory_limit_bytes=1024 * 1024 * 1000,  # 1000 MB limit
         )
-        ocp.type_handlers.register_type_handler(jax.Array, single_replica_handler, override=True)
+        ocp.type_handlers.register_type_handler(
+            jax.Array, single_replica_handler, override=True)
+
+        # Monkeypatch orbax to use direct RCCL broadcast with explicit
+        # communicator destroy + gc.collect() (falls back to Orbax default if
+        # RCCL ctypes unavailable).  The default orbax broadcast creates RCCL
+        # communicators via JAX/XLA that are cached with persistent proxy
+        # threads, degrading training TGS.
+        _install_custom_broadcast()
 
       restore_args = jax.tree_util.tree_map(map_to_pspec, abstract_unboxed_pre_state)
-      checkpoint_args = ocp.args.PyTreeRestore(item=abstract_unboxed_pre_state, restore_args=restore_args)
+      checkpoint_args = ocp.args.PyTreeRestore(
+          item=abstract_unboxed_pre_state, restore_args=restore_args)
 
-      def _restore_original_array_handler():
-        """Restore the original ArrayHandler after SingleReplicaArrayHandler restore.
-
-        This is critical because SingleReplicaArrayHandler is designed for restore only.
-        Using it for saves will cause missing array_metadatas files and checkpoint failures.
-        We restore the EXACT handler that was in place before, not a new instance.
-        """
+      # try/finally guarantees that SingleReplicaArrayHandler and the
+      # custom broadcast monkeypatch are always cleaned up, even if
+      # restore() raises.  SingleReplicaArrayHandler is restore-only;
+      # leaving it registered corrupts saves ("No ArrayMetadata found").
+      try:
+        match (checkpoint_manager, dataset_type, data_iterator):
+          # Case 1: EmergencyCheckpointManager or EmergencyReplicatorCheckpointManager
+          case (checkpoint_manager, _, _) if isinstance(
+              checkpoint_manager, (EmergencyCheckpointManager, EmergencyReplicatorCheckpointManager)
+          ):
+            return (
+                checkpoint_manager.restore(step, args=Composite(state=checkpoint_args)).state,
+                None,
+            )
+          # Case 2: grain dataset with iterator checkpoint
+          case (
+              checkpoint_manager,
+              dataset_type,
+              data_iterator,
+          ) if (
+              dataset_type == "grain"
+              and data_iterator
+              and not isinstance(data_iterator, PlaceHolderDataIterator)
+              and (checkpoint_manager.directory / str(step) / "iter").exists()
+          ):
+            return _restore_grain_iterator(
+                checkpoint_manager, step, data_iterator, checkpoint_args, expansion_factor_real_data
+            )
+          # Case 3: Default/Fallback
+          case _:
+            return (checkpoint_manager.restore(step, args=Composite(items=checkpoint_args)), None)
+      finally:
         if _sr_effective:
-          max_logging.log("Restoring original ArrayHandler after SingleReplicaArrayHandler restore...")
-          # Re-register the original handler that was cached before the override
-          ocp.type_handlers.register_type_handler(jax.Array, original_array_handler, override=True)
-          max_logging.log("Original ArrayHandler restored successfully.")
-
-      match (checkpoint_manager, dataset_type, data_iterator):
-        # Case 1: Matches if 'checkpoint_manager' is an instance of either EmergencyCheckpointManager
-        # or EmergencyReplicatorCheckpointManager. The '_' indicates that 'dataset_type' and
-        # 'data_iterator' can be any value and aren't used in this pattern.
-        case (checkpoint_manager, _, _) if isinstance(
-            checkpoint_manager, (EmergencyCheckpointManager, EmergencyReplicatorCheckpointManager)
-        ):
-          result = (
-              checkpoint_manager.restore(step, args=Composite(state=checkpoint_args)).state,
-              None,
-          )
-          _restore_original_array_handler()
-          return result
-        # Case 2: Matches if dataset type is "grain" and the data iterator is not a
-        # PlaceHolderDataIterator and a specific checkpoint file exists for the iterator
-        case (
-            checkpoint_manager,
-            dataset_type,
-            data_iterator,
-        ) if (
-            dataset_type == "grain"
-            and data_iterator
-            and not isinstance(data_iterator, PlaceHolderDataIterator)
-            and (checkpoint_manager.directory / str(step) / "iter").exists()
-        ):
-          result = _restore_grain_iterator(
-              checkpoint_manager, step, data_iterator, checkpoint_args, expansion_factor_real_data
-          )
-          _restore_original_array_handler()
-          return result
-        # Case 3: Default/Fallback case.
-        # This case acts as a wildcard ('_') and matches if none of the preceding cases were met.
-        case _:
-          result = (checkpoint_manager.restore(step, args=Composite(items=checkpoint_args)), None)
-          _restore_original_array_handler()
-          return result
+          ocp.type_handlers.register_type_handler(
+              jax.Array, original_array_handler, override=True)
+          _uninstall_custom_broadcast()
+          gc.collect()
 
   if load_parameters_from_path != "":
     restored_params = load_params_from_path(
