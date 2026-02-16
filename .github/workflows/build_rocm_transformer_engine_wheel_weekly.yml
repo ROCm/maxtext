@@ -1,0 +1,314 @@
+name: Build ROCm TransformerEngine wheel (weekly)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly at night (02:00 UTC every Monday), 2 hours ahead of scheduled tests.
+    - cron: "0 2 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  build_upload_prune:
+    # Same runner label used by ROCm test workflows.
+    runs-on: ["self-hosted", "linux-x86-64-4gpu-amd"]
+    container:
+      image: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
+      options: >-
+        --device=/dev/kfd --device=/dev/dri --group-add video
+        --ipc=host --shm-size 64g
+        --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+        --privileged
+      env:
+        XLA_PYTHON_CLIENT_MEM_FRACTION: "0.9"
+        NVTE_FUSED_ATTN_AOTRITON: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build & publish TE wheels (native arch then MI300)
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git build-essential python3-dev
+          python3 -m pip install -U uv
+          python3 -m uv venv --seed
+          source .venv/bin/activate
+          uv pip install -U pip setuptools wheel pybind11 cmake
+          # Install ROCm JAX/JAXlib wheels into the venv (so TE builds against the same stack as CI).
+          uv pip install -r dependencies/requirements/requirements_decoupled_rocm_jax_0_8_2.txt
+
+          # Detect runner ROCm architecture (avoid generic tokens like gfx9).
+          PRIMARY_ARCH="$(
+            (command -v rocminfo >/dev/null 2>&1 && rocminfo || /opt/rocm/bin/rocminfo) \
+              | grep -oE 'gfx[0-9a-f]+' \
+              | sort -u \
+              | awk '{ print length($0), $0 }' \
+              | sort -nr \
+              | head -n1 \
+              | awk '{ print $2 }'
+          )"
+          echo "Detected runner ROCm arch: ${PRIMARY_ARCH}"
+
+          # Detect ROCm version number from JAX backend string when available (e.g. 'rocm 70200').
+          ROCM_NUM="$(python3 -c 'import re, jax; s=str(jax.devices()[0].client.platform_version); m=re.search(r"rocm\\s+([0-9]+)", s); print(m.group(1) if m else "unknown")')"
+          echo "Detected ROCm version: ${ROCM_NUM}"
+
+          # Build TE from ROCm/TransformerEngine dev branch.
+          rm -rf TransformerEngine
+          git clone --recursive --branch dev https://github.com/ROCm/TransformerEngine.git
+          cd TransformerEngine
+          git submodule update --init --recursive
+
+          TE_SHA="$(git rev-parse --short=12 HEAD)"
+          PYTAG="cp$(python3 -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
+
+          export USE_ROCM=1
+          export HIP_PATH=/opt/rocm
+          export NVTE_FRAMEWORK=jax
+          export CMAKE_BUILD_PARALLEL_LEVEL=64
+          export NVTE_USE_ROCM=1
+          export NVTE_FUSED_ATTN_AOTRITON=0
+          export NVTE_BUILD_MAX_JOBS=180
+
+          # Return to workspace root; build function will enter TE directory.
+          cd ..
+
+          build_one() {
+            local arch="$1"
+            echo "=== Building TE wheel for ${arch} ==="
+            pushd TransformerEngine >/dev/null
+            rm -rf build dist
+            export PYTORCH_ROCM_ARCH="${arch}"
+            export NVTE_ROCM_ARCH="${arch}"
+            python3 setup.py bdist_wheel
+            local wheel_path
+            wheel_path="$(ls -1 dist/transformer_engine-*.whl | head -n1)"
+            popd >/dev/null
+            local asset_name
+            asset_name="transformer_engine-${TE_SHA}-${PYTAG}-rocm${ROCM_NUM}-${arch}.whl"
+            cp -f "TransformerEngine/${wheel_path}" "${asset_name}"
+            echo "${asset_name}"
+          }
+
+          publish_asset_to_release_tag() {
+            local tag="$1"
+            local title="$2"
+            local body="$3"
+            local wheel_file="$4"
+            python3 - "$tag" "$title" "$body" "$wheel_file" <<'PY'
+          import json, os, sys, urllib.error, urllib.parse, urllib.request
+
+          tag, title, body, wheel_file = sys.argv[1:5]
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ.get("GITHUB_REPOSITORY")
+          if not repo:
+            raise SystemExit("GITHUB_REPOSITORY is not set")
+          owner, name = repo.split("/", 1)
+
+          api = "https://api.github.com"
+          headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "maxtext-ci",
+          }
+
+          def request_json(method: str, url: str, body_obj=None):
+            data = None
+            if body_obj is not None:
+              data = json.dumps(body_obj).encode("utf-8")
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            with urllib.request.urlopen(req) as r:
+              return json.loads(r.read().decode("utf-8"))
+
+          def request_raw(method: str, url: str, data: bytes, extra_headers=None):
+            h = dict(headers)
+            if extra_headers:
+              h.update(extra_headers)
+            req = urllib.request.Request(url, data=data, method=method, headers=h)
+            with urllib.request.urlopen(req) as r:
+              return r.read()
+
+          # Ensure release exists for this tag.
+          release = None
+          try:
+            release = request_json("GET", f"{api}/repos/{owner}/{name}/releases/tags/{tag}")
+          except urllib.error.HTTPError as e:
+            if e.code != 404:
+              raise
+
+          if release is None:
+            release = request_json(
+              "POST",
+              f"{api}/repos/{owner}/{name}/releases",
+              {
+                "tag_name": tag,
+                "name": title,
+                "body": body,
+                "prerelease": True,
+              },
+            )
+
+          release_id = release["id"]
+          upload_url = release["upload_url"].split("{", 1)[0]
+
+          # Delete any existing asset with same name.
+          assets = request_json("GET", f"{api}/repos/{owner}/{name}/releases/{release_id}")["assets"]
+          wheel_name = os.path.basename(wheel_file)
+          for a in assets:
+            if a.get("name") == wheel_name:
+              request_json("DELETE", f"{api}/repos/{owner}/{name}/releases/assets/{a['id']}")
+
+          with open(wheel_file, "rb") as f:
+            wheel_bytes = f.read()
+          up = f"{upload_url}?{urllib.parse.urlencode({'name': wheel_name})}"
+          request_raw("POST", up, wheel_bytes, extra_headers={"Content-Type": "application/octet-stream"})
+          print(f"Uploaded {wheel_name} to release tag {tag}", flush=True)
+          PY
+          }
+
+          prune_old_weekly_releases() {
+            local prefix="$1"
+            local keep_days="$2"
+            python3 - "$prefix" "$keep_days" <<'PY'
+          import datetime as dt
+          import json, os, sys, urllib.request
+
+          prefix = sys.argv[1]
+          keep_days = int(sys.argv[2])
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ.get("GITHUB_REPOSITORY")
+          if not repo:
+            raise SystemExit("GITHUB_REPOSITORY is not set")
+
+          api = "https://api.github.com"
+          headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "maxtext-ci",
+          }
+
+          def get_json(url: str):
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req) as r:
+              return json.loads(r.read().decode("utf-8"))
+
+          def delete(url: str):
+            req = urllib.request.Request(url, method="DELETE", headers=headers)
+            with urllib.request.urlopen(req):
+              return
+
+          cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=keep_days)
+
+          # Paginate releases.
+          page = 1
+          deleted = 0
+          while True:
+            releases = get_json(f"{api}/repos/{repo}/releases?per_page=100&page={page}")
+            if not releases:
+              break
+            for rel in releases:
+              tag = rel.get("tag_name", "")
+              if not tag.startswith(prefix):
+                continue
+              created = dt.datetime.fromisoformat(rel["created_at"].replace("Z", "+00:00"))
+              if created < cutoff:
+                delete(f"{api}/repos/{repo}/releases/{rel['id']}")
+                deleted += 1
+                print(f"Deleted old weekly TE release {tag} (created_at={rel['created_at']})", flush=True)
+            page += 1
+          print(f"Weekly TE release prune complete. Deleted {deleted} releases older than {keep_days} days.", flush=True)
+          PY
+          }
+
+          prune_old_assets_in_release_tag() {
+            local tag="$1"
+            local keep_days="$2"
+            python3 - "$tag" "$keep_days" <<'PY'
+          import datetime as dt
+          import json, os, sys, urllib.error, urllib.request
+
+          tag = sys.argv[1]
+          keep_days = int(sys.argv[2])
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ.get("GITHUB_REPOSITORY")
+          if not repo:
+            raise SystemExit("GITHUB_REPOSITORY is not set")
+          owner, name = repo.split("/", 1)
+
+          api = "https://api.github.com"
+          headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "maxtext-ci",
+          }
+
+          def request_json(method: str, url: str):
+            req = urllib.request.Request(url, method=method, headers=headers)
+            with urllib.request.urlopen(req) as r:
+              data = r.read()
+              return json.loads(data.decode("utf-8")) if data else None
+
+          def delete(url: str):
+            req = urllib.request.Request(url, method="DELETE", headers=headers)
+            with urllib.request.urlopen(req):
+              return
+
+          try:
+            rel = request_json("GET", f"{api}/repos/{owner}/{name}/releases/tags/{tag}")
+          except urllib.error.HTTPError as e:
+            if e.code == 404:
+              print(f"No release for tag {tag}; skipping asset prune.", flush=True)
+              raise SystemExit(0)
+            raise
+
+          cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=keep_days)
+          pruned = 0
+          for a in rel.get("assets", []):
+            created = dt.datetime.fromisoformat(a["created_at"].replace("Z", "+00:00"))
+            if created < cutoff:
+              delete(f"{api}/repos/{owner}/{name}/releases/assets/{a['id']}")
+              pruned += 1
+              print(f"Pruned old asset: {a['name']} (created_at={a['created_at']})", flush=True)
+          print(f"Asset prune complete for {tag}. Deleted {pruned} assets older than {keep_days} days.", flush=True)
+          PY
+          }
+
+          # Build runner-native wheel and upload immediately so other CI can pick it up.
+          NATIVE_WHEEL="$(build_one "${PRIMARY_ARCH}")"
+          ls -lh "${NATIVE_WHEEL}"
+          publish_asset_to_release_tag \
+            "te-rocm-wheels" \
+            "ROCm TransformerEngine wheels (latest)" \
+            "Rolling release for latest weekly-built ROCm TransformerEngine wheels used by CI." \
+            "${NATIVE_WHEEL}"
+
+          # Build MI300 wheel (gfx942) and upload.
+          MI300_WHEEL="$(build_one "gfx942")"
+          ls -lh "${MI300_WHEEL}"
+          publish_asset_to_release_tag \
+            "te-rocm-wheels" \
+            "ROCm TransformerEngine wheels (latest)" \
+            "Rolling release for latest weekly-built ROCm TransformerEngine wheels used by CI." \
+            "${MI300_WHEEL}"
+
+          # Retention: prune rolling release assets older than 3 weeks.
+          prune_old_assets_in_release_tag "te-rocm-wheels" 21
+
+          # Also publish both wheels to a new weekly release page.
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          WEEKLY_TAG="te-rocm-wheels-${DATE_UTC}-${TE_SHA}"
+          WEEKLY_TITLE="ROCm TransformerEngine wheels ${DATE_UTC} (TE ${TE_SHA})"
+          WEEKLY_BODY="Built from ROCm/TransformerEngine dev @ ${TE_SHA} on ${DATE_UTC}.\nROCm=${ROCM_NUM}, Python=${PYTAG}, arches=${PRIMARY_ARCH} and gfx942."
+
+          publish_asset_to_release_tag "${WEEKLY_TAG}" "${WEEKLY_TITLE}" "${WEEKLY_BODY}" "${NATIVE_WHEEL}"
+          publish_asset_to_release_tag "${WEEKLY_TAG}" "${WEEKLY_TITLE}" "${WEEKLY_BODY}" "${MI300_WHEEL}"
+
+          # Retention: delete weekly releases older than 3 weeks.
+          prune_old_weekly_releases "te-rocm-wheels-" 21
+
