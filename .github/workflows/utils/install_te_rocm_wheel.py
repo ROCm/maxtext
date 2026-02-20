@@ -91,7 +91,8 @@ def try_download_from_te_rocm_wheels(repo: str, arch: str) -> bool:
     rel = json.loads(r.read().decode("utf-8"))
 
   assets = rel.get("assets", [])
-  name_re = re.compile(rf"^transformer_engine-.*-{arch}-cp312-cp312-linux_x86_64\.whl$")
+  # Wheels published by this repo use the selector format: `-1.<arch>-...` (e.g. `-1.mi355-...`).
+  name_re = re.compile(rf"^transformer_engine-.*-1\.{arch}-cp312-cp312-linux_x86_64\.whl$")
   hit = next((a for a in assets if name_re.match(a.get("name", ""))), None)
   if not hit:
     return False
