@@ -36,6 +36,7 @@ from orbax.checkpoint._src.arrays import sharding as sharding_utils
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
 import orbax.checkpoint.experimental.emergency.replicator_checkpoint_manager as emergency_replicator_checkpoint_manager
 import orbax.checkpoint._src.multihost.multislice as _orbax_multislice
+import orbax.checkpoint._src.serialization.jax_array_handlers as _orbax_array_handlers
 import dataclasses
 import json
 # pylint: disable=too-many-positional-arguments
@@ -52,6 +53,7 @@ LocalCheckpointOptions = emergency_checkpoint_manager.LocalCheckpointOptions
 PersistentCheckpointOptions = emergency_checkpoint_manager.PersistentCheckpointOptions
 EmergencyReplicatorCheckpointManager = emergency_replicator_checkpoint_manager.ReplicatorCheckpointManager
 _original_broadcast_one_replica_to_all = _orbax_multislice.broadcast_one_replica_to_all
+_original_single_replica_deserialize = _orbax_array_handlers._single_replica_deserialize_and_broadcast
 
 
 class GrainCheckpointHandler(PyGrainCheckpointHandler, ocp.CheckpointHandler):
@@ -691,6 +693,81 @@ def _uninstall_custom_broadcast():
   max_logging.log("Restored original orbax broadcast_one_replica_to_all")
 
 
+# ── Non-jit create_zeros for non-primary hosts ──────────────────────────────
+#
+# Orbax's _single_replica_deserialize_and_broadcast uses jax.jit(create_zeros)
+# on non-primary hosts. This creates an XLA compilation that persists in the
+# compilation cache and fragments GPU memory, causing a ~0.5% TGS degradation
+# versus SR=False restore even though the compiled training code is identical.
+#
+# Our replacement creates the same zero buffers via numpy + device_put, which
+# goes through the host-to-device DMA path without touching the XLA compiler.
+
+
+def _create_zeros_no_jit(args, single_replica_shardings):
+  """Create zero arrays matching single_replica_shardings without jax.jit."""
+  deserialized = []
+  for arg, sharding in zip(args, single_replica_shardings):
+    shard_shape = sharding.shard_shape(arg.global_shape)
+    bufs = [jax.device_put(np.zeros(shard_shape, dtype=arg.dtype), d)
+            for d in sharding._addressable_device_assignment]
+    deserialized.append(jax.make_array_from_single_device_arrays(
+        arg.global_shape, sharding, bufs))
+  return deserialized
+
+
+async def _custom_single_replica_deserialize_and_broadcast(
+    infos, args, shardings, single_replica_shardings,
+    replica_axis_index, primary_replica_id, metadata_key,
+    broadcast_memory_limit_bytes, broadcast_memory_scaling_factor,
+):
+  """Like Orbax's version but avoids jax.jit for zero creation on non-primary hosts."""
+  from typing import cast
+  primary_replica_pids = (
+      _orbax_array_handlers._validate_sharding_and_get_primary_replica_processes(
+          replica_axis_index=replica_axis_index,
+          primary_replica_id=primary_replica_id,
+          sharding=shardings[0],
+      ))
+  is_primary = _orbax_array_handlers._is_host_for_primary_replica(
+      primary_replica_pids)
+
+  if is_primary:
+    t0 = time.monotonic()
+    deserialized = await _orbax_array_handlers._deserialize_arrays(
+        infos, args, single_replica_shardings, metadata_key, None)
+    max_logging.log(
+        f"Finished primary replica deserialization in {time.monotonic() - t0:.2f}s")
+  else:
+    deserialized = _create_zeros_no_jit(args, single_replica_shardings)
+
+  deserialized = tuple(deserialized)
+  t0 = time.monotonic()
+  global_mesh = cast(
+      jax.sharding.NamedSharding, shardings[0]).mesh
+  shared_state, _ = _orbax_multislice.broadcast_one_replica_to_all(
+      deserialized, global_mesh, replica_axis_index, is_primary,
+      memory_limit_bytes=broadcast_memory_limit_bytes,
+      memory_scaling_factor=broadcast_memory_scaling_factor,
+  )
+  max_logging.log(f"Finished broadcasting in {time.monotonic() - t0:.2f}s")
+  return shared_state
+
+
+def _install_custom_deserialize():
+  """Monkeypatch Orbax to skip jax.jit create_zeros on non-primary hosts."""
+  _orbax_array_handlers._single_replica_deserialize_and_broadcast = (
+      _custom_single_replica_deserialize_and_broadcast)
+  max_logging.log("Installed custom single-replica deserialize (no-jit zeros)")
+
+
+def _uninstall_custom_deserialize():
+  """Restore Orbax's original _single_replica_deserialize_and_broadcast."""
+  _orbax_array_handlers._single_replica_deserialize_and_broadcast = (
+      _original_single_replica_deserialize)
+  max_logging.log("Restored original Orbax single-replica deserialize")
+
+
 # ── End custom broadcast ────────────────────────────────────────────────────
 
 
@@ -905,12 +982,12 @@ def load_state_if_possible(
         ocp.type_handlers.register_type_handler(
             jax.Array, single_replica_handler, override=True)
 
-        # Monkeypatch orbax to use direct RCCL broadcast with explicit
-        # communicator destroy + gc.collect() (falls back to Orbax default if
-        # RCCL ctypes unavailable).  The default orbax broadcast creates RCCL
-        # communicators via JAX/XLA that are cached with persistent proxy
-        # threads, degrading training TGS.
+        # Monkeypatch orbax:
+        # 1. Replace broadcast with direct RCCL (avoids clique-cached comms)
+        # 2. Replace create_zeros jax.jit with numpy+device_put (avoids XLA
+        #    compilation artifacts that fragment GPU memory and degrade TGS)
         _install_custom_broadcast()
+        _install_custom_deserialize()
 
       restore_args = jax.tree_util.tree_map(map_to_pspec, abstract_unboxed_pre_state)
       checkpoint_args = ocp.args.PyTreeRestore(
@@ -951,6 +1028,7 @@ def load_state_if_possible(
         if _sr_effective:
           ocp.type_handlers.register_type_handler(
               jax.Array, original_array_handler, override=True)
+          _uninstall_custom_deserialize()
           _uninstall_custom_broadcast()
           gc.collect()
 
