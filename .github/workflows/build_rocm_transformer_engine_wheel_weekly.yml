@@ -52,8 +52,7 @@ jobs:
           set -euo pipefail
           source .venv/bin/activate
 
-          # Detect ROCm version number from JAX backend string when available (e.g. 'rocm 70200').
-          ROCM_NUM="$(python3 -c 'import re, jax; s=str(jax.devices()[0].client.platform_version); m=re.search(r"rocm\\s+([0-9]+)", s); print(m.group(1) if m else "unknown")')"
+          ROCM_NUM="$([ -f /opt/rocm/.info/version ] && head -n1 /opt/rocm/.info/version | tr -d ' \t\r' || echo unknown)"
           echo "Detected ROCm version: ${ROCM_NUM}"
           echo "ROCM_NUM=${ROCM_NUM}" >> "${GITHUB_ENV}"
 
