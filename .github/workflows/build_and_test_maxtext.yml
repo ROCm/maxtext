@@ -104,7 +104,7 @@ jobs:
     uses: ./.github/workflows/build_package.yml
     with:
       device_type: ${{ vars.ROCM_ONLY == 'true' && 'rocm' || 'tpu' }}
-      device_name: ${{ vars.ROCM_ONLY == 'true' && 'mi300' || 'v4-8' }}
+      device_name: ${{ vars.ROCM_ONLY == 'true' && 'mi355' || 'v4-8' }}
       cloud_runner: ${{ vars.ROCM_ONLY == 'true' && 'linux-x86-64-4gpu-amd' || 'linux-x86-n2-16-buildkit' }}
 
   maxtext_jupyter_notebooks:
@@ -279,7 +279,7 @@ jobs:
         image_type: ["py312"]
     with:
       device_type: rocm
-      device_name: mi300
+      device_name: mi355
       image_type: ${{ matrix.image_type }}
       cloud_runner: linux-x86-64-4gpu-amd
       pytest_marker: 'decoupled'
