@@ -52,7 +52,7 @@ jobs:
           set -euo pipefail
           source .venv/bin/activate
 
-          ROCM_NUM="$([ -f /opt/rocm/.info/version ] && head -n1 /opt/rocm/.info/version | tr -d ' \t\r' || echo unknown)"
+          ROCM_NUM="$([ -f /opt/rocm/.info/version ] && head -n1 /opt/rocm/.info/version | tr -d '[:space:]' || echo unknown)"
           echo "Detected ROCm version: ${ROCM_NUM}"
           echo "ROCM_NUM=${ROCM_NUM}" >> "${GITHUB_ENV}"
 
