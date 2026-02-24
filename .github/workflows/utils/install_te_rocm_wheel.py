@@ -62,7 +62,7 @@ def detect_arch() -> str:
     return "mi300"
 
   # Safe default.
-  return "mi300"
+  return "mi355"
 
 
 def _headers() -> dict[str, str]:
