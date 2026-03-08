@@ -549,6 +549,9 @@ class MoEGeneral(BaseModel):
   float32_weight_sum: bool = Field(
       True, description="Whether to use full fp32 precision for weight_sum during final unpermute in MoE."
   )
+  router_logits_soft_cap: None | NonNegativeFloat = Field(
+      None, description="Soft-cap value for router logits (e.g. Grok-2). None or 0.0 means no cap."
+  )
 
 
 class MoEKernels(BaseModel):

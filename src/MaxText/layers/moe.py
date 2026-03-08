@@ -409,6 +409,9 @@ class RoutedMoE(nnx.Module):
     """get topk."""
     # shape of top_k_weights & top_k_indices:
     # (batch, sequence, num_experts_per_tok).
+    if self.config.router_logits_soft_cap:
+      gate_logits = jnp.tanh(gate_logits / self.config.router_logits_soft_cap) * self.config.router_logits_soft_cap
+
     if self.config.use_random_routing:
       if rngs is None:
         raise ValueError("The random key cannot be None for random routing.")
