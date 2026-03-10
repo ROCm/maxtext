@@ -92,9 +92,17 @@ def try_download_from_te_rocm_wheels(repo: str, arch: str) -> bool:
 
   assets = rel.get("assets", [])
   name_re = re.compile(rf"^transformer_engine-.*-1\.{arch}-cp312-cp312-linux_x86_64\.whl$")
-  hit = next((a for a in assets if name_re.match(a.get("name", ""))), None)
-  if not hit:
+  matches = [a for a in assets if name_re.match(a.get("name", ""))]
+  if not matches:
     return False
+
+  # Rolling tag keeps many wheels; select newest matching asset.
+  hit = max(matches, key=lambda a: a.get("created_at", ""))
+  print(
+      "[te wheel] selected latest te-rocm-wheels asset: "
+      f"{hit.get('name', '<unknown>')} (created_at={hit.get('created_at', 'unknown')})",
+      flush=True,
+  )
 
   download(hit["browser_download_url"], hit["name"])
   return True
