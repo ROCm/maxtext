@@ -105,9 +105,6 @@ jobs:
         ALLOW_MULTIPLE_LIBTPU_LOAD: ${{ inputs.device_type == 'cpu' && 'true' || '' }} # bypass /tmp/libtpu_lockfile check for cpu tests, which don't actually use accelerators (to allow concurrency)
         DECOUPLE_GCLOUD: ${{ inputs.decoupled_mode && 'TRUE' || '' }}
         LOCAL_GCLOUD_PROJECT: ${{ inputs.decoupled_mode && 'ci-decoupled' || '' }}
-        # ROCm: prefer CK fused-attention backend over AOTriton for stability.
-        NVTE_FUSED_ATTN_CK: ${{ inputs.device_type == 'rocm' && '1' || '' }}
-        NVTE_FUSED_ATTN_AOTRITON: ${{ inputs.device_type == 'rocm' && '0' || '' }}
       options: ${{ inputs.container_resource_option }}
     steps:
       - name: Checkout MaxText
