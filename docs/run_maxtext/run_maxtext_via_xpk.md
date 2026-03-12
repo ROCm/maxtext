@@ -51,7 +51,7 @@ Before you begin, you must have the necessary tools installed and permissions co
 
 - **kubectl:** The Kubernetes command-line tool.
 
-- **Docker:** Follow the [installation instructions](https://docs.docker.com/engine/install/) and complete the [post-install steps](https://docs.docker.com/engine/install/linux-postinstall/) to run Docker without `sudo`.
+- **Docker:** Follow the [installation instructions](https://docs.docker.com/engine/install/) and [follow the steps to configure sudoless Docker](https://docs.docker.com/engine/install/linux-postinstall/).
 
 ### GCP permissions
 
@@ -118,6 +118,10 @@ ______________________________________________________________________
 
 ## 4. Build the MaxText Docker image
 
+```{note}
+Ensure Docker is configured for sudoless use before running the build script. Follow the steps to [configure sudoless Docker](https://docs.docker.com/engine/install/linux-postinstall/).
+```
+
 1. **Clone the MaxText repository**
 
    ```
@@ -130,13 +134,13 @@ ______________________________________________________________________
    - **For TPUs:**
 
      ```
-     bash dependencies/scripts/docker_build_dependency_image.sh DEVICE=tpu MODE=stable
+     bash src/dependencies/scripts/docker_build_dependency_image.sh DEVICE=tpu MODE=stable
      ```
 
    - **For GPUs:**
 
      ```
-     bash dependencies/scripts/docker_build_dependency_image.sh DEVICE=gpu MODE=stable
+     bash src/dependencies/scripts/docker_build_dependency_image.sh DEVICE=gpu MODE=stable
      ```
 
 ______________________________________________________________________
