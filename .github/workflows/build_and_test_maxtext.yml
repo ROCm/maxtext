@@ -286,7 +286,7 @@ jobs:
       xla_python_client_mem_fraction: 0.9
       tf_force_gpu_allow_growth: true
       container_resource_option: "--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size 64g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --privileged"
-      requirements_file: "dependencies/requirements/requirements_decoupled_rocm_jax_0_8_2.txt"
+      requirements_file: "src/dependencies/requirements/requirements_decoupled_rocm_jax_0_8_2.txt"
       decoupled_mode: true
       is_scheduled_run: ${{ github.event_name == 'schedule' }}
       maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
