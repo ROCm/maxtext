@@ -377,6 +377,209 @@ class NANOOFp8Quantization(Quantization):
     return nn.NANOOFp8DotGeneralOp
 
 
+class AiterBf16DotGeneralOp(nn.Module):
+  """Drop-in dot_general replacement using AITER ASM BF16 GEMM.
+
+  Uses AITER hand-tuned ASM kernels via FFI for all GEMM operations.
+  Supports multi-GPU via custom_partitioning (sharding_rule="m k, n k -> m n").
+  """
+
+  @nn.compact
+  def __call__(self, inputs, kernel, dimension_numbers, precision=None, **kwargs):
+    from jax_aiter.gemm import gemm as aiter_gemm
+
+    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+    lhs_contract = tuple(lhs_contract)
+    rhs_contract = tuple(rhs_contract)
+
+    inp_shape = inputs.shape
+    ker_shape = kernel.shape
+    inp_ndim = len(inp_shape)
+    ker_ndim = len(ker_shape)
+
+    m_axes = [i for i in range(inp_ndim) if i not in lhs_contract]
+    n_axes = [i for i in range(ker_ndim) if i not in rhs_contract]
+
+    K = 1
+    for ax in lhs_contract:
+      K *= inp_shape[ax]
+    M = 1
+    for ax in m_axes:
+      M *= inp_shape[ax]
+    N = 1
+    for ax in n_axes:
+      N *= ker_shape[ax]
+
+    perm_lhs = m_axes + list(lhs_contract)
+    is_identity_lhs = perm_lhs == list(range(inp_ndim))
+    if is_identity_lhs:
+      a_2d = jnp.reshape(inputs, (M, K))
+    else:
+      a_2d = jnp.reshape(jnp.transpose(inputs, perm_lhs), (M, K))
+
+    perm_rhs = n_axes + list(rhs_contract)
+    is_identity_rhs = perm_rhs == list(range(ker_ndim))
+    if is_identity_rhs:
+      b_nk = jnp.reshape(kernel, (N, K))
+    else:
+      b_nk = jnp.reshape(jnp.transpose(kernel, perm_rhs), (N, K))
+
+    a_2d = a_2d.astype(jnp.bfloat16)
+    b_nk = b_nk.astype(jnp.bfloat16)
+
+    out_2d = aiter_gemm(a_2d, b_nk)
+
+    out_m_shape = tuple(inp_shape[ax] for ax in m_axes)
+    out_n_shape = tuple(ker_shape[ax] for ax in n_axes)
+    return jnp.reshape(out_2d, out_m_shape + out_n_shape)
+
+
+@dataclass
+class AiterBf16Quantization(Quantization):
+  """AITER ASM BF16 GEMM for AMD MI350 (gfx950).
+
+  Uses hand-tuned assembly kernels via FFI.
+  Set quantization='aiter_bf16' to enable.
+  """
+
+  quant_mode = "train"
+
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+    return AiterBf16DotGeneralOp
+
+
+AITER_FP8_AMAX_HISTORY_LEN = 16
+
+
+def _aiter_fp8_compute_scale(amax_history, fp8_max=448.0):
+  """Compute FP8 scale from amax history (delayed scaling)."""
+  amax = jnp.max(amax_history)
+  scale = jnp.where(amax > 0, amax / fp8_max, 1.0)
+  scale = jnp.where(jnp.isfinite(amax), scale, 1.0)
+  return scale
+
+
+def _aiter_fp8_update_history(x, amax_history):
+  """Update rolling amax history with current tensor's max."""
+  amax_update = jnp.max(jnp.abs(x))
+  return jnp.roll(amax_history, shift=-1).at[-1].set(amax_update)
+
+
+class AiterFp8DotGeneralOp(nn.Module):
+  """Drop-in dot_general replacement using AITER FP8 block-scale GEMM for MI350.
+
+  Uses delayed scaling with amax history for stable FP8 training.
+  Forward: FP8 ASM kernel with per-block scales derived from delayed per-tensor scale.
+  Backward: BF16 GEMM (STE pattern).
+  """
+
+  @nn.compact
+  def __call__(self, inputs, kernel, dimension_numbers, precision=None, **kwargs):
+    from jax_aiter.gemm_fp8 import gemm_fp8_mi350 as aiter_fp8_gemm
+
+    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+    lhs_contract = tuple(lhs_contract)
+    rhs_contract = tuple(rhs_contract)
+
+    inp_shape = inputs.shape
+    ker_shape = kernel.shape
+    inp_ndim = len(inp_shape)
+    ker_ndim = len(ker_shape)
+
+    m_axes = [i for i in range(inp_ndim) if i not in lhs_contract]
+    n_axes = [i for i in range(ker_ndim) if i not in rhs_contract]
+
+    K = 1
+    for ax in lhs_contract:
+      K *= inp_shape[ax]
+    M = 1
+    for ax in m_axes:
+      M *= inp_shape[ax]
+    N = 1
+    for ax in n_axes:
+      N *= ker_shape[ax]
+
+    perm_lhs = m_axes + list(lhs_contract)
+    is_identity_lhs = perm_lhs == list(range(inp_ndim))
+    if is_identity_lhs:
+      a_2d = jnp.reshape(inputs, (M, K))
+    else:
+      a_2d = jnp.reshape(jnp.transpose(inputs, perm_lhs), (M, K))
+
+    perm_rhs = n_axes + list(rhs_contract)
+    is_identity_rhs = perm_rhs == list(range(ker_ndim))
+    if is_identity_rhs:
+      b_nk = jnp.reshape(kernel, (N, K))
+    else:
+      b_nk = jnp.reshape(jnp.transpose(kernel, perm_rhs), (N, K))
+
+    block_k = 128
+    fp8_max = 448.0
+    a_bf16 = a_2d.astype(jnp.bfloat16)
+    b_bf16 = b_nk.astype(jnp.bfloat16)
+
+    a_sg = jax.lax.stop_gradient(a_bf16)
+    b_sg = jax.lax.stop_gradient(b_bf16)
+
+    # Delayed scaling: maintain amax history as mutable state.
+    # Use "aqt" collection so MaxText's existing mutable=["aqt"] allows updates.
+    # Initialize history to a safe value (activations typically have max ~3-5).
+    input_amax_history = self.variable(
+        "aqt", "input_amax_history",
+        lambda: jnp.full(AITER_FP8_AMAX_HISTORY_LEN, 4.0, dtype=jnp.float32))
+    kernel_amax_history = self.variable(
+        "aqt", "kernel_amax_history",
+        lambda: jnp.full(AITER_FP8_AMAX_HISTORY_LEN, 1.0, dtype=jnp.float32))
+
+    # Compute per-tensor delayed scale from history
+    a_global_scale = _aiter_fp8_compute_scale(input_amax_history.value, fp8_max)
+    b_global_scale = _aiter_fp8_compute_scale(kernel_amax_history.value, fp8_max)
+
+    # Update history with current step's amax
+    if not self.is_initializing():
+      input_amax_history.value = _aiter_fp8_update_history(a_sg, input_amax_history.value)
+      kernel_amax_history.value = _aiter_fp8_update_history(b_sg, kernel_amax_history.value)
+
+    # Activation quantization: use delayed per-tensor scale, then compute per-block scales
+    xq = jnp.clip(a_sg / a_global_scale, -fp8_max, fp8_max).astype(jnp.float8_e4m3fn)
+    # Per-block x_scale for the kernel: [K/128, M]
+    a_blocks = xq.astype(jnp.float32).reshape(M, K // block_k, block_k)
+    x_block_amax = jnp.max(jnp.abs(a_blocks), axis=-1)
+    x_scale = (x_block_amax * a_global_scale / fp8_max).transpose(1, 0).astype(jnp.float32)
+    x_scale = jnp.where(x_scale == 0, a_global_scale, x_scale)
+
+    # Weight quantization: use delayed per-tensor scale
+    wq = jnp.clip(b_sg / b_global_scale, -fp8_max, fp8_max).astype(jnp.float8_e4m3fn)
+    # Per-block w_scale for the kernel: [N/128, K/128]
+    b_blocks = wq.astype(jnp.float32).reshape(N // block_k, block_k, K // block_k, block_k)
+    w_block_amax = jnp.max(jnp.abs(b_blocks), axis=(1, 3))
+    w_scale = (w_block_amax * b_global_scale / fp8_max).astype(jnp.float32)
+    w_scale = jnp.where(w_scale == 0, b_global_scale, w_scale)
+
+    # Shuffle weight for ASM kernel
+    wq_shuf = wq.reshape(N // 16, 16, K // 32, 2, 16).transpose(0, 2, 3, 1, 4).reshape(N, K)
+
+    out_2d = aiter_fp8_gemm(xq, wq_shuf, x_scale, w_scale, a_bf16, b_bf16)
+
+    out_m_shape = tuple(inp_shape[ax] for ax in m_axes)
+    out_n_shape = tuple(ker_shape[ax] for ax in n_axes)
+    return jnp.reshape(out_2d, out_m_shape + out_n_shape)
+
+
+@dataclass
+class AiterFp8Quantization(Quantization):
+  """AITER FP8 block-scale GEMM for AMD MI350 (gfx950).
+
+  Forward in FP8 (2x compute throughput), backward in BF16 (accuracy).
+  Set quantization='aiter_fp8' to enable.
+  """
+
+  quant_mode = "train"
+
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+    return AiterFp8DotGeneralOp
+
+
 def _get_int8_quant_config(config):
   drhs_bits = None
   drhs_accumulator_dtype = None
@@ -601,6 +804,10 @@ def _get_quant_config(config):
     return "fp8"
   if config.quantization == "nanoo_fp8":
     return "nanoo_fp8"
+  if config.quantization == "aiter_bf16":
+    return "aiter_bf16"
+  if config.quantization == "aiter_fp8":
+    return "aiter_fp8"
   if config.quantization == "aqt_fp8":
     return _get_aqt_fp8_quant_config(config)
   if config.quantization == "aqt_fp8_full":
@@ -651,6 +858,10 @@ def configure_quantization(config: Config, quant_mode_str: str = "train"):
       return Fp8Quantization()
     elif quant_cfg == "nanoo_fp8":
       return NANOOFp8Quantization()
+    elif quant_cfg == "aiter_bf16":
+      return AiterBf16Quantization()
+    elif quant_cfg == "aiter_fp8":
+      return AiterFp8Quantization()
     elif isinstance(quant_cfg, str) and quant_cfg.startswith("te_"):
       return TransformerEngineQuantization(config)
     quant_mode = get_quant_mode(quant_mode_str)

@@ -91,6 +91,8 @@ class QuantizationType(str, Enum):
   FP8_E4M3 = "fp8_e4m3"
   FP8 = "fp8"
   NANOO_FP8 = "nanoo_fp8"
+  AITER_BF16 = "aiter_bf16"
+  AITER_FP8 = "aiter_fp8"
   FP8_NANO_V2 = "fp8_nanoo"
   FP8_GPU = "fp8_gpu"
   FP8_FULL = "fp8_full"
