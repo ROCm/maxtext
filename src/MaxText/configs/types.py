@@ -556,6 +556,19 @@ class MoEKernels(BaseModel):
 
   megablox: bool = Field(True, description="Whether to use Megablox kernels for MoE.")
   sparse_matmul: bool = Field(True, description="Whether to use sparse matmul kernels for MoE.")
+  use_turbo_grouped_gemm: bool = Field(
+      False,
+      description="Use Primus Turbo grouped GEMM for MoE sparse matmul. "
+      "Requires sparse_matmul=True and megablox=False. "
+      "Requires the primus_turbo package to be installed.",
+  )
+  use_deepep_dispatch: bool = Field(
+      False,
+      description="Use Primus-Turbo DeepEP for MoE expert-parallel dispatch/combine. "
+      "Replaces ragged_all_to_all with fused NVLink IPC streaming. "
+      "Requires sparse_matmul=True and expert_parallelism > 1. "
+      "Intranode only (max 8 GPUs). Requires primus_turbo (DeepEP).",
+  )
   wi_tile_fwd_batch_seq: int = Field(512, description="forward pass tiling dimension for batch/sequence in GMM for wi.")
   wi_tile_fwd_embed_dim: int = Field(1024, description="forward pass tiling dimension for embedding in GMM for wi.")
   wi_tile_fwd_mlp_dim: int = Field(1024, description="forward pass tiling dimension for MLP in GMM for wi.")
@@ -1899,6 +1912,32 @@ class MaxTextConfig(
           )
       if self.decoder_block == DecoderBlockType.GPT_OSS and not self.sparse_matmul and self.capacity_factor != -1:
         raise ValueError("GPT-OSS MoE only supports dropless (capacity_factor=-1) with dense matmul.")
+    if self.use_turbo_grouped_gemm:
+      if self.quantization:
+        raise ValueError("use_turbo_grouped_gemm is not compatible with quantization.")
+      if not self.sparse_matmul:
+        raise ValueError("use_turbo_grouped_gemm requires sparse_matmul=True.")
+      if self.megablox:
+        raise ValueError("use_turbo_grouped_gemm requires megablox=False.")
+    if self.use_deepep_dispatch:
+      if not self.sparse_matmul:
+        raise ValueError("use_deepep_dispatch requires sparse_matmul=True.")
+      ep_size = self.ici_expert_parallelism * self.dcn_expert_parallelism
+      if ep_size <= 1:
+        raise ValueError("use_deepep_dispatch requires expert_parallelism > 1.")
+      if self.dcn_expert_parallelism > 1:
+        raise ValueError(
+            "use_deepep_dispatch only supports intranode (ici) expert parallelism. "
+            "dcn_expert_parallelism must be 1. Internode DeepEP is not yet supported in JAX."
+        )
+      if self.ici_expert_parallelism > 8:
+        raise ValueError("use_deepep_dispatch supports at most 8 GPUs (ici_expert_parallelism <= 8).")
+      try:
+        import primus_turbo.jax.lax.moe  # pylint: disable=import-outside-toplevel,unused-import
+      except ImportError as e:
+        raise ValueError(
+            "use_deepep_dispatch requires the primus_turbo package with DeepEP JAX bindings."
+        ) from e
     if self.use_multimodal:
       valid_mm_models = ("gemma3-4b", "gemma3-12b", "gemma3-27b", "llama4-17b-16e", "llama4-17b-128e")
       if self.model_name not in valid_mm_models and self.model_name != "default":

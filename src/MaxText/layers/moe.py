@@ -19,7 +19,7 @@ import enum
 import functools
 import math
 import random
-from typing import Iterable, Optional, Tuple, Union
+from typing import Callable, Iterable, NamedTuple, Optional, Tuple, Union
 
 from aqt.jax.v2 import aqt_tensor as aqt
 from flax import nnx
@@ -93,6 +93,116 @@ def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tupl
 
 
 _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_custom_bwd)
+
+
+_deepep_dispatch_logged = False
+
+
+class _DeepEPCombineState(NamedTuple):
+  """State passed from DeepEP dispatch to combine within sparse_matmul."""
+  handle: Tuple
+  recv_topk_weights: jax.Array
+  recv_topk_idx: jax.Array
+  fan_out_token_indices: jax.Array
+  sort_idx: jax.Array
+  num_recv_tokens: int
+  combine_fn: Callable
+
+
+def deepep_fan_out(
+    recv_x: jax.Array,
+    recv_topk_idx: jax.Array,
+    num_local_experts: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Expand received DeepEP tokens: one copy per assigned local expert.
+
+  DeepEP dispatches one token per rank (not per expert). After dispatch, each
+  received token may be assigned to multiple local experts via recv_topk_idx.
+  This function expands the token buffer so that each (token, expert) pair
+  becomes a separate row, suitable for grouped matmul.
+
+  Invalid slots (recv_topk_idx == -1) are mapped to a padding expert ID
+  (= num_local_experts). After sorting by expert_id, padding entries land at
+  the end and are excluded from group_sizes.
+
+  Args:
+    recv_x: [num_recv_tokens, hidden] -- tokens received from DeepEP dispatch.
+    recv_topk_idx: [num_recv_tokens, num_topk] -- local expert IDs per slot,
+      -1 means unassigned.
+    num_local_experts: number of experts on this rank.
+
+  Returns:
+    expanded_x: [num_recv * num_topk, hidden] -- one row per (token, slot).
+    expert_ids: [num_recv * num_topk] -- local expert ID; num_local_experts
+      for padding (invalid) entries.
+    group_sizes: [num_local_experts] -- valid token count per local expert.
+    token_indices: [num_recv * num_topk] -- which recv token each row maps to.
+  """
+  num_recv_tokens = recv_x.shape[0]
+  num_topk = recv_topk_idx.shape[1]
+
+  flat_idx = recv_topk_idx.reshape(-1)
+  valid = flat_idx >= 0
+
+  expert_ids = jnp.where(valid, flat_idx, num_local_experts)
+
+  token_indices = jnp.repeat(jnp.arange(num_recv_tokens), num_topk)
+  expanded_x = recv_x[token_indices]
+
+  group_sizes = jnp.bincount(
+      expert_ids.astype(jnp.int32), length=num_local_experts + 1
+  )[:num_local_experts]
+
+  return expanded_x, expert_ids, group_sizes, token_indices
+
+
+def deepep_fan_in(
+    expert_output: jax.Array,
+    token_indices: jax.Array,
+    recv_topk_weights: jax.Array,
+    recv_topk_idx: jax.Array,
+    num_recv_tokens: int,
+    float32_weight_sum: bool = True,
+) -> jax.Array:
+  """Aggregate multi-expert outputs per received token via gather + local sum.
+
+  After grouped GEMM processes the expanded (token, expert) pairs, this
+  function reduces them back to one row per received token using the routing
+  weights. Sorts rows by token_indices so each token's num_topk expert results
+  are contiguous, reshapes to [num_recv, num_topk, hidden], then sums over
+  the num_topk axis. This avoids scatter-add.
+
+  Args:
+    expert_output: [num_recv * num_topk, hidden_out] -- output from gmm.
+    token_indices: [num_recv * num_topk] -- from deepep_fan_out.
+    recv_topk_weights: [num_recv_tokens, num_topk] -- routing weights.
+    recv_topk_idx: [num_recv_tokens, num_topk] -- local expert IDs, -1 =
+      unassigned.
+    num_recv_tokens: total number of received tokens.
+    float32_weight_sum: if True, upcast to float32 for accumulation.
+
+  Returns:
+    aggregated: [num_recv_tokens, hidden_out] -- weighted sum of expert
+      outputs for each received token.
+  """
+  flat_idx = recv_topk_idx.reshape(-1)
+  valid = flat_idx >= 0
+  flat_weights = recv_topk_weights.reshape(-1)
+  slot_weights = jnp.where(valid, flat_weights, 0.0)
+
+  hidden_out = expert_output.shape[-1]
+  num_topk = expert_output.shape[0] // num_recv_tokens
+
+  if float32_weight_sum:
+    weighted_output = expert_output.astype(jnp.float32) * slot_weights[:, None]
+  else:
+    weighted_output = expert_output * slot_weights[:, None]
+
+  gather_order = jnp.argsort(token_indices, stable=True)
+  gathered = _sort_activations(weighted_output, gather_order, use_custom_vjp=True)
+  reshaped = gathered.reshape(num_recv_tokens, num_topk, hidden_out)
+  aggregated = reshaped.sum(axis=1)
+  return aggregated
 
 
 def random_routing(rng_key, gate_logits, num_experts_per_tok):
@@ -855,6 +965,30 @@ class RoutedMoE(nnx.Module):
               use_tokamax_backend=self.config.use_tokamax_gmm,
               is_fsdp_shard_on_exp=self.config.fsdp_shard_on_exp,
           )
+        elif self.config.use_turbo_grouped_gemm:
+          try:
+            from primus_turbo.jax.lax.grouped_gemm import grouped_gemm as turbo_grouped_gemm
+          except ImportError:
+            raise ImportError(
+                "use_turbo_grouped_gemm=True requires the primus_turbo package to be installed."
+            )
+          if not getattr(turbo_grouped_gemm, "_logged", False):
+            max_logging.log("Using primus_turbo grouped_gemm in MoE sparse matmul")
+            turbo_grouped_gemm._logged = True
+          # Thread-local x64: CK kernel requires int64 group_sizes, but
+          # global x64 breaks argsort (XLA-ROCm s32/s64 scatter mismatch).
+          # Use jax.experimental.enable_x64() for thread-local scope,
+          # safe for concurrent shard_map threads.
+          # Remove this once primus_turbo accepts int32 group_lens natively.
+          with jax.experimental.enable_x64():
+            output = turbo_grouped_gemm(
+                inputs,
+                kernel,
+                group_sizes.astype(jnp.int64),
+                transA=False,
+                transB=False,
+                num_cu=-1,
+            )
         else:
           rhs_inputs = kernel
           if isinstance(kernel, aqt.QTensor):
@@ -984,6 +1118,9 @@ class RoutedMoE(nnx.Module):
       else:
         expert_shard_id = 0
       num_expert_parallelism = self.get_expert_parallelism_size()
+      _deepep_combine_state = None
+      _deepep_valid_rows = None
+
       if self.config.use_ring_of_experts:
         # The ring-of-experts strategy first duplicates the inputs to all
         # expert shards, and then routes within each shard.
@@ -1009,66 +1146,130 @@ class RoutedMoE(nnx.Module):
         mask = jnp.arange(x.shape[0]) < jnp.sum(group_sizes)
         x = jnp.where(mask[:, None], x, 0)
       else:
-        x, sorted_selected_experts, weights, group_sizes, selected_experts = self.permute(
-            x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs
-        )
 
-        if num_expert_parallelism > 1:
-          batch_axis = "expert" if is_batch_sharded_by_expert else "data"
-          # get group sizes for all shards
+        if self.config.use_deepep_dispatch and num_expert_parallelism > 1:
+          from primus_turbo.jax.lax.moe import (  # pylint: disable=g-import-not-at-top
+              moe_combine as _deepep_moe_combine,
+              moe_dispatch as _deepep_moe_dispatch,
+          )
+
+          global _deepep_dispatch_logged  # pylint: disable=global-statement
+          if not _deepep_dispatch_logged:
+            max_logging.log(
+                f"Using Primus-Turbo DeepEP dispatch/combine for MoE expert parallelism "
+                f"(EP={num_expert_parallelism}, intranode NVLink IPC)"
+            )
+            _deepep_dispatch_logged = True
+
+          if self.dtype != jnp.bfloat16:
+            raise ValueError(
+                f"use_deepep_dispatch only supports dtype=bfloat16; got {self.dtype}."
+            )
+
+          weights, selected_experts_raw = self.get_topk(logits, pre_bias_logits, rngs)
+          x_2d = jnp.reshape(x, (batch_size * sequence_length, -1))
+
+          topk_idx = selected_experts_raw.reshape(
+              batch_size * sequence_length, self.num_experts_per_tok
+          ).astype(jnp.int32)
+          topk_weights_f32 = weights.reshape(
+              batch_size * sequence_length, self.num_experts_per_tok
+          ).astype(jnp.float32)
+
+          recv_x, recv_topk_idx, recv_topk_weights, deepep_handle = _deepep_moe_dispatch(
+              x_2d,
+              topk_idx=topk_idx,
+              topk_weights=topk_weights_f32,
+              num_experts=self.num_experts,
+              expert_alignment=1,
+          )
+
+          rank_prefix_matrix = deepep_handle[0]
+          actual_num_recv = rank_prefix_matrix[num_expert_parallelism - 1, expert_shard_id]
+          valid_recv_rows = jnp.arange(recv_topk_idx.shape[0]) < actual_num_recv
+          recv_topk_idx = jnp.where(valid_recv_rows[:, None], recv_topk_idx, -1)
+
           local_expert_size = self.config.num_experts // num_expert_parallelism
-          reshaped_group_sizes = jnp.sum(group_sizes.reshape(-1, local_expert_size), axis=1)
-          global_group_sizes = group_sizes
-          if is_batch_sharded_by_expert:
-            all_shards_group_sizes = jax.lax.all_gather(reshaped_group_sizes, axis_name=batch_axis)
-            input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
-                all_shards_group_sizes,
-                expert_shard_id,
-                num_expert_parallelism,
-            )
+          expanded_x, expert_ids, group_sizes, fan_out_token_indices = deepep_fan_out(
+              recv_x, recv_topk_idx, local_expert_size,
+          )
 
-            # TODO(ranran): For better performance, we could update output buffer to a smaller
-            # size to replace self.get_expert_parallelism_size() for efficiency,
-            # Or we could apply capacity_factor for excessive experts.
-            # Note: Reducing buffer increase the risk of token dropping under unbalanced distribution.
+          deepep_sort_idx = jnp.argsort(expert_ids.astype(jnp.int32))
+          x = expanded_x[deepep_sort_idx]
+          _deepep_valid_rows = (jnp.arange(x.shape[0]) < jnp.sum(group_sizes))[:, None]
+          x = jnp.where(_deepep_valid_rows, x, 0)
+          selected_experts = jnp.where(
+              expert_ids < local_expert_size, expert_ids, 0
+          )[deepep_sort_idx]
 
-            # In the worst case, all of the global input data is assigned to each expert in the current shard.
-            # This would result in num_expert_shards * input_size * experts_per_shard assignments. However, if
-            # experts_per_shard > num_experts_per_tok we cannot assign more than num_experts_per_tok to all of the inputs.
-            max_local_experts_per_tok = min(local_expert_size, self.config.num_experts_per_tok)
-            buffer_size = int(num_expert_parallelism * batch_size * sequence_length * max_local_experts_per_tok)
-            output_shape = jnp.zeros((buffer_size, self.config.emb_dim), dtype=x.dtype)
+          _deepep_combine_state = _DeepEPCombineState(
+              handle=deepep_handle,
+              recv_topk_weights=recv_topk_weights,
+              recv_topk_idx=recv_topk_idx,
+              fan_out_token_indices=fan_out_token_indices,
+              sort_idx=deepep_sort_idx,
+              num_recv_tokens=recv_x.shape[0],
+              combine_fn=_deepep_moe_combine,
+          )
+          sorted_selected_experts = jnp.array([], dtype=jnp.int32)
 
-            x = jax.lax.ragged_all_to_all(
-                x,
-                output_shape,
-                input_offsets,
-                send_sizes,
-                output_offsets,
-                recv_sizes,
-                axis_name=expert_axis_name,
-            )
-            global_group_sizes = jax.lax.all_gather(group_sizes, axis_name=expert_axis_name)
-            x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
-                x,
-                global_group_sizes,
-                local_expert_size,
-                shard_index=expert_shard_id,
-                use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-            )
-          else:
-            x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
-                x,
-                global_group_sizes[None, :],
-                local_expert_size,
-                shard_index=expert_shard_id,
-                is_offset=True,
-                global_sorted_experts=selected_experts,
-                use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-            )
+        else:
+          x, sorted_selected_experts, weights, group_sizes, selected_experts = self.permute(
+              x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs
+          )
+
+          if num_expert_parallelism > 1:
+            batch_axis = "expert" if is_batch_sharded_by_expert else "data"
+            # get group sizes for all shards
+            local_expert_size = self.config.num_experts // num_expert_parallelism
+            reshaped_group_sizes = jnp.sum(group_sizes.reshape(-1, local_expert_size), axis=1)
+            global_group_sizes = group_sizes
+            if is_batch_sharded_by_expert:
+              all_shards_group_sizes = jax.lax.all_gather(reshaped_group_sizes, axis_name=batch_axis)
+              input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
+                  all_shards_group_sizes,
+                  expert_shard_id,
+                  num_expert_parallelism,
+              )
+
+              max_local_experts_per_tok = min(local_expert_size, self.config.num_experts_per_tok)
+              buffer_size = int(num_expert_parallelism * batch_size * sequence_length * max_local_experts_per_tok)
+              output_shape = jnp.zeros((buffer_size, self.config.emb_dim), dtype=x.dtype)
+
+              x = jax.lax.ragged_all_to_all(
+                  x,
+                  output_shape,
+                  input_offsets,
+                  send_sizes,
+                  output_offsets,
+                  recv_sizes,
+                  axis_name=expert_axis_name,
+              )
+              global_group_sizes = jax.lax.all_gather(group_sizes, axis_name=expert_axis_name)
+              x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
+                  x,
+                  global_group_sizes,
+                  local_expert_size,
+                  shard_index=expert_shard_id,
+                  use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+              )
+            else:
+              x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
+                  x,
+                  global_group_sizes[None, :],
+                  local_expert_size,
+                  shard_index=expert_shard_id,
+                  is_offset=True,
+                  global_sorted_experts=selected_experts,
+                  use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+              )
 
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(selected_experts, w0_bias, w1_bias, wo_bias)
+        if _deepep_valid_rows is not None:
+          w0_bias = jnp.where(_deepep_valid_rows, w0_bias, 0)
+          w1_bias = jnp.where(_deepep_valid_rows, w1_bias, 0)
+          wo_bias = jnp.where(_deepep_valid_rows, wo_bias, 0)
 
       gmm_fn = functools.partial(
           gmm,
@@ -1139,67 +1340,84 @@ class RoutedMoE(nnx.Module):
         output = jax.lax.psum_scatter(output, expert_axis_name, scatter_dimension=0, tiled=True)
 
       else:
-        if num_expert_parallelism > 1:
-          original_inputs_first_dim = batch_size * sequence_length * self.config.num_experts_per_tok
-          if sorted_selected_experts.shape[0] != original_inputs_first_dim:
-            raise ValueError("original_inputs_first_dim does not match the original tensor" " shape!")
-          output_shape = jnp.zeros(
-              (
-                  original_inputs_first_dim,
-                  self.config.emb_dim // self.get_tensor_parallelism_size(),
-              ),
-              dtype=intermediate_output.dtype,
-          )
-          if is_batch_sharded_by_expert:
-            # locally unpermute back to the original order
-            local_output = _sort_activations(
-                intermediate_output,
-                jnp.argsort(local_sorted_indices),  # pylint: disable=undefined-variable
-                self.config.use_custom_sort_vjp,
-            )
-            input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
-                jnp.transpose(all_shards_group_sizes),  # pylint: disable=undefined-variable
-                expert_shard_id,
-                num_expert_parallelism,
-            )
-            intermediate_output = jax.lax.ragged_all_to_all(
-                local_output,
-                output_shape,
-                input_offsets,
-                send_sizes,
-                output_offsets,
-                recv_sizes,
-                axis_name=expert_axis_name,
-            )
-          else:
-            # If bach is replicated across EP shards then each shard should send
-            # 0..local_shard_size data to the other shards and receive the
-            # local_shard data from all of the other shards using
-            # ragged_all_to_all.
-            input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
-                reshaped_group_sizes,  # pylint: disable=undefined-variable
-                expert_shard_id,
-                num_expert_parallelism,
-                is_batch_sharded=False,
-            )
-            intermediate_output = jax.lax.ragged_all_to_all(
-                intermediate_output,
-                output_shape,
-                input_offsets,
-                send_sizes,
-                output_offsets,
-                recv_sizes,
-                axis_name=expert_axis_name,
-            )
+        if self.config.use_deepep_dispatch and num_expert_parallelism > 1:
+          cs = _deepep_combine_state
+          intermediate_output = jnp.where(_deepep_valid_rows, intermediate_output, 0)
 
-        output = self.unpermute(
-            intermediate_output,
-            sorted_selected_experts,
-            weights,
-            batch_size=batch_size,
-            sequence_length=sequence_length,
-            use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-        )
+          unsort_idx = jnp.argsort(cs.sort_idx)
+          unsorted_output = _sort_activations(intermediate_output, unsort_idx, use_custom_vjp=True)
+
+          aggregated = deepep_fan_in(
+              unsorted_output,
+              cs.fan_out_token_indices,
+              cs.recv_topk_weights,
+              cs.recv_topk_idx,
+              cs.num_recv_tokens,
+              float32_weight_sum=self.config.float32_weight_sum,
+          )
+
+          combined_x = cs.combine_fn(
+              aggregated.astype(jnp.bfloat16), handle=cs.handle,
+          )
+          output = combined_x.reshape(batch_size, sequence_length, -1).astype(self.dtype)
+
+        else:
+          if num_expert_parallelism > 1:
+            original_inputs_first_dim = batch_size * sequence_length * self.config.num_experts_per_tok
+            if sorted_selected_experts.shape[0] != original_inputs_first_dim:
+              raise ValueError("original_inputs_first_dim does not match the original tensor" " shape!")
+            output_shape = jnp.zeros(
+                (
+                    original_inputs_first_dim,
+                    self.config.emb_dim // self.get_tensor_parallelism_size(),
+                ),
+                dtype=intermediate_output.dtype,
+            )
+            if is_batch_sharded_by_expert:
+              local_output = _sort_activations(
+                  intermediate_output,
+                  jnp.argsort(local_sorted_indices),  # pylint: disable=undefined-variable
+                  self.config.use_custom_sort_vjp,
+              )
+              input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
+                  jnp.transpose(all_shards_group_sizes),  # pylint: disable=undefined-variable
+                  expert_shard_id,
+                  num_expert_parallelism,
+              )
+              intermediate_output = jax.lax.ragged_all_to_all(
+                  local_output,
+                  output_shape,
+                  input_offsets,
+                  send_sizes,
+                  output_offsets,
+                  recv_sizes,
+                  axis_name=expert_axis_name,
+              )
+            else:
+              input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
+                  reshaped_group_sizes,  # pylint: disable=undefined-variable
+                  expert_shard_id,
+                  num_expert_parallelism,
+                  is_batch_sharded=False,
+              )
+              intermediate_output = jax.lax.ragged_all_to_all(
+                  intermediate_output,
+                  output_shape,
+                  input_offsets,
+                  send_sizes,
+                  output_offsets,
+                  recv_sizes,
+                  axis_name=expert_axis_name,
+              )
+
+          output = self.unpermute(
+              intermediate_output,
+              sorted_selected_experts,
+              weights,
+              batch_size=batch_size,
+              sequence_length=sequence_length,
+              use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+          )
 
       return output, None
 
