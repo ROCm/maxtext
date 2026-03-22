@@ -1480,27 +1480,6 @@ class RoutedMoE(nnx.Module):
       wo_bias,
   ) -> tuple[jax.Array, Optional[jax.Array]]:
     """Dense matrix multiplication."""
-    if self.config.expert_balance:
-      ######################################################################################################
-      ############################## start hard code for uniform expert ####################################
-      # Create deterministic rotational pattern for gate logits
-      batch_size, seq_len, num_experts = gate_logits.shape
-
-      # Create base weights for experts (increasing values)
-      base_weights = jnp.linspace(0.1, 0.1 * num_experts, num_experts, dtype=gate_logits.dtype)
-
-      # Create position-based indices matrix [seq_len, num_experts]
-      # Each row represents which index in base_weights to use after rotation
-      indices = (jnp.arange(num_experts)[None, :] + jnp.arange(seq_len)[:, None]) % num_experts
-
-      # Use advanced indexing to create the rotated weights matrix in one operation
-      # This takes the appropriate weight for each position based on the rotation pattern
-      rotated_weights = base_weights[indices]
-
-      # Broadcast to batch dimension
-      gate_logits = jnp.broadcast_to(rotated_weights[None, :, :], (batch_size, seq_len, num_experts))
-      ############################################# end ####################################################
-      ######################################################################################################
     # gate_logits: batch, length, expert
     gate_logits = nn.with_logical_constraint(gate_logits, ("activation_batch", "activation_norm_length", None))
     if self.config.model_name.startswith("deepseek3"):
@@ -1800,6 +1779,17 @@ class RoutedMoE(nnx.Module):
     cfg = self.config
     inputs = inputs.astype(cfg.dtype)
     gate_logits, pre_bias_logits = self.gate(inputs)
+
+    if cfg.expert_balance:
+      ######################################################################################################
+      ############################## start hard code for uniform expert ####################################
+      batch_size, seq_len, num_experts = gate_logits.shape
+      base_weights = jnp.linspace(0.1, 0.1 * num_experts, num_experts, dtype=gate_logits.dtype)
+      indices = (jnp.arange(num_experts)[None, :] + jnp.arange(seq_len)[:, None]) % num_experts
+      rotated_weights = base_weights[indices]
+      gate_logits = jnp.broadcast_to(rotated_weights[None, :, :], (batch_size, seq_len, num_experts))
+      ############################################# end ####################################################
+      ######################################################################################################
 
     w0_kernel = jnp.asarray(self.wi_0[...], self.dtype)
     w1_kernel = jnp.asarray(self.wi_1[...], self.dtype)
