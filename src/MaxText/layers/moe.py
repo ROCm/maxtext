@@ -1393,7 +1393,7 @@ class RoutedMoE(nnx.Module):
           intermediate_output = jnp.where(_deepep_valid_rows, intermediate_output, 0)
 
           unsort_idx = jnp.argsort(cs.sort_idx)
-          unsorted_output = intermediate_output[unsort_idx]
+          unsorted_output = _sort_activations(intermediate_output, unsort_idx, use_custom_vjp=True)
 
           aggregated = deepep_fan_in(
               unsorted_output,
