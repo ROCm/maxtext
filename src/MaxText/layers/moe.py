@@ -169,14 +169,19 @@ def deepep_fan_in(
     num_recv_tokens: int,
     float32_weight_sum: bool = True,
 ) -> jax.Array:
-  """Aggregate multi-expert outputs per received token via weighted scatter-add.
+  """Aggregate multi-expert outputs per received token via gather + local sum.
 
   After gmm processes the expanded (token, expert) pairs, this function
   reduces them back to one row per received token using the routing weights.
   Uses static-shape ops only (compatible with jax.jit).
 
   Invalid slots (recv_topk_idx == -1) get weight 0, so they contribute nothing
-  to the aggregation even though the scatter-add touches all rows.
+  to the aggregation.
+
+  Implementation: sorts rows by token_indices so each token's num_topk expert
+  results are contiguous, reshapes to [num_recv, num_topk, hidden], then sums
+  over the num_topk axis. This avoids the indexed scatter-add that XLA lowers
+  to atomic GPU writes with poor memory coalescing.
 
   Args:
     expert_output: [num_recv * num_topk, hidden_out] -- output from gmm (after
@@ -195,22 +200,23 @@ def deepep_fan_in(
     aggregated: [num_recv_tokens, hidden_out] -- weighted sum of expert
       outputs for each received token.
   """
-  hidden_out = expert_output.shape[-1]
-
   flat_idx = recv_topk_idx.reshape(-1)
   valid = flat_idx >= 0
   flat_weights = recv_topk_weights.reshape(-1)
   slot_weights = jnp.where(valid, flat_weights, 0.0)
 
+  hidden_out = expert_output.shape[-1]
+  num_topk = expert_output.shape[0] // num_recv_tokens
+
   if float32_weight_sum:
-    accum_dtype = jnp.float32
     weighted_output = expert_output.astype(jnp.float32) * slot_weights[:, None]
   else:
-    accum_dtype = expert_output.dtype
     weighted_output = expert_output * slot_weights[:, None]
 
-  aggregated = jnp.zeros((num_recv_tokens, hidden_out), dtype=accum_dtype)
-  aggregated = aggregated.at[token_indices].add(weighted_output)
+  gather_order = jnp.argsort(token_indices, stable=True)
+  gathered = _sort_activations(weighted_output, gather_order, use_custom_vjp=True)
+  reshaped = gathered.reshape(num_recv_tokens, num_topk, hidden_out)
+  aggregated = reshaped.sum(axis=1)
   return aggregated
 
 
