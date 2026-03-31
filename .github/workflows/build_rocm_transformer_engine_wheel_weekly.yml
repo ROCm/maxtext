@@ -48,6 +48,13 @@ jobs:
           source .venv/bin/activate
           uv pip install -r src/dependencies/requirements/requirements_decoupled_rocm_jax_0_8_2.txt
 
+      - name: Install PyTorch ROCm (build-time dep for aiter JIT)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          uv pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+
       - name: Detect ROCm version and Python tag
         shell: bash
         run: |
@@ -114,7 +121,6 @@ jobs:
           export NVTE_USE_ROCM=1
           export NVTE_FUSED_ATTN_AOTRITON=0
           export NVTE_BUILD_MAX_JOBS=180
-          #export NVTE_AITER_PREBUILT_BASE_URL=https://compute-artifactory.amd.com:5000/artifactory/rocm-generic-local/te-ci/aiter-prebuilts
 
           echo "=== Building TE wheel for ${SELECTOR} (gfx=${GFX_ARCH}) ==="
           pushd TransformerEngine >/dev/null
