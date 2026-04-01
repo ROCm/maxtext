@@ -859,9 +859,7 @@ class RoutedMoE(nnx.Module):
           try:
             from primus_turbo.jax.lax.grouped_gemm import grouped_gemm as turbo_grouped_gemm
           except ImportError:
-            raise ImportError(
-                "use_turbo_grouped_gemm=True requires the primus_turbo package to be installed."
-            )
+            raise ImportError("use_turbo_grouped_gemm=True requires the primus_turbo package to be installed.")
           if not getattr(turbo_grouped_gemm, "_logged", False):
             max_logging.log("Using primus_turbo grouped_gemm in MoE sparse matmul")
             turbo_grouped_gemm._logged = True
@@ -1469,7 +1467,10 @@ class RoutedMoE(nnx.Module):
       def aqt_einsum(*args, **kwargs):  # pylint: disable=unused-argument
         # simply skip kwargs, since aqt einsum doesn't support any kwargs
         # like precision
-        is_aqt = not ( isinstance(self.quant, quantizations.Fp8Quantization) or isinstance(self.quant, quantizations.NANOOFp8Quantization) )
+        is_aqt = not (
+            isinstance(self.quant, quantizations.Fp8Quantization)
+            or isinstance(self.quant, quantizations.NANOOFp8Quantization)
+        )
         kw = {"mesh_axes": rhs_mesh_axes} if is_aqt else {"dtype": self.dtype}
         return self.quant.einsum(**kw)(*args)  # pytype: disable=attribute-error
 
