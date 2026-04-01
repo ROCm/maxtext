@@ -879,6 +879,23 @@ class RoutedMoE(nnx.Module):
                 transB=False,
                 num_cu=-1,
             )
+        elif self.config.use_turbo_grouped_gemm_fp8:
+          try:
+            from primus_turbo.jax.lax.grouped_gemm_fp8 import grouped_gemm_fp8 as turbo_grouped_gemm_fp8
+          except ImportError:
+            raise ImportError(
+                "use_turbo_grouped_gemm_fp8=True requires the primus_turbo package to be installed."
+            )
+          if not getattr(turbo_grouped_gemm_fp8, "_logged", False):
+            max_logging.log("Using primus_turbo grouped_gemm_fp8 (E4M3, tensorwise) in MoE sparse matmul")
+            turbo_grouped_gemm_fp8._logged = True
+          with jax.experimental.enable_x64():
+            output = turbo_grouped_gemm_fp8(
+                inputs,
+                kernel,
+                group_lens=group_sizes.astype(jnp.int64),
+                trans_b=False,
+            )
         else:
           rhs_inputs = kernel
           if isinstance(kernel, aqt.QTensor):

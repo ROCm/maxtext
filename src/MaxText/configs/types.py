@@ -562,6 +562,13 @@ class MoEKernels(BaseModel):
       "Requires sparse_matmul=True and megablox=False. "
       "Requires the primus_turbo package to be installed.",
   )
+  use_turbo_grouped_gemm_fp8: bool = Field(
+      False,
+      description="Use Primus Turbo grouped GEMM with FP8 quantization for MoE sparse matmul. "
+      "Inputs/outputs remain in the model dtype (bf16/fp16); FP8 quantization is handled "
+      "internally by the Primus kernel (E4M3 format, tensorwise scaling). "
+      "Requires sparse_matmul=True, megablox=False, and the primus_turbo package.",
+  )
   wi_tile_fwd_batch_seq: int = Field(512, description="forward pass tiling dimension for batch/sequence in GMM for wi.")
   wi_tile_fwd_embed_dim: int = Field(1024, description="forward pass tiling dimension for embedding in GMM for wi.")
   wi_tile_fwd_mlp_dim: int = Field(1024, description="forward pass tiling dimension for MLP in GMM for wi.")
@@ -1912,6 +1919,18 @@ class MaxTextConfig(
         raise ValueError("use_turbo_grouped_gemm requires sparse_matmul=True.")
       if self.megablox:
         raise ValueError("use_turbo_grouped_gemm requires megablox=False.")
+    if self.use_turbo_grouped_gemm_fp8:
+      if self.use_turbo_grouped_gemm:
+        raise ValueError(
+            "use_turbo_grouped_gemm and use_turbo_grouped_gemm_fp8 are mutually exclusive. "
+            "Set exactly one."
+        )
+      if self.quantization:
+        raise ValueError("use_turbo_grouped_gemm_fp8 is not compatible with quantization.")
+      if not self.sparse_matmul:
+        raise ValueError("use_turbo_grouped_gemm_fp8 requires sparse_matmul=True.")
+      if self.megablox:
+        raise ValueError("use_turbo_grouped_gemm_fp8 requires megablox=False.")
     if self.use_multimodal:
       valid_mm_models = ("gemma3-4b", "gemma3-12b", "gemma3-27b", "llama4-17b-16e", "llama4-17b-128e")
       if self.model_name not in valid_mm_models and self.model_name != "default":
