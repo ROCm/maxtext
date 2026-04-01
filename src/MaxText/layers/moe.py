@@ -855,6 +855,28 @@ class RoutedMoE(nnx.Module):
               use_tokamax_backend=self.config.use_tokamax_gmm,
               is_fsdp_shard_on_exp=self.config.fsdp_shard_on_exp,
           )
+        elif self.config.use_turbo_grouped_gemm:
+          try:
+            from primus_turbo.jax.lax.grouped_gemm import grouped_gemm as turbo_grouped_gemm
+          except ImportError:
+            raise ImportError("use_turbo_grouped_gemm=True requires the primus_turbo package to be installed.")
+          if not getattr(turbo_grouped_gemm, "_logged", False):
+            max_logging.log("Using primus_turbo grouped_gemm in MoE sparse matmul")
+            turbo_grouped_gemm._logged = True
+          # Thread-local x64: CK kernel requires int64 group_sizes, but
+          # global x64 breaks argsort (XLA-ROCm s32/s64 scatter mismatch).
+          # Use jax.experimental.enable_x64() for thread-local scope,
+          # safe for concurrent shard_map threads.
+          # Remove this once primus_turbo accepts int32 group_lens natively.
+          with jax.experimental.enable_x64():
+            output = turbo_grouped_gemm(
+                inputs,
+                kernel,
+                group_sizes.astype(jnp.int64),
+                transA=False,
+                transB=False,
+                num_cu=-1,
+            )
         else:
           rhs_inputs = kernel
           if isinstance(kernel, aqt.QTensor):
@@ -1445,7 +1467,10 @@ class RoutedMoE(nnx.Module):
       def aqt_einsum(*args, **kwargs):  # pylint: disable=unused-argument
         # simply skip kwargs, since aqt einsum doesn't support any kwargs
         # like precision
-        is_aqt = not ( isinstance(self.quant, quantizations.Fp8Quantization) or isinstance(self.quant, quantizations.NANOOFp8Quantization) )
+        is_aqt = not (
+            isinstance(self.quant, quantizations.Fp8Quantization)
+            or isinstance(self.quant, quantizations.NANOOFp8Quantization)
+        )
         kw = {"mesh_axes": rhs_mesh_axes} if is_aqt else {"dtype": self.dtype}
         return self.quant.einsum(**kw)(*args)  # pytype: disable=attribute-error
 
