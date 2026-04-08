@@ -116,8 +116,8 @@ jobs:
             "gpu-integration": "not cpu_only and not tpu_only and integration_test and not post_training",
             "cpu-unit": "cpu_only and not post_training",
             "cpu-post-training-unit": "cpu_only",
-            "rocm-unit": "not cpu_only and not tpu_only and not integration_test and not post_training and not decoupled",
-            "rocm-decoupled": "decoupled"
+            "rocm-unit": "not cpu_only and not tpu_only and not decoupled",
+            "rocm-decoupled": "not cpu_only and not tpu_only and decoupled"
           }')[inputs.flavor] }}
 
       pytest_addopts: >-
@@ -144,7 +144,7 @@ jobs:
             "gpu-integration": "--ignore=tests/post_training",
             "cpu-unit": "--ignore=tests/post_training",
             "cpu-post-training-unit": "",
-            "rocm-unit": "--ignore=tests/post_training",
+            "rocm-unit": "",
             "rocm-decoupled": ""
           }')[inputs.flavor] }}
 
