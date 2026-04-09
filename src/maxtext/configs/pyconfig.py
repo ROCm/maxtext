@@ -320,7 +320,7 @@ def initialize_pydantic(argv: list[str], **kwargs) -> MaxTextConfig:
     if not os.path.isfile(model_config_path):
       # Fallback to the default location within package
       dir_path = os.path.dirname(os.path.realpath(__file__))
-      model_config_path = os.path.join(dir_path, "configs", "models", f"{model_name}.yml")
+      model_config_path = os.path.join(dir_path, "models", f"{model_name}.yml")
 
     if os.path.exists(model_config_path):
       model_loaded_cfg = omegaconf.OmegaConf.load(model_config_path)
