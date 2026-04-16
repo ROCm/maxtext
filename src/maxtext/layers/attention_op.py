@@ -1786,6 +1786,14 @@ class AttentionOp(nnx.Module):
       attn_mask = None
       dummy_attn_mask = None
       mask_type = "causal"
+    elif self.config.dataset_type == "synthetic":
+      # Synthetic batches are unpadded and single-segment (the pipeline hands out an all-ones
+      # inputs_segmentation), so a causal mask is already exact and the S x S mask built below can
+      # be skipped. Unlike context parallelism this places no limit on the attention type: a
+      # sliding window reaches the kernel as window_size rather than through attn_mask.
+      attn_mask = None
+      dummy_attn_mask = None
+      mask_type = "causal"
     elif model_mode == MODEL_MODE_PREFILL and self.config.attention_kernel == "cudnn":
       # Prefill with CUDNN attention does not support packing or context parallelism.
       attn_mask = None
