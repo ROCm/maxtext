@@ -771,6 +771,7 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any]:
   config = pyconfig.initialize(argv)
   max_utils.print_system_information()
   train_utils.validate_train_config(config)
+  max_utils.save_device_information(config)
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
   jax.config.update("jax_remove_size_one_mesh_axis_from_type", config.remove_size_one_mesh_axis_from_type)
   os.environ["TFDS_DATA_DIR"] = config.dataset_path or ""
