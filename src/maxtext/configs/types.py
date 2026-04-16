@@ -694,6 +694,7 @@ class MoEGeneral(BaseModel):
       None, description="Padded intermediate dimension at MoE layer for efficient GMM_v2 kernel execution."
   )
   load_balance_loss_weight: NonNegativeFloat = Field(0.0, description="Weight for the load balancing auxiliary loss.")
+  expert_balance: bool = Field(False, description="Whether to use expert balancing.")
   use_custom_sort_vjp: bool = Field(
       True,
       description="Whether to use a custom VJP sort for efficient backward pass processing in sparse matmul.",
