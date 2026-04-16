@@ -90,6 +90,7 @@ class GemmaDecoderLayer(nnx.Module):
         kv_quant=quantizations.configure_kv_quant(config),
         use_ragged_attention=config.use_ragged_attention,
         ragged_block_size=config.ragged_block_size,
+        query_pre_attn_scalar=(config.head_dim**-0.5),
         model_mode=self.model_mode,
         rngs=self.rngs,
     )
