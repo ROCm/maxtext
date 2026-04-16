@@ -98,6 +98,7 @@ class LlamaDecoderLayer(nnx.Module):
         reshape_q=config.reshape_q,
         use_ragged_attention=config.use_ragged_attention,
         ragged_block_size=config.ragged_block_size,
+        query_pre_attn_scalar=(config.head_dim**-0.5),
         model_mode=model_mode,
         attn_logits_soft_cap=config.attn_logits_soft_cap,
         rngs=rngs,

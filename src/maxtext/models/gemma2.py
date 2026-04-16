@@ -92,6 +92,7 @@ class Gemma2DecoderLayer(nnx.Module):
         attention_type=attentions.AttentionType.LOCAL_SLIDING,
         sliding_window_size=config.sliding_window_size,
         attn_logits_soft_cap=config.attn_logits_soft_cap,
+        query_pre_attn_scalar=(config.head_dim**-0.5),
         model_mode=self.model_mode,
         rngs=self.rngs,
     )
@@ -170,6 +171,7 @@ class Gemma2DecoderLayer(nnx.Module):
         kv_quant=quantizations.configure_kv_quant(config),
         attention_type=attentions.AttentionType.GLOBAL,
         attn_logits_soft_cap=config.attn_logits_soft_cap,
+        query_pre_attn_scalar=(config.head_dim**-0.5),
         model_mode=model_mode,
         rngs=self.rngs,
     )
