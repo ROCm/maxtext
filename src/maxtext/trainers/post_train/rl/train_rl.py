@@ -97,7 +97,7 @@ def get_maxtext_model(config, devices=None):
   # load_parameters_path=/path/to/your/output/directory/0/items
   """
   model, mesh = model_creation_utils.create_nnx_model(config, devices=devices)
-  with mesh:
+  with jax.set_mesh(mesh):
     use_no_op_mappings = "maxtext_config" in config.vllm_additional_config
     tunix_model = TunixMaxTextAdapter(base_model=model, use_no_op_mappings=use_no_op_mappings)
     tunix_model.config = None
