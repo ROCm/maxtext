@@ -1573,7 +1573,7 @@ class AttentionOp(nnx.Module):
       dummy_segment_ids = jnp.ones(shape=query.shape[:2], dtype=jnp.int32)
       dummy_attn_mask = _sequence_descriptor(dummy_segment_ids)
       max_segments_per_seq = self.config.max_segments_per_seq
-    elif using_context_parallelism:
+    elif using_context_parallelism or self.config.dataset_type == "synthetic":
       if self.attention_type == AttentionType.LOCAL_SLIDING:
         raise AssertionError(
             "Sliding window attention requires context parallelism with load-balanced ring strategy "
