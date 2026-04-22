@@ -618,7 +618,7 @@ class RoutedMoE(nnx.Module):
       else:
         layer_act = self.activation_fn(layer_w0)
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
-      return intermediate_layer.astype(self.dtype)
+      return intermediate_layer
 
   def permute(self, inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp=True, rngs=None, roll_to_expert_id=None):
     """Permute tokens to group by expert to fit gmm call."""
