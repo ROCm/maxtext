@@ -1190,12 +1190,28 @@ class RoutedMoE(nnx.Module):
           recv_topk_idx = jnp.where(valid_recv_rows[:, None], recv_topk_idx, -1)
 
           local_expert_size = self.config.num_experts // num_expert_parallelism
-          expanded_x, expert_ids, group_sizes, fan_out_token_indices = deepep_fan_out(
-              recv_x, recv_topk_idx, local_expert_size,
+          # Compose the fan-out gather with the sort permutation into a single
+          # gather. The backward pass then accumulates one scatter-add into
+          # recv_x instead of two chained ones, halving the cost of the
+          # corresponding XLA scatter fusion on the dispatch side.
+          #
+          # The dispatch-side jnp.where below must stay: its backward zeros
+          # gradients flowing out of the grouped-GEMM VJP for rows beyond
+          # sum(group_sizes). Without the mask, garbage gradients from those
+          # out-of-group rows scatter back into recv_x at valid-token indices
+          # (composed_idx for padded positions still points to real tokens),
+          # causing training to plateau at initialization.
+          flat_idx    = recv_topk_idx.reshape(-1)
+          expert_ids  = jnp.where(flat_idx >= 0, flat_idx, local_expert_size)
+          group_sizes = jnp.bincount(
+              expert_ids.astype(jnp.int32), length=local_expert_size + 1
+          )[:local_expert_size]
+          deepep_sort_idx       = jnp.argsort(expert_ids.astype(jnp.int32))
+          fan_out_token_indices = jnp.repeat(
+              jnp.arange(recv_x.shape[0]), recv_topk_idx.shape[1]
           )
-
-          deepep_sort_idx = jnp.argsort(expert_ids.astype(jnp.int32))
-          x = expanded_x[deepep_sort_idx]
+          composed_idx = fan_out_token_indices[deepep_sort_idx]
+          x            = recv_x[composed_idx]
           _deepep_valid_rows = (jnp.arange(x.shape[0]) < jnp.sum(group_sizes))[:, None]
           x = jnp.where(_deepep_valid_rows, x, 0)
           selected_experts = jnp.where(
