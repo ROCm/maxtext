@@ -156,6 +156,54 @@ def deepep_fan_out(
   return expanded_x, expert_ids, group_sizes, token_indices
 
 
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _deepep_dispatch_fan_out(
+    recv_x: jax.Array,
+    sort_idx: jax.Array,
+    num_topk: int,
+) -> jax.Array:
+  """Fan recv_x out onto the sorted expert-dispatch layout.
+
+  Forward: x[i] = recv_x[sort_idx[i] // num_topk]. Implemented as a single
+  gather with composed index sort_idx // num_topk, so only one [N*K, H]
+  tensor is materialized on the main stream.
+
+  The custom backward avoids the atomic scatter-add that JAX's autodiff
+  would otherwise emit for a duplicate-index gather: it inverts the
+  permutation with argsort(sort_idx) and folds the top-K duplicates with
+  a pure reduce-sum instead of a duplicate-index scatter. This removes
+  the dominant input_scatter_fusion kernel from the dispatch-side backward.
+
+  `sort_idx` is an integer tensor with no meaningful gradient; `num_topk`
+  is a Python int (captured via nondiff_argnums).
+  """
+  composed_idx = sort_idx // num_topk
+  return recv_x[composed_idx]
+
+
+def _deepep_dispatch_fan_out_fwd(recv_x, sort_idx, num_topk):
+  composed_idx = sort_idx // num_topk
+  return recv_x[composed_idx], (sort_idx, recv_x.shape)
+
+
+def _deepep_dispatch_fan_out_bwd(num_topk, residual, grad_x):
+  sort_idx, recv_x_shape = residual
+  unsort_idx = jnp.argsort(sort_idx)
+  grad_fanned = grad_x[unsort_idx]  # permutation gather, no atomics
+  num_recv_tokens, hidden = recv_x_shape
+  grad_recv_x = grad_fanned.reshape(
+      num_recv_tokens, num_topk, hidden
+  ).sum(axis=1)  # fold K duplicates with a reduction, not a scatter-add
+  # sort_idx is integer and has no real gradient; return zeros to satisfy
+  # custom_vjp's arity (one cotangent per differentiable input).
+  return (grad_recv_x, jnp.zeros_like(sort_idx))
+
+
+_deepep_dispatch_fan_out.defvjp(
+    _deepep_dispatch_fan_out_fwd, _deepep_dispatch_fan_out_bwd
+)
+
+
 def deepep_fan_in(
     expert_output: jax.Array,
     token_indices: jax.Array,
@@ -1190,17 +1238,17 @@ class RoutedMoE(nnx.Module):
           recv_topk_idx = jnp.where(valid_recv_rows[:, None], recv_topk_idx, -1)
 
           local_expert_size = self.config.num_experts // num_expert_parallelism
-          # Compose the fan-out gather with the sort permutation into a single
-          # gather. The backward pass then accumulates one scatter-add into
-          # recv_x instead of two chained ones, halving the cost of the
-          # corresponding XLA scatter fusion on the dispatch side.
+          # Dispatch-side fan-out via _deepep_dispatch_fan_out (custom_vjp):
+          # forward does the single composed gather recv_x[sort_idx // K],
+          # backward inverts the permutation with argsort and folds the K
+          # duplicates with a reduce-sum — no atomic scatter-add. This
+          # removes the dominant input_scatter_fusion kernel.
           #
           # The dispatch-side jnp.where below must stay: its backward zeros
           # gradients flowing out of the grouped-GEMM VJP for rows beyond
           # sum(group_sizes). Without the mask, garbage gradients from those
-          # out-of-group rows scatter back into recv_x at valid-token indices
-          # (composed_idx for padded positions still points to real tokens),
-          # causing training to plateau at initialization.
+          # out-of-group rows fold into recv_x via the reduce-sum, stalling
+          # training at initialization.
           flat_idx    = recv_topk_idx.reshape(-1)
           expert_ids  = jnp.where(flat_idx >= 0, flat_idx, local_expert_size)
           group_sizes = jnp.bincount(
@@ -1210,8 +1258,8 @@ class RoutedMoE(nnx.Module):
           fan_out_token_indices = jnp.repeat(
               jnp.arange(recv_x.shape[0]), recv_topk_idx.shape[1]
           )
-          composed_idx = fan_out_token_indices[deepep_sort_idx]
-          x            = recv_x[composed_idx]
+          num_topk = recv_topk_idx.shape[1]
+          x = _deepep_dispatch_fan_out(recv_x, deepep_sort_idx, num_topk)
           _deepep_valid_rows = (jnp.arange(x.shape[0]) < jnp.sum(group_sizes))[:, None]
           x = jnp.where(_deepep_valid_rows, x, 0)
           selected_experts = jnp.where(
