@@ -1552,13 +1552,22 @@ class AttentionOp(nnx.Module):
       dummy_attn_mask = None
       mask_type = "causal"
     else:
-      # Default case: no packing, no context parallelism
-      dummy_attn_mask = jnp.zeros(
-          (1, 1, 1, self.max_target_length, self.max_target_length),
-          dtype=jnp.uint8,
-      )
-      attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
-      attn_mask = jnp.where((attn_mask >= DEFAULT_MASK_VALUE * 0.5), 0, 1).astype(jnp.uint8)
+      # Default case: no packing, no context parallelism.
+      # For synthetic data, segment IDs are always all-ones (one segment per sequence), so
+      # the segment mask is all-True and the combined mask reduces to pure causal masking.
+      # Use mask_type="causal" directly to avoid materializing f32/s32[seq,seq] tensors that
+      # XLA loop_broadcast_fusion hoists into the pipeline scan carry (+5 GiB temp memory).
+      if self.config.dataset_type == "synthetic":
+        attn_mask = None
+        dummy_attn_mask = None
+        mask_type = "causal"
+      else:
+        dummy_attn_mask = jnp.zeros(
+            (1, 1, 1, self.max_target_length, self.max_target_length),
+            dtype=jnp.uint8,
+        )
+        attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
+        attn_mask = jnp.where((attn_mask >= DEFAULT_MASK_VALUE * 0.5), 0, 1).astype(jnp.uint8)
 
     dpa_layer = DotProductAttention(
         head_dim=head_dim,
@@ -1576,7 +1585,7 @@ class AttentionOp(nnx.Module):
         window_size=sliding_window_size,
         context_parallel_causal_load_balanced=self.config.context_parallel_load_balance,
         context_parallel_axis="context",
-        context_parallel_strategy=self.config.context_parallel_strategy,
+        # context_parallel_strategy=self.config.context_parallel_strategy,
         max_segments_per_seq=max_segments_per_seq,
     )
 
