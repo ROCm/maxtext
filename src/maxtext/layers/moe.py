@@ -1296,26 +1296,26 @@ class RoutedMoE(nnx.Module):
           expert_assignments=selected_experts,
       )
       wi_tile_size = (
-          self.config.wi_tile_fwd_batch_seq,
-          self.config.wi_tile_fwd_embed_dim,
-          self.config.wi_tile_fwd_mlp_dim,
-          self.config.wi_tile_dlhs_batch_seq,
-          self.config.wi_tile_dlhs_embed_dim,
-          self.config.wi_tile_dlhs_mlp_dim,
-          self.config.wi_tile_drhs_batch_seq,
-          self.config.wi_tile_drhs_embed_dim,
-          self.config.wi_tile_drhs_mlp_dim,
+          self.config.wi_tile_fwd_batch_seq,  # m (LHS batch)
+          self.config.wi_tile_fwd_embed_dim,  # k  (contracting)
+          self.config.wi_tile_fwd_mlp_dim,  # n (RHS batch)
+          self.config.wi_tile_dlhs_batch_seq,  # m (LHS batch)
+          self.config.wi_tile_dlhs_mlp_dim,  # k (contracting)
+          self.config.wi_tile_dlhs_embed_dim,  # n (RHS batch)
+          self.config.wi_tile_drhs_batch_seq,  # Called m in megablox, but this is contracting
+          self.config.wi_tile_drhs_embed_dim,  # Called k in megablox, but this is LHS batch dim
+          self.config.wi_tile_drhs_mlp_dim,  # Called n in megablox, and indeed is RHS batch dim
       )
       wo_tile_size = (
-          self.config.wo_tile_fwd_batch_seq,
-          self.config.wo_tile_fwd_embed_dim,
-          self.config.wo_tile_fwd_mlp_dim,
-          self.config.wo_tile_dlhs_batch_seq,
-          self.config.wo_tile_dlhs_embed_dim,
-          self.config.wo_tile_dlhs_mlp_dim,
-          self.config.wo_tile_drhs_batch_seq,
-          self.config.wo_tile_drhs_embed_dim,
-          self.config.wo_tile_drhs_mlp_dim,
+          self.config.wo_tile_fwd_batch_seq,  # m (LHS batch)
+          self.config.wo_tile_fwd_mlp_dim,  # k (contracting)
+          self.config.wo_tile_fwd_embed_dim,  # n (RHS batch)
+          self.config.wo_tile_dlhs_batch_seq,  # m (LHS batch)
+          self.config.wo_tile_dlhs_embed_dim,  # k (contracting)
+          self.config.wo_tile_dlhs_mlp_dim,  # n (RHS)
+          self.config.wo_tile_drhs_batch_seq,  # Called m in megablox, but this is contracting
+          self.config.wo_tile_drhs_mlp_dim,  # Called k in megablox, but this is LHS batch dim
+          self.config.wo_tile_drhs_embed_dim,  # Called n in megablox, and indeed is the RHS batch dim
       )
 
       layer_w0 = gmm_fn(

@@ -977,26 +977,27 @@ def compute(x, w0, w1, wo, group_sizes, weights, *, config, mesh):
   wo_gather_axes = []
 
   wi_tile_size = (
-      config.wi_tile_fwd_batch_seq,
-      config.wi_tile_fwd_embed_dim,
-      config.wi_tile_fwd_mlp_dim,
-      config.wi_tile_dlhs_batch_seq,
-      config.wi_tile_dlhs_embed_dim,
-      config.wi_tile_dlhs_mlp_dim,
-      config.wi_tile_drhs_batch_seq,
-      config.wi_tile_drhs_embed_dim,
-      config.wi_tile_drhs_mlp_dim,
+      config.wi_tile_fwd_batch_seq,  # m (LHS batch)
+      config.wi_tile_fwd_embed_dim,  # k  (contracting)
+      config.wi_tile_fwd_mlp_dim,  # n (RHS batch)
+      config.wi_tile_dlhs_batch_seq,  # m (LHS batch)
+      config.wi_tile_dlhs_mlp_dim,  # k (contracting)
+      config.wi_tile_dlhs_embed_dim,  # n (RHS batch)
+      config.wi_tile_drhs_batch_seq,  # Called m in megablox, but this is contracting
+      config.wi_tile_drhs_embed_dim,  # Called k in megablox, but this is LHS batch dim
+      config.wi_tile_drhs_mlp_dim,  # Called n in megablox, and indeed is the RHS batch dim
   )
+
   wo_tile_size = (
-      config.wo_tile_fwd_batch_seq,
-      config.wo_tile_fwd_embed_dim,
-      config.wo_tile_fwd_mlp_dim,
-      config.wo_tile_dlhs_batch_seq,
-      config.wo_tile_dlhs_embed_dim,
-      config.wo_tile_dlhs_mlp_dim,
-      config.wo_tile_drhs_batch_seq,
-      config.wo_tile_drhs_embed_dim,
-      config.wo_tile_drhs_mlp_dim,
+      config.wo_tile_fwd_batch_seq,  # m (LHS batch)
+      config.wo_tile_fwd_mlp_dim,  # k (contracting)
+      config.wo_tile_fwd_embed_dim,  # n (RHS batch)
+      config.wo_tile_dlhs_batch_seq,  # m (LHS batch)
+      config.wo_tile_dlhs_embed_dim,  # k (contracting)
+      config.wo_tile_dlhs_mlp_dim,  # n (RHS)
+      config.wo_tile_drhs_batch_seq,  # Called m in megablox, but this is contracting
+      config.wo_tile_drhs_mlp_dim,  # Called k in megablox, but this is LHS batch dim
+      config.wo_tile_drhs_embed_dim,  # Called n in megablox, and indeed is the RHS batch dim
   )
 
   if config.use_qwix_quantization:
