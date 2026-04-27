@@ -1930,8 +1930,11 @@ class MaxTextConfig(
             "use_deepep_dispatch only supports intranode (ici) expert parallelism. "
             "dcn_expert_parallelism must be 1. Internode DeepEP is not yet supported in JAX."
         )
-      if self.ici_expert_parallelism > 8:
-        raise ValueError("use_deepep_dispatch supports at most 8 GPUs (ici_expert_parallelism <= 8).")
+      if ep_size > 8:
+        raise ValueError(
+            "use_deepep_dispatch supports at most 8 GPUs (total expert_parallelism <= 8). "
+            "Internode DeepEP is not yet supported."
+        )
       try:
         import primus_turbo.jax.lax.moe  # pylint: disable=import-outside-toplevel,unused-import
       except ImportError as e:

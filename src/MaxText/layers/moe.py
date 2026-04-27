@@ -18,6 +18,7 @@
 import enum
 import functools
 import math
+import os
 import random
 from typing import Callable, Iterable, NamedTuple, Optional, Tuple, Union
 
@@ -1196,6 +1197,16 @@ class RoutedMoE(nnx.Module):
       else:
 
         if self.config.use_deepep_dispatch and num_expert_parallelism > 1:
+          # Auto-detect per-process mode: if each process has exactly one GPU
+          # and there are multiple processes, we are in 1-GPU-per-process mode
+          # and DeepEP must use inter-process IPC buffers.
+          if (
+              jax.local_device_count() == 1
+              and jax.process_count() > 1
+              and os.environ.get("PRIMUS_TURBO_JAX_DEEPEP_MODE") is None
+          ):
+            os.environ["PRIMUS_TURBO_JAX_DEEPEP_MODE"] = "per_process"
+
           from primus_turbo.jax.lax.moe import (  # pylint: disable=g-import-not-at-top
               moe_combine as _deepep_moe_combine,
               moe_dispatch as _deepep_moe_dispatch,
@@ -1203,9 +1214,10 @@ class RoutedMoE(nnx.Module):
 
           global _deepep_dispatch_logged  # pylint: disable=global-statement
           if not _deepep_dispatch_logged:
+            _deepep_mode = os.environ.get("PRIMUS_TURBO_JAX_DEEPEP_MODE", "inproc")
             max_logging.log(
-                f"Using Primus-Turbo DeepEP dispatch/combine for MoE expert parallelism "
-                f"(EP={num_expert_parallelism}, intranode NVLink IPC)"
+                f"Using Primus-Turbo DeepEP dispatch/combine "
+                f"(EP={num_expert_parallelism}, mode={_deepep_mode})"
             )
             _deepep_dispatch_logged = True
 
