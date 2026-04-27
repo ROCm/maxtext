@@ -89,6 +89,11 @@ class QuantizationType(str, Enum):
   NANOO_FP8 = "nanoo_fp8"
   AITER_BF16 = "aiter_bf16"
   AITER_FP8 = "aiter_fp8"
+  AITER_FP8_DELAYED = "aiter_fp8_delayed"
+  AITER_FP8_QDQ = "aiter_fp8_qdq"
+  AITER_FP8_MLP_ONLY = "aiter_fp8_mlp_only"
+  AITER_NANOO_FP8 = "aiter_nanoo_fp8"
+  AITER_FP4 = "aiter_fp4"
   FP8_NANO_V2 = "fp8_nanoo"
   FP8_GPU = "fp8_gpu"
   FP8_FULL = "fp8_full"
@@ -411,6 +416,26 @@ class Quantization(BaseModel):
   bwd_quantization_calibration_method: str = Field(
       "absmax",
       description="Quantization calibration method used for gradients.",
+  )
+
+
+class Aiter(BaseModel):
+  """Configuration for AITER kernel integration (ROCm MI350/MI355X).
+
+  AITER provides hand-tuned ASM kernels that can replace hipBLASLt for specific
+  operations. The tiered strategy automatically selects FFI kernels on 1-GPU and
+  XLA-compatible pure-JAX implementations on multi-GPU.
+  """
+
+  use_jax_aiter: bool = Field(False, description="Master flag: enable all AITER kernel optimizations.")
+  aiter_gemm: bool = Field(True, description="AITER ASM GEMM for forward matmuls (requires use_jax_aiter=True).")
+  aiter_rmsnorm: bool = Field(True, description="Fused add+RMSNorm (requires use_jax_aiter=True).")
+  aiter_silu_and_mul: bool = Field(False, description="Fused silu(gate)*up activation via FFI. DISABLED by default — FFI inside scan+remat serializes backward, causing ~55% regression. Only useful for non-scan or single-GPU. (requires use_jax_aiter=True).")
+  aiter_attention: bool = Field(
+      False,
+      description="AITER CK flash attention via jax-aiter FFI. "
+      "Set attention=aiter_flash or enable this flag (requires use_jax_aiter=True). "
+      "Note: TE attention (cudnn_flash_te) already uses the same CK kernels on ROCm.",
   )
 
 
@@ -1846,6 +1871,7 @@ class MaxTextConfig(
     # Data Types and Quantization
     DataTypes,
     Quantization,
+    Aiter,
     # Core Model Architecture
     ModelArchitecture,
     Engram,
@@ -2124,6 +2150,16 @@ class MaxTextConfig(
         self.quantization_local_shard_count = jax.local_device_count()
       except RuntimeError:
         self.quantization_local_shard_count = 1
+
+    # AITER <-> config flag sync.
+    if self.quantization in ("aiter_bf16", "aiter_fp8", "aiter_fp8_delayed", "aiter_fp8_qdq", "aiter_fp8_mlp_only", "aiter_fp4") and not self.use_jax_aiter:
+      self.use_jax_aiter = True
+    if self.attention == "aiter_flash" and not self.use_jax_aiter:
+      self.use_jax_aiter = True
+    if self.use_jax_aiter and self.aiter_gemm and not self.quantization:
+      self.quantization = QuantizationType.AITER_BF16
+    if self.use_jax_aiter and self.aiter_attention and self.attention not in ("aiter_flash",):
+      self.attention = "aiter_flash"
 
     # F. CALCULATE BATCH SIZES
     def calculate_global_batch_sizes(per_device_batch_size, expansion_factor, num_devices, grad_accum_steps):
