@@ -298,6 +298,7 @@ class Decoder(nn.Module):
 
   config: Config
   mesh: Mesh
+  shared_embedding: nn.Module | nnx.Module | None = None
   quant: None | Quant = None
   model_mode: str = MODEL_MODE_TRAIN
 
@@ -615,7 +616,6 @@ class Decoder(nn.Module):
   @nn.compact
   def _apply_embedding(
       self,
-      shared_embedding: nn.Module | nnx.Module,
       decoder_input_tokens,
       decoder_positions,
       deterministic,
@@ -625,7 +625,7 @@ class Decoder(nn.Module):
     """Applies token and positional embeddings to the input tokens."""
     cfg = self.config
 
-    y = shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
+    y = self.shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
 
     # Merge the image embeddings with the text embeddings for multimodal models
     if multimodal_input is not None:
@@ -686,7 +686,7 @@ class Decoder(nn.Module):
     return y
 
   @nn.compact
-  def apply_output_head(self, shared_embedding: nn.Module | nnx.Module, y, deterministic, model_mode):
+  def apply_output_head(self, y, deterministic, model_mode):
     """Applies final normalization and projects hidden states to logits."""
 
     cfg = self.config
@@ -715,10 +715,10 @@ class Decoder(nn.Module):
     # [batch, length, emb_dim] -> [batch, length, vocab_size]
     if cfg.logits_via_embedding:
       # Use the transpose of embedding matrix for logit transform.
-      if isinstance(shared_embedding, nnx.Module):
-        embedding_table = shared_embedding.embedding.value
+      if isinstance(self.shared_embedding, nnx.Module):
+        embedding_table = self.shared_embedding.embedding.value
       else:
-        embedding_table = shared_embedding.variables["params"]["embedding"]
+        embedding_table = self.shared_embedding.variables["params"]["embedding"]
       if isinstance(embedding_table, nn.spmd.LogicallyPartitioned):
         embedding_table = embedding_table.unbox()
       attend_dtype = jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype
@@ -746,6 +746,13 @@ class Decoder(nn.Module):
           out_sharding=out_sharding,
       )  # We do not quantize the logits matmul.
 
+    if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
+      logits = nn.with_logical_constraint(logits, (None, None, "activation_vocab"))
+    else:
+      logits = nn.with_logical_constraint(
+          logits, ("activation_embed_and_logits_batch", "activation_length", "activation_vocab")
+      )
+
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
 
@@ -754,7 +761,6 @@ class Decoder(nn.Module):
   @nn.compact
   def __call__(
       self,
-      shared_embedding: nn.Module | nnx.Module,
       decoder_input_tokens,
       decoder_positions,
       decoder_segment_ids=None,
@@ -774,7 +780,6 @@ class Decoder(nn.Module):
 
     # [batch, length] -> [batch, length, emb_dim]
     y = self._apply_embedding(
-        shared_embedding,
         decoder_input_tokens,
         decoder_positions,
         deterministic,
@@ -1107,7 +1112,7 @@ class Decoder(nn.Module):
     # When initializing with vLLM RPA attention, we need to run the output head to
     # initialize any parameters associated with it.
     if self.is_initializing() and cfg.attention == "vllm_rpa":
-      _ = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
+      _ = self.apply_output_head(hidden_state, deterministic, model_mode)
 
     # When invoking from vLLM with RPA attention, logit computation is deferred to a later stage.
     if cfg.attention == "vllm_rpa":
@@ -1126,7 +1131,7 @@ class Decoder(nn.Module):
       self.sow("intermediates", "hidden_states", hidden_state)
 
     else:
-      logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
+      logits = self.apply_output_head(hidden_state, deterministic, model_mode)
 
     # The API of the Decoder is now a tuple, providing both the main output
     # and the raw hidden state needed for auxiliary tasks.
