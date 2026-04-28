@@ -121,6 +121,7 @@ class DenseGeneral(nnx.Module):
       shard_mode: ShardMode = ShardMode.AUTO,
       matmul_precision: str = "default",
       parameter_memory_host_offload: bool = False,
+      module_context: str = "",
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -140,6 +141,7 @@ class DenseGeneral(nnx.Module):
       shard_mode: auto or explicit shard mode.
       matmul_precision: Precision for matrix multiplication.
       parameter_memory_host_offload: Determines whether to offload params to host
+      module_context: context string passed to quantization ops (e.g., "mlp" for MLP layers).
       rngs: RNG state for initialization in nnx.
     """
     self.in_features_shape = canonicalize_tuple(in_features_shape)
@@ -184,7 +186,12 @@ class DenseGeneral(nnx.Module):
 
     if quant:
       dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes)
-      dot_general_linen = dot_general_cls()
+      # Pass module_context to quant ops that support it (e.g., FP8 MLP-only).
+      # Falls back to no-arg construction for ops that don't accept it.
+      try:
+        dot_general_linen = dot_general_cls(module_context=module_context)
+      except TypeError:
+        dot_general_linen = dot_general_cls()
       quant_dot_general = nnx_wrappers.ToNNX(dot_general_linen, rngs=rngs)
       self._quant_dot_general_name = f"{type(dot_general_linen).__name__}_0"
       setattr(self, self._quant_dot_general_name, quant_dot_general)
@@ -422,11 +429,15 @@ class MlpBlock(nnx.Module):
           use_bias=self.use_bias,
           shard_mode=self.config.shard_mode,
           matmul_precision=self.config.matmul_precision,
+          module_context="mlp_fused",
           rngs=rngs,
       )
     else:
+      # Llama-style gated MLP: wi_0=gate_proj (SiLU), wi_1=up_proj (linear)
+      _mlp_proj_names = ["mlp_gate", "mlp_up", "mlp_wi"]  # gate, up, fallback
       for idx in range(len(self.activations)):
         dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
+        proj_context = _mlp_proj_names[idx] if idx < len(_mlp_proj_names) else f"mlp_wi_{idx}"
         module = DenseGeneral(
             in_features_shape=in_features,
             out_features_shape=self.intermediate_dim,
@@ -438,6 +449,7 @@ class MlpBlock(nnx.Module):
             use_bias=self.use_bias,
             shard_mode=self.config.shard_mode,
             matmul_precision=self.config.matmul_precision,
+            module_context=proj_context,
             rngs=rngs,
         )
         setattr(self, dense_name, module)
@@ -453,6 +465,7 @@ class MlpBlock(nnx.Module):
         use_bias=self.use_bias,
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
+        module_context="mlp_down",
         rngs=rngs,
     )
 
@@ -503,26 +516,116 @@ class MlpBlock(nnx.Module):
 
     # Iterate over specified MLP input activation functions.
     # e.g. ('relu',) or ('gelu', 'linear') for gated-gelu.
-    activations = []
-    if cfg.fused_mlp:
-      x = self.wi(inputs, out_sharding=intermediate_sharding)
-      x = checkpoint_name(x, "mlpwi")
-      for idx, act_fn in enumerate(self.activations):
-        y = _convert_to_activation_function(act_fn)(x[:, :, idx, ...])
-        activations.append(y)
-    else:
-      for idx, act_fn in enumerate(self.activations):
-        dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
-        module = getattr(self, dense_name)
-        x = module(inputs, out_sharding=intermediate_sharding)
-        x = checkpoint_name(x, "mlp" + dense_name)
-        if cfg.activations_in_float32:
-          x = x.astype(jnp.float32)
-        x = _convert_to_activation_function(act_fn)(x)
-        activations.append(x)
 
-    # Take elementwise product of above intermediate activations.
-    x = functools.reduce(operator.mul, activations).astype(self.dtype)
+    # Check if AITER fused silu_and_mul can be used:
+    # - use_jax_aiter and aiter_silu_and_mul must be enabled
+    # - activations must be ("silu", "linear") (gated SiLU MLP, e.g. Llama)
+    # - must not be fused_mlp mode
+    # - must not use activations_in_float32
+    _use_aiter_silu = (
+        not cfg.fused_mlp
+        and getattr(cfg, "use_jax_aiter", False)
+        and getattr(cfg, "aiter_silu_and_mul", False)
+        and list(self.activations) == ["silu", "linear"]
+        and not cfg.activations_in_float32
+    )
+
+    # Check if AITER FP4 gate+up GEMM fusion can be used:
+    # - quantization must be aiter_fp4 (this is FP4-recipe-specific)
+    # - use_jax_aiter must be enabled
+    # - activations must be ("silu", "linear") and not fused_mlp
+    # - must not use activations_in_float32
+    # - opt-in via AITER_FP4_GATE_UP_FUSED=1 env (off by default while perf is validated)
+    # The fusion runs ONE FP4 GEMM with combined weight [2*N_proj, K] instead of two
+    # separate ones with [N_proj, K]. Saves: 1 activation cast (gate+up share input x),
+    # 1 weight cast (combined), 1 FP4 GEMM dispatch, plus 5 FFI per layer in backward.
+    # See benchmarks/bench_fp4_vs_fp8_70b.py: at 70B fused N=57344 runs at 4125 TF/s
+    # vs separate N=28672 at 2993 TF/s -- the fused shape hits AITER's tile sweet spot.
+    import os as _os
+    _quant_is_fp4 = (getattr(cfg, "quantization", "") in ("aiter_fp4", "aiter_mxfp4"))
+    _use_fp4_gate_up_fused = (
+        not cfg.fused_mlp
+        and getattr(cfg, "use_jax_aiter", False)
+        and _quant_is_fp4
+        and list(self.activations) == ["silu", "linear"]
+        and not cfg.activations_in_float32
+        and not getattr(self, "use_bias", False)
+        and _os.environ.get("AITER_FP4_GATE_UP_FUSED", "0") == "1"
+    )
+
+    if _use_fp4_gate_up_fused:
+      # AITER FP4 fused gate+up: ONE FP4 GEMM with combined weight,
+      # shared activation cast, then the silu_and_mul fusion (if enabled).
+      from jax_aiter.gemm_fp4 import gemm_fp4_gate_up_bf16
+      # wi_0 / wi_1 kernel shape is (embed, intermediate); the FP4 helper expects
+      # (N, K) = (intermediate, embed) for each weight.
+      w_gate = self.wi_0.kernel.value.astype(jnp.bfloat16)
+      w_up = self.wi_1.kernel.value.astype(jnp.bfloat16)
+      w_gate_nk = jnp.swapaxes(w_gate, -2, -1)  # (intermediate, embed)
+      w_up_nk = jnp.swapaxes(w_up, -2, -1)
+      x_2d = inputs.reshape(-1, inputs.shape[-1]).astype(jnp.bfloat16)
+      gate_2d, up_2d = gemm_fp4_gate_up_bf16(x_2d, w_gate_nk, w_up_nk)
+      out_shape = inputs.shape[:-1] + (gate_2d.shape[-1],)
+      gate = gate_2d.reshape(out_shape)
+      up = up_2d.reshape(out_shape)
+      gate = checkpoint_name(gate, "mlpwi_0")
+      up = checkpoint_name(up, "mlpwi_1")
+      if _use_aiter_silu:
+        from jax_aiter.activation import silu_and_mul as aiter_silu_and_mul
+        x = aiter_silu_and_mul(gate, up).astype(self.dtype)
+      else:
+        x = (_convert_to_activation_function("silu")(gate) * up).astype(self.dtype)
+    elif _use_aiter_silu:
+      # AITER fused path: compute gate and up projections, then fuse silu(gate)*up.
+      from jax_aiter.activation import silu_and_mul as aiter_silu_and_mul
+      gate = self.wi_0(inputs, out_sharding=intermediate_sharding)
+      gate = checkpoint_name(gate, "mlpwi_0")
+      up = self.wi_1(inputs, out_sharding=intermediate_sharding)
+      up = checkpoint_name(up, "mlpwi_1")
+      x = aiter_silu_and_mul(gate, up).astype(self.dtype)
+    else:
+      activations = []
+      if cfg.fused_mlp:
+        x = self.wi(inputs, out_sharding=intermediate_sharding)
+        x = checkpoint_name(x, "mlpwi")
+        for idx, act_fn in enumerate(self.activations):
+          y = _convert_to_activation_function(act_fn)(x[:, :, idx, ...])
+          activations.append(y)
+      else:
+        for idx, act_fn in enumerate(self.activations):
+          dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
+          module = getattr(self, dense_name)
+          x = module(inputs, out_sharding=intermediate_sharding)
+          x = checkpoint_name(x, "mlp" + dense_name)
+          if cfg.activations_in_float32:
+            x = x.astype(jnp.float32)
+          x = _convert_to_activation_function(act_fn)(x)
+          activations.append(x)
+
+      # Take elementwise product of above intermediate activations.
+      x = functools.reduce(operator.mul, activations).astype(self.dtype)
+    # --- MLP hidden trace (AITER_FP8_TRACE_MLP=1) ---
+    import os as _os
+    if _os.environ.get("AITER_FP8_TRACE_MLP", "0") == "1":
+      _x_f32 = x.astype(jnp.float32)
+      _abs = jnp.abs(_x_f32)
+      jax.debug.print(
+          "MLP_HIDDEN: max_abs={mx:.4f} p99_abs={p99:.4f} nonfinite={nf} shape={sh}",
+          mx=jnp.max(_abs), p99=jnp.percentile(_abs.reshape(-1), 99.0),
+          nf=jnp.sum(~jnp.isfinite(_x_f32)), sh=x.shape,
+      )
+    # --- MLP boundary stabilizer (AITER_FP8_CLIP_MLP) ---
+    # "1" = full clip to BF16 max (±65504)
+    # "2" = inf/nan only — replace non-finite with 0 (lightest)
+    # "3" = tight threshold clamp (±1024)
+    import os
+    _clip_mode = os.environ.get("AITER_FP8_CLIP_MLP", "0")
+    if _clip_mode == "1":
+      x = jnp.clip(x, -65504.0, 65504.0)
+    elif _clip_mode == "2":
+      x = jnp.where(jnp.isfinite(x), x, jnp.zeros_like(x))
+    elif _clip_mode == "3":
+      x = jnp.clip(x, -1024.0, 1024.0)
     # Apply dropout and final dense output projection.
     x = self.dropout(x, deterministic=deterministic)  # Broadcast along length.
     x = self._maybe_shard_with_logical(x, self.intermediate_logical)
