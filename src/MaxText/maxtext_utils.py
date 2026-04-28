@@ -910,7 +910,7 @@ def _eagerly_bootstrap_deepep(config):
   except ImportError:
     return
 
-  hidden_bytes = config.emb_dim * max(jnp.dtype(str(config.dtype.value)).itemsize, 2)
+  hidden_bytes = config.emb_dim * max(jnp.dtype(config.dtype).itemsize, 2)
   deepep_warmup(hidden_bytes)
 
 
