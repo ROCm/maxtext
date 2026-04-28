@@ -36,6 +36,8 @@ import tensorflow as tf
 import jax
 import jax.numpy as jnp
 
+import flax
+flax.config.update("flax_always_shard_variable", False)
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 
@@ -333,10 +335,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
     (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True)
 
-  raw_grads = jax.tree_util.tree_map(
-      lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
-      raw_grads,
-  )
+  if config.grad_dtype != jnp.float32:
+    raw_grads = jax.tree_util.tree_map(
+        lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
+        raw_grads,
+    )
   if config.parameter_memory_host_offload:
     raw_grads = jax.device_put(
         raw_grads,
@@ -556,13 +559,13 @@ def train_loop(config, recorder, state=None):
         params_shardings,
     )
     shaped_batch = maxtext_utils.get_shaped_batch(config)
-    if config.shard_optimizer_over_data:
-      state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
+    # if config.shard_optimizer_over_data:
+    #   state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
     maxtext_utils.maybe_dump_jaxpr(config, p_train_step, (state, shaped_batch, init_rng))
-    if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
-      compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
-      compiled_stats = compiled.memory_analysis()
-      max_utils.print_compiled_memory_stats(compiled_stats)
+    # if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
+    compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
+    compiled_stats = compiled.memory_analysis()
+    max_utils.print_compiled_memory_stats(compiled_stats)
 
   start_step = get_first_step(model, state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
