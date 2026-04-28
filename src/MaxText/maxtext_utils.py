@@ -897,8 +897,28 @@ def setup_initial_state(
   return state, state_mesh_annotations, state_mesh_shardings, data_iterator
 
 
+def _eagerly_bootstrap_deepep(config):
+  """Bootstrap DeepEP IPC buffers before any JAX tracing begins.
+
+  In per_process mode, DeepEP exchanges IPC handles via
+  process_allgather — a real collective that cannot run inside
+  jax.eval_shape (arrays are Tracers there).  We call warmup() here,
+  eagerly, so the buffers are ready before tracing starts.
+  """
+  try:
+    from primus_turbo.jax.lax.moe import warmup as deepep_warmup
+  except ImportError:
+    return
+
+  hidden_bytes = config.emb_dim * max(jnp.dtype(str(config.dtype.value)).itemsize, 2)
+  deepep_warmup(hidden_bytes)
+
+
 def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
   """Get a shaped abstraction of the state (including optimizer)"""
+  if config.use_deepep_dispatch:
+    _eagerly_bootstrap_deepep(config)
+
   init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training, rng)
 
   with nn_partitioning.axis_rules(config.logical_axis_rules):
