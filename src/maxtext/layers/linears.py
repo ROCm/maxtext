@@ -530,52 +530,7 @@ class MlpBlock(nnx.Module):
         and not cfg.activations_in_float32
     )
 
-    # Check if AITER FP4 gate+up GEMM fusion can be used:
-    # - quantization must be aiter_fp4 (this is FP4-recipe-specific)
-    # - use_jax_aiter must be enabled
-    # - activations must be ("silu", "linear") and not fused_mlp
-    # - must not use activations_in_float32
-    # - opt-in via AITER_FP4_GATE_UP_FUSED=1 env (off by default while perf is validated)
-    # The fusion runs ONE FP4 GEMM with combined weight [2*N_proj, K] instead of two
-    # separate ones with [N_proj, K]. Saves: 1 activation cast (gate+up share input x),
-    # 1 weight cast (combined), 1 FP4 GEMM dispatch, plus 5 FFI per layer in backward.
-    # See benchmarks/bench_fp4_vs_fp8_70b.py: at 70B fused N=57344 runs at 4125 TF/s
-    # vs separate N=28672 at 2993 TF/s -- the fused shape hits AITER's tile sweet spot.
-    import os as _os
-    _quant_is_fp4 = (getattr(cfg, "quantization", "") in ("aiter_fp4", "aiter_mxfp4"))
-    _use_fp4_gate_up_fused = (
-        not cfg.fused_mlp
-        and getattr(cfg, "use_jax_aiter", False)
-        and _quant_is_fp4
-        and list(self.activations) == ["silu", "linear"]
-        and not cfg.activations_in_float32
-        and not getattr(self, "use_bias", False)
-        and _os.environ.get("AITER_FP4_GATE_UP_FUSED", "0") == "1"
-    )
-
-    if _use_fp4_gate_up_fused:
-      # AITER FP4 fused gate+up: ONE FP4 GEMM with combined weight,
-      # shared activation cast, then the silu_and_mul fusion (if enabled).
-      from jax_aiter.gemm_fp4 import gemm_fp4_gate_up_bf16
-      # wi_0 / wi_1 kernel shape is (embed, intermediate); the FP4 helper expects
-      # (N, K) = (intermediate, embed) for each weight.
-      w_gate = self.wi_0.kernel.value.astype(jnp.bfloat16)
-      w_up = self.wi_1.kernel.value.astype(jnp.bfloat16)
-      w_gate_nk = jnp.swapaxes(w_gate, -2, -1)  # (intermediate, embed)
-      w_up_nk = jnp.swapaxes(w_up, -2, -1)
-      x_2d = inputs.reshape(-1, inputs.shape[-1]).astype(jnp.bfloat16)
-      gate_2d, up_2d = gemm_fp4_gate_up_bf16(x_2d, w_gate_nk, w_up_nk)
-      out_shape = inputs.shape[:-1] + (gate_2d.shape[-1],)
-      gate = gate_2d.reshape(out_shape)
-      up = up_2d.reshape(out_shape)
-      gate = checkpoint_name(gate, "mlpwi_0")
-      up = checkpoint_name(up, "mlpwi_1")
-      if _use_aiter_silu:
-        from jax_aiter.activation import silu_and_mul as aiter_silu_and_mul
-        x = aiter_silu_and_mul(gate, up).astype(self.dtype)
-      else:
-        x = (_convert_to_activation_function("silu")(gate) * up).astype(self.dtype)
-    elif _use_aiter_silu:
+    if _use_aiter_silu:
       # AITER fused path: compute gate and up projections, then fuse silu(gate)*up.
       from jax_aiter.activation import silu_and_mul as aiter_silu_and_mul
       gate = self.wi_0(inputs, out_sharding=intermediate_sharding)
