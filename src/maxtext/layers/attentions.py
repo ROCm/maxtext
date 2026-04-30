@@ -586,7 +586,7 @@ class Attention(nnx.Module):
     if self.config.use_qk_norm or (self.query_pre_attn_scalar is not None and self.query_pre_attn_scalar != 1.0):
       depth_scaling = 1.0
     else:
-      depth_scaling = 1.0
+      depth_scaling = jnp.sqrt(self.head_dim).astype(self.dtype)
 
     def query_init(*args):
       # pylint: disable=no-value-for-parameter

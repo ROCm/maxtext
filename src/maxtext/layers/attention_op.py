@@ -1608,12 +1608,13 @@ class AttentionOp(nnx.Module):
         dtype=self.dtype,
         float32_logits=self.float32_logits,
         qkv_layout=qkv_layout,
-        # scale_factor=1.0,
+        # scale_factor omitted: TE default (None) auto-computes 1/sqrt(head_dim).
+        # Explicitly passing 1.0 disables QK scaling — see TE DotProductAttention docs.
         transpose_batch_sequence=False,
         window_size=sliding_window_size,
         context_parallel_causal_load_balanced=self.config.context_parallel_load_balance,
-        context_parallel_axis="context",
-        # context_parallel_strategy=self.config.context_parallel_strategy,
+        context_parallel_axis=self.config.context_sharding,
+        # context_parallel_strategy omitted: not supported in installed TE 2.6.x.
         max_segments_per_seq=max_segments_per_seq,
     )
 
