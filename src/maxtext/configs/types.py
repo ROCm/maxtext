@@ -691,7 +691,7 @@ class MoEGeneral(BaseModel):
       description="Enable top-k probability normalization for router weights (Qwen3-specific).",
   )
   float32_weight_sum: bool = Field(
-      True,
+      False,
       description="Whether to use full fp32 precision to sum expert weights for numerical stability.",
   )
   float32_gate_logits: bool = Field(

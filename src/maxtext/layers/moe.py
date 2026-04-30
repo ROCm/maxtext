@@ -1295,6 +1295,12 @@ class RoutedMoE(nnx.Module):
           group_sizes=group_sizes,
           expert_assignments=selected_experts,
       )
+      # 3-tuple (fwd only): used by jax.lax.ragged_dot and megablox forward path.
+      # The 9-tuple (fwd+dlhs+drhs) is only consumed by the megablox custom VJP
+      # (_gmm_bwd uses tiling[3:6] for dlhs and tiling[-3:] for drhs). Since
+      # ds-proxy uses megablox=False / use_tokamax_gmm=False (jax ragged_dot path),
+      # the extra 6 backward-pass values would be ignored. See base.yml comment:
+      # "megablox/jax ragged dot - supports forward pass only".
       wi_tile_size = (
           self.config.wi_tile_fwd_batch_seq,  # m (LHS batch)
           self.config.wi_tile_fwd_embed_dim,  # k  (contracting)
