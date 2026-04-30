@@ -29,6 +29,7 @@ from maxtext.layers.attentions import attention_as_linen
 from maxtext.layers.normalizations import rms_norm
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.utils import max_utils
+from maxtext.utils.sharding import maybe_shard_with_logical
 
 # -----------------------------------------
 # The Decoder Layer for Mixtral
@@ -66,7 +67,13 @@ class MixtralDecoderLayer(nn.Module):
 
     activation_axis_names = ("activation_batch", "activation_norm_length", "activation_embed")
 
-    inputs = nn.with_logical_constraint(inputs, activation_axis_names)
+    def shard(x):
+      return maybe_shard_with_logical(
+          x, activation_axis_names, mesh=mesh, shard_mode=cfg.shard_mode,
+          rules=cfg.logical_axis_rules, skip_trivial_specs=True,
+      )
+
+    inputs = shard(inputs)
     inputs = checkpoint_name(inputs, "decoder_layer_input")
 
     lnx = rms_norm(
@@ -77,7 +84,7 @@ class MixtralDecoderLayer(nn.Module):
         kernel_axes=("norm",),
         epsilon=cfg.normalization_layer_epsilon,
     )(inputs)
-    lnx = nn.with_logical_constraint(lnx, activation_axis_names)
+    lnx = shard(lnx)
 
     batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(cfg, model_mode)
     dummy_inputs_shape = (batch_size, seq_len, cfg.emb_dim)
@@ -120,7 +127,7 @@ class MixtralDecoderLayer(nn.Module):
         attention_metadata=attention_metadata,
     )
 
-    attention_lnx = nn.with_logical_constraint(attention_lnx, activation_axis_names)
+    attention_lnx = shard(attention_lnx)
     intermediate_inputs = inputs + attention_lnx
 
     # Fully Connected
@@ -132,7 +139,7 @@ class MixtralDecoderLayer(nn.Module):
         kernel_axes=("norm",),
         epsilon=cfg.normalization_layer_epsilon,
     )(intermediate_inputs)
-    hidden_states = nn.with_logical_constraint(hidden_states, activation_axis_names)
+    hidden_states = shard(hidden_states)
 
     load_balance_loss = None
     # NOTE: the naming mismatch here is to ensure reverse compatibility with existing checkpoints.
@@ -151,11 +158,11 @@ class MixtralDecoderLayer(nn.Module):
         quant=self.quant,
         name="MoeBlock_0",
     )(hidden_states)
-    mlp_lnx = nn.with_logical_constraint(mlp_lnx, activation_axis_names)
+    mlp_lnx = shard(mlp_lnx)
 
     layer_output = mlp_lnx + intermediate_inputs
     layer_output = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(layer_output, deterministic=deterministic)
-    layer_output = nn.with_logical_constraint(layer_output, activation_axis_names)
+    layer_output = shard(layer_output)
 
     if cfg.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
       self.sow("intermediates", "moe_lb_loss", load_balance_loss)
