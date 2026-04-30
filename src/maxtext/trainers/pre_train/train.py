@@ -553,13 +553,13 @@ def train_loop(config, recorder, state=None):
         params_shardings,
     )
     shaped_batch = maxtext_utils.get_shaped_batch(config)
-    # if config.shard_optimizer_over_data:
-    #   state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
+    if config.shard_optimizer_over_data:
+      state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
     maxtext_utils.maybe_dump_jaxpr(config, p_train_step, (state, shaped_batch, init_rng))
-    # if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
-    compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
-    compiled_stats = compiled.memory_analysis()
-    max_utils.print_compiled_memory_stats(compiled_stats)
+    if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
+      compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
+      compiled_stats = compiled.memory_analysis()
+      max_utils.print_compiled_memory_stats(compiled_stats)
 
   start_step = get_first_step(model, state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
