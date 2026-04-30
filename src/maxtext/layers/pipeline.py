@@ -118,6 +118,7 @@ class PipelineBase(nn.Module):
         rules=self.config.logical_axis_rules,
         debug_sharding=self.config.debug_sharding,
         extra_stack_level=1,
+        skip_trivial_specs=True,
     )
 
   def _maybe_shard_with_name(self, inputs, sharding_name):
