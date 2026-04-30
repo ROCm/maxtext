@@ -1204,12 +1204,23 @@ class RoutedMoE(nnx.Module):
           )
 
           deep_ep_runtime.auto_detect_mode()
+          deep_ep_mode = deep_ep_runtime.get_mode()
+          if (
+              num_expert_parallelism > deep_ep_runtime.NUM_MAX_NVL_PEERS
+              and deep_ep_mode is not deep_ep_runtime.MODE_PER_PROCESS
+          ):
+            raise ValueError(
+                "use_deepep_dispatch with internode expert parallelism currently "
+                "requires Primus-Turbo DeepEP per_process mode. "
+                f"Got expert_parallelism={num_expert_parallelism}, "
+                f"mode={deep_ep_mode.mode_name}."
+            )
 
           global _deepep_dispatch_logged  # pylint: disable=global-statement
           if not _deepep_dispatch_logged:
             max_logging.log(
                 f"Using Primus-Turbo DeepEP dispatch/combine "
-                f"(EP={num_expert_parallelism}, mode={deep_ep_runtime.get_mode().mode_name})"
+                f"(EP={num_expert_parallelism}, mode={deep_ep_mode.mode_name})"
             )
             _deepep_dispatch_logged = True
 

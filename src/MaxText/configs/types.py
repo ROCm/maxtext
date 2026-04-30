@@ -567,7 +567,8 @@ class MoEKernels(BaseModel):
       description="Use Primus-Turbo DeepEP for MoE expert-parallel dispatch/combine. "
       "Replaces ragged_all_to_all with fused NVLink IPC streaming. "
       "Requires sparse_matmul=True and expert_parallelism > 1. "
-      "Intranode only (max 8 GPUs). Requires primus_turbo (DeepEP).",
+      "Supports intranode and internode expert parallelism when the installed "
+      "primus_turbo package has the matching DeepEP JAX bindings.",
   )
   wi_tile_fwd_batch_seq: int = Field(512, description="forward pass tiling dimension for batch/sequence in GMM for wi.")
   wi_tile_fwd_embed_dim: int = Field(1024, description="forward pass tiling dimension for embedding in GMM for wi.")
@@ -1926,15 +1927,12 @@ class MaxTextConfig(
       if ep_size <= 1:
         raise ValueError("use_deepep_dispatch requires expert_parallelism > 1.")
       if self.dcn_expert_parallelism > 1:
-        raise ValueError(
-            "use_deepep_dispatch only supports intranode (ici) expert parallelism. "
-            "dcn_expert_parallelism must be 1. Internode DeepEP is not yet supported in JAX."
-        )
-      if ep_size > 8:
-        raise ValueError(
-            "use_deepep_dispatch supports at most 8 GPUs (total expert_parallelism <= 8). "
-            "Internode DeepEP is not yet supported."
-        )
+        num_max_nvl_peers = 8
+        if ep_size % num_max_nvl_peers != 0:
+          raise ValueError(
+              "use_deepep_dispatch internode DeepEP requires total expert_parallelism "
+              f"({ep_size}) to be divisible by {num_max_nvl_peers}."
+          )
       try:
         import primus_turbo.jax.lax.moe  # pylint: disable=import-outside-toplevel,unused-import
       except ImportError as e:
