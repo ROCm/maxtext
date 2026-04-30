@@ -85,7 +85,8 @@ def get_topology_mesh(config):
           num_slices=config.compile_topology_num_slices,
           wrap=target_hardware.wrap,
       ).devices
-  jax.config.update("jax_remove_size_one_mesh_axis_from_type", config.remove_size_one_mesh_axis_from_type)
+  if hasattr(jax.config, "jax_remove_size_one_mesh_axis_from_type"):
+    jax.config.update("jax_remove_size_one_mesh_axis_from_type", config.remove_size_one_mesh_axis_from_type)
   topology_device_mesh = maxtext_utils.create_device_mesh(config, topology_devices)
   mesh_axis_type = AxisType.Explicit if config.shard_mode == ShardMode.EXPLICIT else AxisType.Auto
   topology_mesh = Mesh(topology_device_mesh, config.mesh_axes, axis_types=(mesh_axis_type,) * len(config.mesh_axes))
