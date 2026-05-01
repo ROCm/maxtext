@@ -1,4 +1,4 @@
-# Copyright 2023–2025 Google LLC
+# Copyright 2023–2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -138,10 +138,6 @@ def resolve_config_path(param: str) -> str:
   """Resolve config path to auto rewrite to use new src folder."""
   if os.path.isfile(param):
     return param
-  elif "MaxText" in param:
-    lowercase_param = param.replace("MaxText", "maxtext")
-    if os.path.isfile(lowercase_param):
-      return lowercase_param
   # For pip-installed packages, strip the src prefix and resolve against
   # the installed configs directory (MAXTEXT_CONFIGS_DIR).
   if param.startswith("src/maxtext/configs/"):
@@ -255,16 +251,6 @@ def _prepare_for_pydantic(raw_keys: dict[str, Any]) -> dict[str, Any]:
           Using the default src/maxtext/assets/tokenizers/tokenizer.llama2 instead. \
           Please pass tokenizer_path in your command if this is not intended."
         )
-
-    # Preprocess muon_consistent_rms to be None or float
-    if key == "muon_consistent_rms":
-      if value in ["None", "none"]:
-        new_value = None
-      else:
-        try:
-          new_value = float(value)
-        except ValueError as e:
-          raise ValueError("muon_consistent_rms should be None or float") from e
 
     pydantic_kwargs[key] = new_value
 

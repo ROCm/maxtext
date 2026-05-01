@@ -21,13 +21,8 @@ are not marked.
 """
 
 import pytest
-from maxtext.common.gcloud_stub import is_decoupled
 import jax
 import importlib.util
-
-# Configure JAX to use unsafe_rbg PRNG implementation to match main scripts.
-if is_decoupled():
-  jax.config.update("jax_default_prng_impl", "unsafe_rbg")
 
 try:
   _HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
@@ -38,6 +33,12 @@ try:
   _HAS_GPU = any(d.platform == "gpu" for d in jax.devices())
 except Exception:  # pragma: no cover  pylint: disable=broad-exception-caught
   _HAS_GPU = False
+
+from maxtext.common.gcloud_stub import is_decoupled
+
+# Configure JAX to use unsafe_rbg PRNG implementation to match main scripts.
+if is_decoupled():
+  jax.config.update("jax_default_prng_impl", "unsafe_rbg")
 
 
 GCP_MARKERS = {"external_serving", "external_training"}

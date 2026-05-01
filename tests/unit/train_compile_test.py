@@ -19,7 +19,7 @@ model configurations and parallelism strategies can be successfully compiled
 for different hardware topologies.
 """
 
-import unittest
+from absl.testing import parameterized
 import os.path
 from tempfile import gettempdir
 
@@ -32,7 +32,7 @@ from tests.utils.test_helpers import get_test_config_path
 
 
 @pytest.mark.tpu_backend
-class TrainCompile(unittest.TestCase):
+class TrainCompile(parameterized.TestCase):
   """Tests for the Ahead of Time Compilation functionality, train_compile.py"""
 
   @pytest.mark.cpu_only
@@ -550,7 +550,6 @@ class TrainCompile(unittest.TestCase):
         )
     )
 
-  @pytest.mark.skip(reason="Fix sharding issue of all layers of DeepSeek")
   @pytest.mark.cpu_only
   def test_moe_deepseek_unscanned_bf16(self):
     temp_dir = gettempdir()
@@ -715,7 +714,7 @@ class TrainCompile(unittest.TestCase):
             "",
             get_test_config_path(),
             f"compiled_trainstep_file={compiled_trainstep_file}",
-            "compile_topology=v5p-256",
+            "compile_topology=v5p-8",
             "compile_topology_num_slices=1",
             "model_name=gpt3-6b",
             "per_device_batch_size=1",
@@ -747,7 +746,7 @@ class TrainCompile(unittest.TestCase):
             "",
             get_test_config_path(),
             f"compiled_trainstep_file={compiled_trainstep_file}",
-            "compile_topology=v5p-256",
+            "compile_topology=v5p-64",
             "compile_topology_num_slices=1",
             "model_name=qwen3-next-80b-a3b",
             "per_device_batch_size=1",
@@ -777,9 +776,6 @@ class TrainCompile(unittest.TestCase):
             "use_tokamax_splash=True",
             "dtype=bfloat16",
             "weight_dtype=bfloat16",
-            # without_device_limit
-            "n_routing_groups=-1",
-            "topk_routing_group=-1",
         )
     )
 
@@ -929,8 +925,12 @@ class TrainCompile(unittest.TestCase):
     )
 
   @pytest.mark.cpu_only
-  def test_qk_clip(self):
-    """AOT test for qk-clip with DeepSeek3 Tiny model"""
+  @parameterized.named_parameters(
+      {"testcase_name": "dot_product", "attention": "dot_product"},
+      {"testcase_name": "tokamax_splash", "attention": "flash"},
+  )
+  def test_qk_clip(self, attention):
+    """AOT test for AdamW optimizer with QK clip for DeepSeek3 Tiny model"""
     compiled_trainstep_file = "/tmp/test_qk_clip.pickle"
     train_compile_main(
         (
@@ -944,15 +944,51 @@ class TrainCompile(unittest.TestCase):
             "sparse_matmul=True",
             "megablox=True",
             "use_tokamax_gmm=False",
-            # TODO(agagik): update to flash after support
-            "attention=dot_product",
-            "use_tokamax_splash=True",
             "max_target_length=128",
             "per_device_batch_size=1",
             "dtype=bfloat16",
             "weight_dtype=float32",
+            # attention
+            f"attention={attention}",
+            "use_tokamax_splash=True",
+            # qk clip
             "use_qk_clip=true",
             "qk_clip_threshold=100",
+        )
+    )
+
+  @pytest.mark.cpu_only
+  @parameterized.named_parameters(
+      {"testcase_name": "consistent_rms_scaling", "muon_consistent_rms": 0.2},
+      {"testcase_name": "width_scaling", "muon_consistent_rms": None},
+  )
+  def test_muon(self, muon_consistent_rms):
+    """AOT test for Muon optimizer for DeepSeek3 Tiny model"""
+    compiled_trainstep_file = "/tmp/test_muon.pickle"
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-8",
+            "compile_topology_num_slices=1",
+            "model_name=deepseek3-tiny",
+            "scan_layers=True",
+            "sparse_matmul=True",
+            "megablox=True",
+            "use_tokamax_gmm=False",
+            "max_target_length=128",
+            "per_device_batch_size=1",
+            "dtype=bfloat16",
+            "weight_dtype=float32",
+            # tokamax splash attention
+            "attention=flash",
+            "use_tokamax_splash=True",
+            # muon optimizer
+            "opt_type=muon",
+            "muon_beta=0.95",
+            "muon_weight_decay=0.1",
+            f"muon_consistent_rms={muon_consistent_rms}",
         )
     )
 

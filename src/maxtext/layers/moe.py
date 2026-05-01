@@ -376,6 +376,9 @@ class RoutedMoE(nnx.Module):
 
     if self.config.attention == "vllm_rpa" and self.config.enable_dp_attention:
       self._expert_parallelism_name = "attn_dp_expert"
+    elif self.config.custom_mesh_and_rule == ctypes.CustomRule.CP_AS_EP:
+      # when custom mesh and rule is cp-as-ep, context axis is same with expert in MoE component
+      self._expert_parallelism_name = ("context", "expert")
     else:
       self._expert_parallelism_name = "expert"
 
@@ -550,6 +553,9 @@ class RoutedMoE(nnx.Module):
     )
 
   def get_expert_parallelism_size(self):
+    # When expert parallelism has more than one physical axes, take product of their shapes
+    if isinstance(self._expert_parallelism_name, tuple):
+      return math.prod(self.mesh.shape.get(name, 1) for name in self._expert_parallelism_name)
     return self.mesh.shape.get(self._expert_parallelism_name, 1)
 
   def get_tensor_parallelism_size(self):

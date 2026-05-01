@@ -938,7 +938,7 @@ class TestMeshUtils(unittest.TestCase):
     # Setup a dummy device array for the mock to return
     self.devices_array = np.array(jax.devices())
 
-  @patch("MaxText.maxtext_utils.create_device_mesh")
+  @patch("maxtext.utils.maxtext_utils.create_device_mesh")
   def test_get_mesh_explicit_mode(self, mock_create_device_mesh):
     """Tests that ShardMode.EXPLICIT sets axis_types to MANUAL."""
     # 1. Setup Mock
@@ -957,7 +957,7 @@ class TestMeshUtils(unittest.TestCase):
     # In JAX, AxisType.MANUAL is the equivalent for explicit control
     self.assertEqual(mesh.axis_types, (AxisType.Explicit,))
 
-  @patch("MaxText.maxtext_utils.create_device_mesh")
+  @patch("maxtext.utils.maxtext_utils.create_device_mesh")
   def test_get_mesh_auto_mode(self, mock_create_device_mesh):
     """Tests that ShardMode.AUTO sets axis_types to AUTO."""
     # 1. Setup Mock
@@ -971,7 +971,7 @@ class TestMeshUtils(unittest.TestCase):
     self.assertEqual(len(mesh.axis_types), 2)
     self.assertTrue(all(t == AxisType.Auto for t in mesh.axis_types))
 
-  @patch("MaxText.maxtext_utils.create_device_mesh")
+  @patch("maxtext.utils.maxtext_utils.create_device_mesh")
   def test_get_mesh_with_provided_devices(self, mock_create_device_mesh):
     """Tests that provided devices are passed through to the mesh creator."""
     config = self.MockConfig()

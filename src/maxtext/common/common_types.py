@@ -139,3 +139,11 @@ class HyperConnectionType(enum.Enum):
   ATTENTION = "attention"
   MLP_MOE = "mlp_moe"
   MLP_DENSE = "mlp_dense"
+
+
+class CustomRule(enum.Enum):
+  DEFAULT = ""
+  PURE_FSDP = "pure-fsdp"
+  CP_AS_EP = "cp-as-ep"  # Support CP and EP together
+  EP_AS_CP = "ep-as-cp"  # Support EP only
+  PIPELINE_LARGE_MOE = "pipeline-large-moe"

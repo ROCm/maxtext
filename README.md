@@ -118,25 +118,25 @@ MaxText aims to provide you with the best OSS models, whether as a reference imp
   * Gemma 2 (2B, 9B, 27B)
   * Gemma 1 (2B, 7B)
 * Alibaba
-  * Qwen 2.5 (1.5B, 7B, 14B)
-  * Qwen 3 MoE 2507 (235B, 480B)
-  * Qwen 3 MoE (30B, 235B)
+  * Qwen 3 Next (80B)
+  * Qwen 3 MoE (30B, 235B), Qwen 3 MoE 2507 (235B, 480B)
   * Qwen 3 Dense (0.6B, 1.7B, 4B, 8B, 14B, 32B)
-* DeepSeek
+  * Qwen 2.5 (1.5B, 7B, 14B)  
+* DeepSeek AI
   * DeepSeek V3.2 (671B)  
   * DeepSeek V3.1 (671B)
-  * DeepSeek V3 0324 (671B) & DeepSeek R1 0528 (671B)
+  * DeepSeek V3 0324 (671B), DeepSeek R1 0528 (671B)
   * DeepSeek V2 (16B, 236B)
-* Kimi
-  * Kimi K2
+* Moonshot AI
+  * Kimi K2 (1T)
 * Meta
   * Llama 4 Scout (109B) & Maverick (400B)
-  * Llama 3.3 70B, 3.1 (8B, 70B, 405B), 3.0 (8B, 70B, 405B)
+  * Llama 3.3 (70B), 3.1 (8B, 70B, 405B), 3.0 (8B, 70B, 405B)
   * Llama 2 (7B, 13B, 70B)
-* Open AI
+* OpenAI
   * GPT-OSS (20B, 120B)
   * GPT3 (52K, 6B, 22B, 175B)
-* Mistral
+* Mistral AI
   * Mixtral (8x7B, 8x22B)
   * Mistral (7B)
 * Diffusion Models

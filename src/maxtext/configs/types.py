@@ -29,7 +29,7 @@ import yaml
 from typing import Any, Literal, NewType, Optional
 
 import jax
-from maxtext.common.common_types import AttentionType, DecoderBlockType, ReorderStrategy, ShardMode
+from maxtext.common.common_types import AttentionType, DecoderBlockType, ReorderStrategy, ShardMode, CustomRule
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_utils
 from maxtext.utils import elastic_utils
@@ -845,7 +845,9 @@ class HardwareAndMesh(BaseModel):
       description="Reorder strategy for load-balanced context parallelism.",
   )
   custom_mesh: str = Field("", description="Available options: ['hybrid_ring_64x4', 'hybrid_ring_32x8']")
-  custom_mesh_and_rule: str = Field("", description="Customized mesh and logical rules for granularity.")
+  custom_mesh_and_rule: CustomRule = Field(
+      CustomRule.DEFAULT, description="Customized mesh and logical rules for granularity."
+  )
   allow_split_physical_axes: bool = Field(False, description="Allow splitting physical axes for device mesh creation.")
   enable_nnx: bool = Field(False, description="Whether to use NNX for model definition.")
   optimize_mesh_for_tpu_v6e: bool = Field(False, description="Apply transformations to the mesh for TPU v6e.")
@@ -1384,7 +1386,7 @@ class Muon(BaseModel):
       0,
       description="Strength of the weight decay regularization. This is multiplied with the learning rate.",
   )
-  muon_consistent_rms: None | float = Field(
+  muon_consistent_rms: float | None = Field(
       None,
       description="If None, apply width scaling to updates. If float, apply consistent rms scaling (recommend 0.2).",
   )
@@ -1820,6 +1822,7 @@ class VLLM(BaseModel):
       description="Overrides for HuggingFace model config for MaxText model.",
   )
   vllm_hf_config_path: str = Field("", description="Path to HuggingFace model config for MaxText model.")
+  use_standalone_converter: bool = Field(False, description="Use the standalone MaxText->torchax vLLM converter")
 
 
 class RL(BaseModel):
@@ -2205,11 +2208,11 @@ class MaxTextConfig(
     Computes all derived values and runs all cross-field validations after initial parsing.
     This logic is ported from the legacy pyconfig_deprecated.py system and adapted for Pydantic.
     """
-    if self.custom_mesh_and_rule:
+    if self.custom_mesh_and_rule is not CustomRule.DEFAULT:
       custom_mesh_path = os.path.join(
           os.path.dirname(os.path.abspath(__file__)),
           "custom_mesh_and_rule",
-          f"{self.custom_mesh_and_rule}.yml",
+          f"{self.custom_mesh_and_rule.value}.yml",
       )
       if os.path.exists(custom_mesh_path):
         with open(custom_mesh_path, "r") as f:  # pylint: disable=unspecified-encoding

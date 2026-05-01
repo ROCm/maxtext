@@ -683,7 +683,6 @@ class _HyperParameters:
           os.path.dirname(MAXTEXT_ASSETS_ROOT),
           os.path.join(MAXTEXT_REPO_ROOT, "assets"),
           MAXTEXT_REPO_ROOT,
-          os.path.join(MAXTEXT_REPO_ROOT, "src", "MaxText"),
           MAXTEXT_PKG_DIR,
           os.path.dirname(config_name),
       ):

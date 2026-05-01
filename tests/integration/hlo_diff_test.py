@@ -41,13 +41,24 @@ SECTION_CONTENT_REGEX = re.compile(r'^\d+ (?:"[^"]*"|\{[^\}]*\})$')
 
 
 # Filters and normalizes an HLO line to ignore environment-specific details.
+STACK_FRAME_REGEX = re.compile(r"stack_frame_id=\d+")
+
+
 def filter_line(line):
   # Matches operation sections content like: 1234 {"sharding parameters", ...} or 1234 "operation metadata"
   if SECTION_CONTENT_REGEX.match(line):
     return None
+  # Replace stack_frame_id=... with stack_frame_id=0
+  line = STACK_FRAME_REGEX.sub("stack_frame_id=0", line)
   return line
 
 
+# The reference HLOs are designed to work in the Github actions environment and this test will likely fail
+# in other environments so it should be skipped
+@pytest.mark.skipif(
+    not os.environ.get("GITHUB_ACTIONS"),
+    reason="Skipping HLO diff test because it is not running in GitHub Actions",
+)
 @pytest.mark.tpu_backend
 class TestHloDiff:
   """Tests for HLO Graph Diff Verification."""
