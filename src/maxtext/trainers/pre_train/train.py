@@ -36,6 +36,8 @@ import tensorflow as tf
 import jax
 import jax.numpy as jnp
 
+import flax
+flax.config.update("flax_always_shard_variable", False)
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 
