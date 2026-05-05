@@ -6,13 +6,16 @@ flax
 grain[parquet]
 huggingface_hub
 
+jax==0.9.1
 
-# ROCm JAX 0.8.2 (py312) wheels (install order matters)
-https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jax_rocm7_pjrt-0.8.2+rocm7.2.0-py3-none-manylinux_2_28_x86_64.whl
-https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jax_rocm7_plugin-0.8.2+rocm7.2.0-cp312-cp312-manylinux_2_28_x86_64.whl
-https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.8.2/jaxlib-0.8.2+rocm7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-jax==0.8.2
+# ROCm JAX wheels
+jax-rocm7-plugin==0.9.1.*
 
+# Post-training deps (needed at pytest collection time for tests/post_training/unit/*).
+# vLLM ROCm wheel from AMD's index; pinned to match the rocm7.1.2 / gfx950 stack.
+--extra-index-url https://rocm.frameworks.amd.com/whl/gfx950-dcgpu/
+vllm==0.16.1.dev10+g11515110f.d20260324.rocm712
+math-verify
 
 jaxtyping
 jsonlines
