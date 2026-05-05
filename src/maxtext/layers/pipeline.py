@@ -985,19 +985,14 @@ class CircularPipeline(PipelineBase):
     old_circ_storage_mover = loop_state["circ_storage_mover"]
     loop_iteration = loop_state["loop_iteration"]
 
-    @jax.shard_map(mesh=self.mesh, in_specs=self.stages_in_spec, out_specs=self.stages_in_spec, check_vma=True)
     def _rotate_right(arr):
-      stage_size = jax.lax.axis_size("stage")
-      perm = [(i, (i + 1) % stage_size) for i in range(stage_size)]
-      return jax.lax.ppermute(arr, axis_name="stage", perm=perm)
+      last = jax.lax.slice_in_dim(arr, self.num_stages - 1, self.num_stages, axis=0)
+      except_last = jax.lax.slice_in_dim(arr, 0, self.num_stages - 1, axis=0)
+      return jnp.concatenate([last, except_last], axis=0)
 
-    @jax.shard_map(mesh=self.mesh, in_specs=self.stages_in_spec, out_specs=self.stages_in_spec, check_vma=True)
     def _shift_right(arr):
-      stage_idx = jax.lax.axis_index("stage")
-      stage_size = jax.lax.axis_size("stage")
-      perm = [(i, (i + 1) % stage_size) for i in range(stage_size)]
-      arr = jax.lax.ppermute(arr, axis_name="stage", perm=perm)
-      return jnp.where(stage_idx == 0, jnp.zeros_like(arr), arr)
+      padding = [[1, 0]] + [[0, 0]] * (arr.ndim - 1)
+      return jax.lax.slice(jnp.pad(arr, padding), [0] * arr.ndim, arr.shape)
 
     def _update_shift(output_in):
       if self.config.num_pipeline_repeats == 1 or self.use_circ_storage:
@@ -1027,28 +1022,16 @@ class CircularPipeline(PipelineBase):
     stream_buf_idx = loop_iteration % self.microbatches_per_stage
     stream_slice = old_state_io[:, stream_buf_idx]
 
-    def _rotate_left(arr, stage_size):
-      perm = [(i, (i - 1) % stage_size) for i in range(stage_size)]
-      return jax.lax.ppermute(arr, axis_name="stage", perm=perm)
-
-    def _shift_left(arr, stage_size, output):
-      stage_idx = jax.lax.axis_index("stage")
-      arr = _rotate_left(arr, stage_size)
-      return jnp.where(stage_idx == stage_size - 1, output, arr)
-
-    @jax.shard_map(
-        mesh=self.mesh,
-        in_specs=(self.state_io_spec, self.stages_in_spec, self.stages_in_spec, P()),
-        out_specs=self.state_io_spec,
-        check_vma=True,
-    )
-    def _update_state_io(state_in, stream_slice, output, stream_buf_idx):
-      stage_size = jax.lax.axis_size("stage")
-      stream_slice = _shift_left(stream_slice, stage_size, output)
+    def _update_state_io(state_in, stream_slice, output):
+      padding = [[0, 1]] + [[0, 0]] * (stream_slice.ndim - 1)
+      stream_slice = jax.lax.slice_in_dim(jnp.pad(stream_slice, padding), 1, stream_slice.shape[0] + 1, axis=0)
+      stream_slice = jnp.where(
+          jax.lax.broadcasted_iota("int32", stream_slice.shape, 0) == self.num_stages - 1, output, stream_slice
+      )
       stream_slice = jnp.expand_dims(stream_slice, 1)
       return jax.lax.dynamic_update_slice_in_dim(state_in, stream_slice, stream_buf_idx, axis=1)
 
-    new_state = _update_state_io(old_state_io, stream_slice, output, stream_buf_idx)
+    new_state = _update_state_io(old_state_io, stream_slice, output)
     new_loop_state = {
         "state_io": new_state,
         "shift": new_shift,
