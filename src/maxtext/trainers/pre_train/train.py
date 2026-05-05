@@ -354,10 +354,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         is_train=True,
     )
 
-  raw_grads = jax.tree_util.tree_map(
-      lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
-      raw_grads,
-  )
+  if config.grad_dtype != jnp.float32:
+    raw_grads = jax.tree_util.tree_map(
+        lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
+        raw_grads,
+    )
   if config.parameter_memory_host_offload:
     raw_grads = jax.device_put(
         raw_grads,
