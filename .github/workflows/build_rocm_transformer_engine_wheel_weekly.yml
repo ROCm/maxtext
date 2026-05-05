@@ -46,7 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          uv pip install -r src/dependencies/requirements/requirements_decoupled_rocm_jax_0_8_2.txt
+          uv pip install -r src/dependencies/requirements/requirements_decoupled_rocm_jax_0_9_1.txt
 
       - name: Install PyTorch ROCm (build-time dep for aiter JIT)
         shell: bash
