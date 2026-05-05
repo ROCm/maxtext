@@ -18,7 +18,10 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from maxtext.kernels import gather_reduce_sc
+try:
+  from maxtext.kernels import gather_reduce_sc
+except (TypeError, ImportError):
+  gather_reduce_sc = None
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(2,))

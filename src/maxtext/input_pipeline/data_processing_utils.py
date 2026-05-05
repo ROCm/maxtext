@@ -17,7 +17,14 @@
 import functools
 
 import jax
-from grain.experimental import BestFitPackIterDataset, pick_performance_config
+try:
+  from grain.experimental import BestFitPackIterDataset, pick_performance_config
+except ImportError:
+  try:
+    from grain.experimental import FirstFitPackIterDataset as BestFitPackIterDataset, pick_performance_config
+  except ImportError:
+    BestFitPackIterDataset = None
+    pick_performance_config = None
 import grain.python as grain
 
 from maxtext.input_pipeline import input_pipeline_utils

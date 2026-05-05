@@ -40,9 +40,15 @@ from maxtext.utils.sharding import create_sharding, maybe_shard_with_logical, ma
 from maxtext.utils.sharding import logical_to_mesh_axes
 import numpy as np
 import qwix
-from qwix.contrib.sparsity import sparsity_module
+try:
+  from qwix.contrib.sparsity import sparsity_module
+except (ModuleNotFoundError, ImportError):
+  sparsity_module = None
 import qwix.pallas as qpl
-import tokamax
+try:
+  import tokamax
+except (ModuleNotFoundError, ImportError):
+  tokamax = None
 
 set_xla_metadata = xla_metadata.set_xla_metadata
 

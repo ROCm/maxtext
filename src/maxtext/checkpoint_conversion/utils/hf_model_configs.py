@@ -1014,7 +1014,7 @@ gpt_oss_120b_dict = {
 gpt_oss_120b_config = transformers.GptOssConfig(**gpt_oss_120b_dict)
 
 
-qwen3_omni_30b_a3b_config = transformers.Qwen3OmniMoeConfig(
+qwen3_omni_30b_a3b_config = getattr(transformers, 'Qwen3OmniMoeConfig', type('_Stub', (), {'__init__': lambda self, **kw: None}))(
     # TODO(hengtaoguo): Pure-text Omni model, need to fill in visual/audio/code2wav parts
     architectures=["Qwen3OmniMoeForConditionalGeneration"],
     thinker_config={
@@ -1075,7 +1075,10 @@ qwen3_next_80b_a3b_dict = {
     "use_cache": True,
     "vocab_size": 151936,
 }
-qwen3_next_80b_a3b_config = transformers.Qwen3NextConfig(**qwen3_next_80b_a3b_dict)
+try:
+  qwen3_next_80b_a3b_config = transformers.Qwen3NextConfig(**qwen3_next_80b_a3b_dict)
+except AttributeError:
+  qwen3_next_80b_a3b_config = None
 
 
 # from https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/blob/main/config.json

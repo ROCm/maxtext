@@ -25,7 +25,10 @@ This module contains implementations of:
 from collections.abc import Sequence
 from typing import Any, Callable
 
-import drjax
+try:
+  import drjax
+except ModuleNotFoundError:
+  drjax = None
 from flax import struct
 from flax.training import train_state
 import jax

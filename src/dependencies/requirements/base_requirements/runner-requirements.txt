@@ -1,5 +1,0 @@
-google-cloud-filestore
-kubernetes
-omegaconf
-packaging==24.2
-xpk>=1.8.0

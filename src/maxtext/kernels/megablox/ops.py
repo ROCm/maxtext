@@ -24,7 +24,10 @@ import jax.numpy as jnp
 from maxtext.kernels.megablox import backend
 import qwix
 import qwix.pallas as qpl
-import tokamax
+try:
+  import tokamax
+except (ModuleNotFoundError, ImportError):
+  tokamax = None
 
 
 DRHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(

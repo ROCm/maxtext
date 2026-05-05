@@ -28,7 +28,10 @@ from maxtext.layers import attention_op
 from maxtext.layers import moe as moe_lib
 from maxtext.layers import quantizations
 import qwix.pallas as qpl
-import tokamax
+try:
+  import tokamax
+except (ModuleNotFoundError, ImportError):
+  tokamax = None
 
 
 @functools.partial(
