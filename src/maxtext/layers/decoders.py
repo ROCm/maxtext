@@ -754,6 +754,13 @@ class Decoder(nn.Module):
           out_sharding=out_sharding,
       )  # We do not quantize the logits matmul.
 
+    if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
+      logits = nn.with_logical_constraint(logits, (None, None, "activation_vocab"))
+    else:
+      logits = nn.with_logical_constraint(
+          logits, ("activation_embed_and_logits_batch", "activation_length", "activation_vocab")
+      )
+
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
 
