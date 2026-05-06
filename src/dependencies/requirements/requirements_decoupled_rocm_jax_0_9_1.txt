@@ -11,11 +11,6 @@ jax==0.9.1
 # ROCm JAX wheels
 jax-rocm7-plugin==0.9.1.*
 
-# Post-training deps (needed at pytest collection time for tests/post_training/unit/*).
-# vLLM ROCm wheel pinned to match the rocm7.1.2 / gfx950 stack. Installed via direct
-# URL (instead of --extra-index-url) so AMD's flat index isn't probed for unrelated
-# packages (e.g. setuptools during sdist builds), which would 403 and break resolution.
-vllm @ https://rocm.frameworks.amd.com/whl/gfx950-dcgpu/vllm-0.16.1.dev10+g11515110f.d20260324.rocm712-cp312-cp312-linux_x86_64.whl
 math-verify
 
 jaxtyping
