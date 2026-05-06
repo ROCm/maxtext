@@ -125,8 +125,8 @@ jobs:
             "gpu-integration": "not cpu_only and not tpu_only and integration_test and not post_training",
             "cpu-unit": "cpu_only and not post_training",
             "cpu-post-training-unit": "cpu_only and post_training",
-            "rocm-unit": "not cpu_only and not tpu_only and not decoupled",
-            "rocm-decoupled": "not cpu_only and not tpu_only and decoupled"
+            "rocm-unit": "not cpu_only and not tpu_only and not post_training and not decoupled",
+            "rocm-decoupled": "not cpu_only and not tpu_only and not post_training and decoupled"
           }')[inputs.flavor] }}
 
       pytest_addopts: >-
@@ -153,8 +153,8 @@ jobs:
             "gpu-integration": "--ignore=tests/post_training",
             "cpu-unit": "--ignore=tests/post_training",
             "cpu-post-training-unit": "",
-            "rocm-unit": "",
-            "rocm-decoupled": ""
+            "rocm-unit": "--ignore=tests/post_training",
+            "rocm-decoupled": "--ignore=tests/post_training"
           }')[inputs.flavor] }}
         ${{ inputs.additional_pytest_args }}
 
@@ -184,7 +184,7 @@ jobs:
           }')[inputs.flavor] || '--privileged' }}
 
       # ROCm-specific parameters
-      decoupled_mode: ${{ contains(inputs.flavor, 'rocm') }}
+      decoupled_mode: ${{ contains(inputs.flavor, 'decoupled') }}
       requirements_file: >-
         ${{ fromJSON('{
             "rocm-unit": "src/dependencies/requirements/requirements_rocm_jax_0_9_1.txt",
