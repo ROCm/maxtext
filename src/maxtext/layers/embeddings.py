@@ -167,7 +167,13 @@ class Embed(nnx.Module):
     else:
       out_sharding = None
 
-    if cfg.use_iota_embed:
+    one_hot_elements = 1
+    for d in inputs.shape:
+      one_hot_elements *= d
+    one_hot_elements *= self.num_embeddings
+    one_hot_bytes = one_hot_elements * jnp.dtype(self.dtype).itemsize
+    use_iota = cfg.use_iota_embed and one_hot_bytes <= 2 * 1024**3
+    if use_iota:
       iota = lax.iota(jnp.int32, self.num_embeddings)
       one_hot = jnp.array(inputs[..., jnp.newaxis] == iota, dtype=self.dtype)
       output = jnp.dot(one_hot, embedding, out_sharding=out_sharding)
