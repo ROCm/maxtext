@@ -36,6 +36,8 @@ import tensorflow as tf
 import jax
 import jax.numpy as jnp
 
+import flax
+flax.config.update("flax_always_shard_variable", False)
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 
@@ -355,10 +357,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         is_train=True,
     )
 
-  raw_grads = jax.tree_util.tree_map(
-      lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
-      raw_grads,
-  )
+  if config.grad_dtype != jnp.float32:
+    raw_grads = jax.tree_util.tree_map(
+        lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
+        raw_grads,
+    )
   if config.parameter_memory_host_offload:
     raw_grads = jax.device_put(
         raw_grads,
@@ -673,7 +676,8 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any]
   max_utils.print_system_information()
   train_utils.validate_train_config(config)
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
-  jax.config.update("jax_remove_size_one_mesh_axis_from_type", config.remove_size_one_mesh_axis_from_type)
+  if hasattr(jax.config, "jax_remove_size_one_mesh_axis_from_type"):
+    jax.config.update("jax_remove_size_one_mesh_axis_from_type", config.remove_size_one_mesh_axis_from_type)
   os.environ["TFDS_DATA_DIR"] = config.dataset_path or ""
   vertex_tensorboard_manager = VertexTensorboardManager()
   if config.use_vertex_tensorboard or os.environ.get("UPLOAD_DATA_TO_TENSORBOARD"):
