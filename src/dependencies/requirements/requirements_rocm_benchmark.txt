@@ -1,0 +1,52 @@
+absl-py
+aqtp
+array-record
+datasets
+flax
+grain[parquet]
+huggingface_hub
+jaxtyping
+jsonlines
+ml-collections
+numpy
+omegaconf
+optax
+orbax-checkpoint
+pathwaysutils
+pillow
+pre-commit
+protobuf
+pydantic
+pyink
+pylint
+pytest
+parameterized
+pytype
+sentencepiece
+tensorboardx
+tensorflow-datasets
+tensorflow-text<2.20
+tensorflow<2.20
+tiktoken
+numba>=0.59.0
+google-tunix
+tokamax @ git+https://github.com/openxla/tokamax.git@69b328121c3ee120d8e54cf26d1565cea189617f
+transformers>=4.57.3,<5
+qwix
+mlperf-logging @ https://github.com/mlcommons/logging/archive/38ab22670527888c8eb7825a4ece176fcc36a95d.zip
+
+
+# GCP / Cloud deps (restored for non-decoupled ROCm runs)
+cloud-accelerator-diagnostics
+cloud-tpu-diagnostics
+gcsfs
+google-api-python-client
+google-cloud-aiplatform
+google-cloud-mldiagnostics
+google-cloud-monitoring
+ml-goodput-measurement
+tensorboard-plugin-profile
+google-jetstream @ https://github.com/AI-Hypercomputer/JetStream/archive/29329e8e73820993f77cfc8efe34eb2a73f5de98.zip
+chex>=0.1.91
+drjax>=0.1.4
+
