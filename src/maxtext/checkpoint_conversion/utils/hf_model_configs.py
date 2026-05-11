@@ -17,9 +17,12 @@ This config defines the architectural configurations of the Hugging Face version
 """
 
 
-import transformers
+try:
+  import transformers
+except (ModuleNotFoundError, ImportError):
+  transformers = None
 
-if transformers.__version__ >= "5.0.0":
+if transformers is not None and transformers.__version__ >= "5.0.0":
   from transformers.configuration_utils import PreTrainedConfig as PTConfig  # pytype: disable=import-error
 else:
   from transformers.configuration_utils import PretrainedConfig as PTConfig

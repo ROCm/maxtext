@@ -27,9 +27,14 @@ from aqt.jax.v2.flax import aqt_flax
 from aqt.jax.v2 import tiled_dot_general
 from aqt.jax.v2 import calibration
 
-import qwix
-from qwix._src.core import dot_general_qt
-from qwix._src.core import sparsity
+try:
+  import qwix
+  from qwix._src.core import dot_general_qt
+  from qwix._src.core import sparsity
+except (ModuleNotFoundError, ImportError):
+  qwix = None
+  dot_general_qt = None
+  sparsity = None
 
 import jax
 import jax.numpy as jnp

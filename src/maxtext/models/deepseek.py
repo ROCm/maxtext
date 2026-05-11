@@ -45,7 +45,10 @@ from maxtext.utils.sharding import create_sharding
 from maxtext.utils.sharding import maybe_shard_with_logical
 from maxtext.utils.sharding import remove_size_one_mesh_axis
 
-import transformers
+try:
+  import transformers
+except (ModuleNotFoundError, ImportError):
+  transformers = None
 
 # -----------------------------------------
 # The Decoder Layer for DeepSeek v3

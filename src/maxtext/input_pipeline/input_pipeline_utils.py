@@ -25,10 +25,16 @@ if TYPE_CHECKING:
   import datasets
   import tensorflow as tf
 
-import grain.python as grain
+try:
+  import grain.python as grain
+  from grain._src.python.dataset.sources.tfrecord_dataset import _TFRecordReader, _TFRecordDatasetIterator  # pylint: disable=protected-access
+  from grain.experimental import TFRecordIterDataset
+except (ModuleNotFoundError, ImportError):
+  grain = None
+  _TFRecordReader = None
+  _TFRecordDatasetIterator = None
+  TFRecordIterDataset = None
 import numpy as np
-from grain._src.python.dataset.sources.tfrecord_dataset import _TFRecordReader, _TFRecordDatasetIterator  # pylint: disable=protected-access
-from grain.experimental import TFRecordIterDataset
 from maxtext.input_pipeline.protos import example_pb2
 from maxtext.input_pipeline import tokenizer
 from maxtext.multimodal import processor as mm_processor

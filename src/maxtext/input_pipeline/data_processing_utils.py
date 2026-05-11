@@ -17,8 +17,13 @@
 import functools
 
 import jax
-from grain.experimental import BestFitPackIterDataset, pick_performance_config
-import grain.python as grain
+try:
+  from grain.experimental import BestFitPackIterDataset, pick_performance_config
+  import grain.python as grain
+except (ModuleNotFoundError, ImportError):
+  BestFitPackIterDataset = None
+  pick_performance_config = None
+  grain = None
 
 from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.input_pipeline import tokenizer
