@@ -408,7 +408,7 @@ class RoutedMoE(nnx.Module):
         shard_mode=config.shard_mode,
         rngs=self.rngs,
     )
-    rule = qpl.get_current_rule("gmm")
+    rule = qpl.get_current_rule("gmm") if qpl is not None else None
     sparsity_rule = None
     if rule is not None:
       if not isinstance(rule, qwix.QtRule):
