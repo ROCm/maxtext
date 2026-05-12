@@ -907,8 +907,22 @@ def _eagerly_bootstrap_deepep(config):
   """
   try:
     from primus_turbo.jax.lax.moe import warmup as deepep_warmup
+    # ``set_default_num_sms`` is only re-exported from ``primus_turbo.jax.lax.moe``
+    # in newer versions; import from the submodule directly to stay
+    # version-agnostic.
+    from primus_turbo.jax.lax.moe.moe_dispatch_combine import (
+        set_default_num_sms as _deepep_set_default_num_sms,
+    )
   except ImportError:
     return
+
+  # Override the library default (currently 64) so that EP NVL/RDMA buffer
+  # sizes don't balloon and squeeze the XLA prefill memory pool — that has
+  # been observed to surface as BFC fragmentation OOM on the v1.2 image.
+  # 32 mirrors the working DeepSeek-3 671B internode smoke run (job 25221).
+  # Allow per-run override via the model config: ``deepep_num_sms: <int>``.
+  deepep_num_sms = int(getattr(config, "deepep_num_sms", 32))
+  _deepep_set_default_num_sms(deepep_num_sms)
 
   hidden_bytes = config.emb_dim * max(jnp.dtype(config.dtype).itemsize, 2)
   deepep_warmup(hidden_bytes)
