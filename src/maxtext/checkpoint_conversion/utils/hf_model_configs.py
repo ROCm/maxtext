@@ -932,7 +932,10 @@ gpt_oss_20b_dict = {
     "use_cache": True,
     "vocab_size": 201088,
 }
-gpt_oss_20b_config = transformers.GptOssConfig(**gpt_oss_20b_dict)
+try:
+  gpt_oss_20b_config = transformers.GptOssConfig(**gpt_oss_20b_dict)
+except (AttributeError, TypeError):
+  gpt_oss_20b_config = None
 
 # from https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json
 # remove mxfp4 quantization_config, since we are using bf16
@@ -1014,10 +1017,13 @@ gpt_oss_120b_dict = {
     "use_cache": True,
     "vocab_size": 201088,
 }
-gpt_oss_120b_config = transformers.GptOssConfig(**gpt_oss_120b_dict)
+try:
+  gpt_oss_120b_config = transformers.GptOssConfig(**gpt_oss_120b_dict)
+except (AttributeError, TypeError):
+  gpt_oss_120b_config = None
 
-
-qwen3_omni_30b_a3b_config = transformers.Qwen3OmniMoeConfig(
+try:
+  qwen3_omni_30b_a3b_config = transformers.Qwen3OmniMoeConfig(
     # TODO(hengtaoguo): Pure-text Omni model, need to fill in visual/audio/code2wav parts
     architectures=["Qwen3OmniMoeForConditionalGeneration"],
     thinker_config={
@@ -1036,7 +1042,9 @@ qwen3_omni_30b_a3b_config = transformers.Qwen3OmniMoeConfig(
             "hidden_size": 1152,
         },
     },
-)
+  )
+except (AttributeError, TypeError):
+  qwen3_omni_30b_a3b_config = None
 
 qwen3_next_80b_a3b_dict = {
     "architectures": ["Qwen3NextForCausalLM"],
@@ -1078,7 +1086,10 @@ qwen3_next_80b_a3b_dict = {
     "use_cache": True,
     "vocab_size": 151936,
 }
-qwen3_next_80b_a3b_config = transformers.Qwen3NextConfig(**qwen3_next_80b_a3b_dict)
+try:
+  qwen3_next_80b_a3b_config = transformers.Qwen3NextConfig(**qwen3_next_80b_a3b_dict)
+except (AttributeError, TypeError):
+  qwen3_next_80b_a3b_config = None
 
 
 # from https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/blob/main/config.json

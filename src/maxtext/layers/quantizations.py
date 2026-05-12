@@ -13,10 +13,14 @@
 # limitations under the License.
 
 """Quantization library."""
+from __future__ import annotations
 
 import functools
 import json
-import qwix.pallas as qpl
+try:
+  import qwix.pallas as qpl
+except (ModuleNotFoundError, ImportError):
+  qpl = None
 import re
 from typing import Tuple, Sequence, Callable
 from dataclasses import dataclass
@@ -712,7 +716,10 @@ def configure_kv_quant(config):
   return None if not config.quantize_kvcache else KVQuant(config)
 
 
-class NvidaFp8Provider(qwix.QtProvider):
+_QtProviderBase = qwix.QtProvider if qwix is not None else object
+
+
+class NvidaFp8Provider(_QtProviderBase):
   """Wraps nn.Fp8DirectDotGeneralOp with Qwix's provider interface."""
 
   def dot_general(self, *args, **kwargs):
@@ -729,7 +736,7 @@ class NvidaFp8Provider(qwix.QtProvider):
     return nn.Fp8Einsum(name=op_id)(*args, **kwargs)
 
 
-class NANOOFp8Provider(qwix.QtProvider):
+class NANOOFp8Provider(_QtProviderBase):
 
   def dot_general(self, *args, **kwargs):
     # Here we only check if the rule is None or not.
