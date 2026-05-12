@@ -1247,8 +1247,12 @@ class RoutedMoE(nnx.Module):
               expert_alignment=1,
           )
 
-          rank_prefix_matrix = deepep_handle[0]
-          actual_num_recv = rank_prefix_matrix[num_expert_parallelism - 1, expert_shard_id]
+          if deep_ep_runtime.is_internode(lock=True):
+            recv_gbl_rank_prefix_sum = deepep_handle[6]
+            actual_num_recv = recv_gbl_rank_prefix_sum[-1]
+          else:
+            rank_prefix_matrix = deepep_handle[0]
+            actual_num_recv = rank_prefix_matrix[num_expert_parallelism - 1, expert_shard_id]
           valid_recv_rows = jnp.arange(recv_topk_idx.shape[0]) < actual_num_recv
           recv_topk_idx = jnp.where(valid_recv_rows[:, None], recv_topk_idx, -1)
 
