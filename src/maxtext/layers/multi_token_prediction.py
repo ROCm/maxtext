@@ -223,6 +223,7 @@ class MultiTokenPredictionBlock(nnx.Module):
 
   def __call__(
       self,
+      shared_embedding,
       main_hidden_state,
       input_ids,
       target_ids,
@@ -254,6 +255,7 @@ class MultiTokenPredictionBlock(nnx.Module):
       rolled_position_id = roll_and_mask(rolled_position_id)
 
       target_token_embedding = self.decoder._apply_embedding(
+          shared_embedding,
           rolled_input_ids,
           rolled_position_id,
           deterministic,
@@ -270,7 +272,7 @@ class MultiTokenPredictionBlock(nnx.Module):
           model_mode=self.decoder.model_mode,
       )
 
-      mtp_logits = self.decoder.apply_output_head(mtp_hidden_state, deterministic, model_mode)
+      mtp_logits = self.decoder.apply_output_head(shared_embedding, mtp_hidden_state, deterministic, model_mode)
 
       mtp_xent, _ = max_utils.cross_entropy_with_logits(
           mtp_logits, jax.nn.one_hot(rolled_target_ids, cfg.vocab_size), 0.0

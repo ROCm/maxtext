@@ -299,7 +299,6 @@ class Decoder(nn.Module):
 
   config: Config
   mesh: Mesh
-  shared_embedding: nn.Module | nnx.Module | None = None
   quant: None | Quant = None
   model_mode: str = MODEL_MODE_TRAIN
 
@@ -450,6 +449,8 @@ class Decoder(nn.Module):
         return [DecoderLayer]
       case DecoderBlockType.LLAMA2:
         return [llama2.LlamaDecoderLayerToLinen]
+      case DecoderBlockType.LLAMA2LTI:
+        return [llama2.LlamaLTIDecoderLayerToLinen]
       case DecoderBlockType.MISTRAL:
         # TODO(ranran): update to Mistral with sliding window attention
         return [mistral.MistralDecoderLayerToLinen]
@@ -544,6 +545,7 @@ class Decoder(nn.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
+        DecoderBlockType.LLAMA2LTI,
     ):
       return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
@@ -567,6 +569,7 @@ class Decoder(nn.Module):
             "cache": cache_spec,
             "intermediates": 0,
             "aqt": 0,
+            "batch_stats": 0,
             "_overwrite_with_gradient": 0,
         },
         split_rngs={
@@ -620,6 +623,7 @@ class Decoder(nn.Module):
   @nn.compact
   def _apply_embedding(
       self,
+      shared_embedding: nn.Module | nnx.Module,
       decoder_input_tokens,
       decoder_positions,
       deterministic,
@@ -629,7 +633,7 @@ class Decoder(nn.Module):
     """Applies token and positional embeddings to the input tokens."""
     cfg = self.config
 
-    y = self.shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
+    y = shared_embedding(decoder_input_tokens.astype("int32"), model_mode=model_mode)
 
     # Merge the image embeddings with the text embeddings for multimodal models
     if multimodal_input is not None:
@@ -690,7 +694,7 @@ class Decoder(nn.Module):
     return y
 
   @nn.compact
-  def apply_output_head(self, y, deterministic, model_mode):
+  def apply_output_head(self, shared_embedding: nn.Module | nnx.Module, y, deterministic, model_mode):
     """Applies final normalization and projects hidden states to logits."""
 
     cfg = self.config
@@ -719,10 +723,10 @@ class Decoder(nn.Module):
     # [batch, length, emb_dim] -> [batch, length, vocab_size]
     if cfg.logits_via_embedding:
       # Use the transpose of embedding matrix for logit transform.
-      if isinstance(self.shared_embedding, nnx.Module):
-        embedding_table = self.shared_embedding.embedding.value
+      if isinstance(shared_embedding, nnx.Module):
+        embedding_table = shared_embedding.embedding.value
       else:
-        embedding_table = self.shared_embedding.variables["params"]["embedding"]
+        embedding_table = shared_embedding.variables["params"]["embedding"]
       if isinstance(embedding_table, nn.spmd.LogicallyPartitioned):
         embedding_table = embedding_table.unbox()
       attend_dtype = jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype
@@ -750,13 +754,6 @@ class Decoder(nn.Module):
           out_sharding=out_sharding,
       )  # We do not quantize the logits matmul.
 
-    if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
-      logits = nn.with_logical_constraint(logits, (None, None, "activation_vocab"))
-    else:
-      logits = nn.with_logical_constraint(
-          logits, ("activation_embed_and_logits_batch", "activation_length", "activation_vocab")
-      )
-
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
 
@@ -765,6 +762,7 @@ class Decoder(nn.Module):
   @nn.compact
   def __call__(
       self,
+      shared_embedding: nn.Module | nnx.Module,
       decoder_input_tokens,
       decoder_positions,
       decoder_segment_ids=None,
@@ -784,6 +782,7 @@ class Decoder(nn.Module):
 
     # [batch, length] -> [batch, length, emb_dim]
     y = self._apply_embedding(
+        shared_embedding,
         decoder_input_tokens,
         decoder_positions,
         deterministic,
@@ -993,16 +992,58 @@ class Decoder(nn.Module):
                 "nope_layer_interval": self.config.nope_layer_interval,
                 "interleave_moe_layer_step": self.config.interleave_moe_layer_step,
             }
-          y, _ = self.scan_decoder_layers(
-              cfg,
-              RemattedBlockLayer,
-              scan_length,
-              "layers",
-              mesh,
-              in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
-              model_mode=model_mode,
-              **layer_kwargs,
-          )(y, *broadcast_args)
+          # Update broadcast_args and in_axes_tuple for vLLM RPA
+          in_axes_tuple = (nn.broadcast,) * len(broadcast_args)
+          current_broadcast_args = list(broadcast_args)
+          current_in_axes_tuple = list(in_axes_tuple)
+
+          if kv_caches is not None:
+            # Stack kv_caches for scan: [num_layers, ...]
+            stacked_kv_cache = jnp.stack(kv_caches, axis=0)
+
+            # We pass (y, stacked_kv_cache, 0) as the carry
+            carry = (y, stacked_kv_cache, 0)
+
+            # We don't pass kv_cache as a scanned argument anymore
+
+            # Pass None for previous_chunk, slot, page_state, kv_cache to align with __call__ signature
+            current_broadcast_args.extend([None, None, None, None, attention_metadata])
+            current_in_axes_tuple.extend([nn.broadcast] * 5)
+
+            max_logging.info(f"DEBUG: len(current_broadcast_args)={len(current_broadcast_args)}")
+            max_logging.info(f"DEBUG: current_broadcast_args={[type(a) for a in current_broadcast_args]}")
+
+            final_carry, _ = self.scan_decoder_layers(
+                cfg,
+                RemattedBlockLayer,
+                scan_length,
+                "layers",
+                mesh,
+                in_axes_tuple=tuple(current_in_axes_tuple),
+                model_mode=model_mode,
+                **layer_kwargs,
+            )(carry, *current_broadcast_args)
+
+            y, returned_kv_cache, _ = final_carry
+
+            # Update the list of KV caches from the scanned results
+            for i in range(cfg.num_decoder_layers):
+              kv_caches[i] = returned_kv_cache[i]
+          else:
+            # Fallback to old behavior if kv_caches is None (not vLLM RPA)
+            current_broadcast_args.append(None)
+            current_in_axes_tuple.append(nn.broadcast)
+
+            y, _ = self.scan_decoder_layers(
+                cfg,
+                RemattedBlockLayer,
+                scan_length,
+                "layers",
+                mesh,
+                in_axes_tuple=tuple(current_in_axes_tuple),
+                model_mode=model_mode,
+                **layer_kwargs,
+            )(y, *current_broadcast_args)
       else:
         if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
           assert len(RemattedBlockLayers) == 2, "Unscanned layers must have a length of 2 using deepseek."
@@ -1119,7 +1160,7 @@ class Decoder(nn.Module):
     # When initializing with vLLM RPA attention, we need to run the output head to
     # initialize any parameters associated with it.
     if self.is_initializing() and cfg.attention == "vllm_rpa":
-      _ = self.apply_output_head(hidden_state, deterministic, model_mode)
+      _ = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
 
     # When invoking from vLLM with RPA attention, logit computation is deferred to a later stage.
     if cfg.attention == "vllm_rpa":
@@ -1138,7 +1179,7 @@ class Decoder(nn.Module):
       self.sow("intermediates", "hidden_states", hidden_state)
 
     else:
-      logits = self.apply_output_head(hidden_state, deterministic, model_mode)
+      logits = self.apply_output_head(shared_embedding, hidden_state, deterministic, model_mode)
 
     # The API of the Decoder is now a tuple, providing both the main output
     # and the raw hidden state needed for auxiliary tasks.

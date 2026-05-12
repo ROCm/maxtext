@@ -88,7 +88,7 @@ class TransformerLinenPure(nn.Module):
     )
     self.vision_encoder = vision_encoder_as_linen(config=cfg, mesh=mesh) if cfg.use_multimodal else None
     self.audio_encoder = audio_encoder_as_linen(config=cfg, mesh=mesh) if cfg.use_audio else None
-    self.decoder = Decoder(config=cfg, shared_embedding=self.shared_embedding, mesh=mesh, quant=self.quant, model_mode=self.model_mode)
+    self.decoder = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode)
 
     # If MTP is enabled via config, set up the MTP block.
     if self.config.mtp_num_layers > 0:
@@ -114,6 +114,7 @@ class TransformerLinenPure(nn.Module):
     This function is only used for vocabulary tiling.
     """
     logits = self.decoder.apply_output_head(
+        shared_embedding=self.shared_embedding,
         y=hidden_states,
         deterministic=deterministic,
         model_mode=model_mode,
@@ -185,6 +186,7 @@ class TransformerLinenPure(nn.Module):
       )
 
     logits, hidden_state, kv_caches = self.decoder(
+        shared_embedding=self.shared_embedding,
         decoder_input_tokens=decoder_input_tokens,
         decoder_positions=decoder_positions,
         decoder_segment_ids=decoder_segment_ids,
@@ -220,6 +222,7 @@ class TransformerLinenPure(nn.Module):
     # Its only effect is to "sow" these losses; it does not alter the primary logits output.
     if self.config.mtp_num_layers > 0:
       self.mtp_block(
+          shared_embedding=self.shared_embedding,
           main_hidden_state=hidden_state,
           input_ids=decoder_input_tokens,
           target_ids=decoder_target_tokens,
@@ -342,7 +345,7 @@ class Transformer(nnx.Module):
     if cfg.pure_nnx_decoder:
       self.decoder = NNXDecoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode, rngs=rngs)
     else:
-      decoder_linen = Decoder(config=cfg, mesh=mesh, shared_embedding=self.token_embedder, quant=self.quant, model_mode=self.model_mode)
+      decoder_linen = Decoder(config=cfg, mesh=mesh, quant=self.quant, model_mode=self.model_mode)
       self.decoder = nnx_wrappers.ToNNX(decoder_linen, rngs=rngs)
     self.hidden_states = None
 
@@ -370,6 +373,7 @@ class Transformer(nnx.Module):
 
     if not cfg.pure_nnx_decoder:
       self.decoder.lazy_init(
+          shared_embedding=self.token_embedder,
           decoder_input_tokens=dummy_decoder_input_tokens,
           decoder_positions=dummy_decoder_positions,
           attention_metadata=dummy_attention_metadata,
@@ -393,6 +397,7 @@ class Transformer(nnx.Module):
       self.mtp_block = nnx_wrappers.ToNNX(mtp_block_linen, rngs=rngs)
 
       self.mtp_block.lazy_init(
+          shared_embedding=self.token_embedder,
           main_hidden_state=jnp.ones((1, 1, self.config.emb_dim), dtype=self.config.dtype),
           input_ids=jnp.ones((1, 1), dtype=jnp.int32),
           target_ids=jnp.ones((1, 1), dtype=jnp.int32),
@@ -503,9 +508,12 @@ class Transformer(nnx.Module):
       mutable_collections.append("intermediates")
     if self.config.distill_beta > 0.0 and "intermediates" not in mutable_collections:
       mutable_collections.append("intermediates")
+    if self.config.load_balance_loss_weight > 0.0 and "intermediates" not in mutable_collections:
+      mutable_collections.append("intermediates")
 
     if self.config.pure_nnx_decoder:
       logits, hidden_state, kv_caches = self.decoder(
+          shared_embedding=self.token_embedder,
           decoder_input_tokens=decoder_input_tokens,
           decoder_positions=decoder_positions,
           decoder_segment_ids=decoder_segment_ids,
@@ -521,6 +529,7 @@ class Transformer(nnx.Module):
       )  # pytype: disable=wrong-keyword-args
     else:
       logits, hidden_state, kv_caches = self.decoder(
+          shared_embedding=self.token_embedder,
           decoder_input_tokens=decoder_input_tokens,
           decoder_positions=decoder_positions,
           decoder_segment_ids=decoder_segment_ids,
@@ -561,6 +570,7 @@ class Transformer(nnx.Module):
     # Its only effect is to "sow" these losses; it does not alter the primary logits output.
     if self.config.mtp_num_layers > 0:
       self.mtp_block(
+          shared_embedding=self.token_embedder,
           main_hidden_state=hidden_state,
           input_ids=decoder_input_tokens,
           target_ids=decoder_target_tokens,
