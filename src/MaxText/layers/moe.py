@@ -18,6 +18,7 @@
 import enum
 import functools
 import math
+import os
 import random
 from typing import Callable, Iterable, NamedTuple, Optional, Tuple, Union
 
@@ -42,6 +43,36 @@ set_xla_metadata = xla_metadata.set_xla_metadata
 
 DISPATCH = "dispatch"
 COMBINE = "combine"
+
+
+# PROBE_NAN diagnostic — host-side state and callback. See _maybe_probe()
+# usages downstream for context. Each probe site logs the first 5 calls
+# (sanity check that the probe ran) and every BAD call (n_nan>0 or n_inf>0).
+# Output goes to /coredump/probe_nan_pid<PID>.log inside the container,
+# which is bind-mounted to the job's output dir on the host (per _container.sh).
+_probe_nan_call_count: dict[str, int] = {}
+
+
+def _probe_nan_callback(name, n_nan, n_inf, max_abs):
+  """Host-side callback for PROBE_NAN. Bounded output; never raises."""
+  try:
+    n_nan_i = int(n_nan)
+    n_inf_i = int(n_inf)
+    bad = (n_nan_i > 0) or (n_inf_i > 0)
+    cnt = _probe_nan_call_count.get(name, 0)
+    _probe_nan_call_count[name] = cnt + 1
+    if cnt >= 5 and not bad:
+      return
+    if os.path.isdir("/coredump"):
+      path = f"/coredump/probe_nan_pid{os.getpid()}.log"
+    else:
+      path = f"/tmp/probe_nan_pid{os.getpid()}.log"
+    marker = "BAD" if bad else "ok "
+    with open(path, "a") as f:
+      f.write(f"[PROBE_NAN] {marker} {name} call#{cnt} "
+              f"n_nan={n_nan_i} n_inf={n_inf_i} max_abs={float(max_abs):.6g}\n")
+  except Exception:
+    pass
 
 
 def _sort_activations(
@@ -1014,29 +1045,40 @@ class RoutedMoE(nnx.Module):
               is_fsdp_shard_on_exp=self.config.fsdp_shard_on_exp,
           )
         elif self.config.use_turbo_grouped_gemm:
-          try:
-            from primus_turbo.jax.lax.grouped_gemm import grouped_gemm as turbo_grouped_gemm
-          except ImportError:
-            raise ImportError(
-                "use_turbo_grouped_gemm=True requires the primus_turbo package to be installed."
-            )
-          if not getattr(turbo_grouped_gemm, "_logged", False):
-            max_logging.log("Using primus_turbo grouped_gemm in MoE sparse matmul")
-            turbo_grouped_gemm._logged = True
-          # Thread-local x64: CK kernel requires int64 group_sizes, but
-          # global x64 breaks argsort (XLA-ROCm s32/s64 scatter mismatch).
-          # Use jax.experimental.enable_x64() for thread-local scope,
-          # safe for concurrent shard_map threads.
-          # Remove this once primus_turbo accepts int32 group_lens natively.
-          with jax.experimental.enable_x64():
-            output = turbo_grouped_gemm(
-                inputs,
-                kernel,
-                group_sizes.astype(jnp.int64),
-                transA=False,
-                transB=False,
-                num_cu=-1,
-            )
+          # NOOP_GMM=1: short-circuit Primus-Turbo GMM with a deterministic
+          # zeros tensor of the expected output shape. Diagnostic only —
+          # used to test whether NaN at sgmf pdbs=10 originates inside the
+          # GMM kernel or in the surrounding MoE infrastructure. Training
+          # will not converge with this on; loss should remain finite.
+          if os.environ.get("NOOP_GMM", "0") == "1":
+            output = jnp.zeros((inputs.shape[0], kernel.shape[2]), dtype=self.dtype)
+            if not getattr(RoutedMoE, "_noop_gmm_logged", False):
+              max_logging.log("[NOOP_GMM=1] Replacing turbo_grouped_gemm with zeros (diagnostic)")
+              RoutedMoE._noop_gmm_logged = True
+          else:
+            try:
+              from primus_turbo.jax.lax.grouped_gemm import grouped_gemm as turbo_grouped_gemm
+            except ImportError:
+              raise ImportError(
+                  "use_turbo_grouped_gemm=True requires the primus_turbo package to be installed."
+              )
+            if not getattr(turbo_grouped_gemm, "_logged", False):
+              max_logging.log("Using primus_turbo grouped_gemm in MoE sparse matmul")
+              turbo_grouped_gemm._logged = True
+            # Thread-local x64: CK kernel requires int64 group_sizes, but
+            # global x64 breaks argsort (XLA-ROCm s32/s64 scatter mismatch).
+            # Use jax.experimental.enable_x64() for thread-local scope,
+            # safe for concurrent shard_map threads.
+            # Remove this once primus_turbo accepts int32 group_lens natively.
+            with jax.experimental.enable_x64():
+              output = turbo_grouped_gemm(
+                  inputs,
+                  kernel,
+                  group_sizes.astype(jnp.int64),
+                  transA=False,
+                  transB=False,
+                  num_cu=-1,
+              )
         else:
           rhs_inputs = kernel
           if isinstance(kernel, aqt.QTensor):
@@ -1375,9 +1417,38 @@ class RoutedMoE(nnx.Module):
       if self.config.mlp_bias:
         layer_w1 = layer_w1 + w1_bias
       layer_w1 = adc.checkpoint_name(layer_w1, "mlpwi_1")
+
+      # PROBE_NAN=1 — diagnostic probes via jax.debug.callback writing to a
+      # per-rank file in /coredump (mounted to the job's output dir). Avoids
+      # Ray's stdout-capture (no runaway-log risk). For each probe site, writes
+      # the first 5 calls (sanity check) plus every BAD call (n_nan>0 or n_inf>0).
+      # Output bounded regardless of step/layer/rank count.
+      def _maybe_probe(name, t):
+        if os.environ.get("PROBE_NAN", "0") != "1":
+          return
+        n_nan = jnp.isnan(t).sum()
+        n_inf = jnp.isinf(t).sum()
+        # Compute max in the original dtype (bf16) and promote only the SCALAR
+        # to fp32 for the callback. The previous version `jnp.abs(t.astype(fp32)).max()`
+        # allocated a full fp32 copy of t per probe call: at pdbs=10 with t.shape =
+        # [40960, 7168] bf16 (0.55 GB) that's 1.1 GB per call × 13 scan iters × 5
+        # probe sites ≈ 70 GB extra per rank. XLA did NOT fuse the cast under scan,
+        # OOM'd Ray actors, and triggered restart-loop topology-probe spam (job 15445).
+        max_abs = jnp.abs(t).max().astype(jnp.float32)
+        jax.debug.callback(
+            functools.partial(_probe_nan_callback, name),
+            n_nan, n_inf, max_abs,
+        )
+
+      _maybe_probe("x       ", x)
+      _maybe_probe("layer_w0", layer_w0)
+      _maybe_probe("layer_w1", layer_w1)
+
       intermediate_layer = self.apply_ffn_activation(layer_w0, layer_w1)
+      _maybe_probe("intermediate(silu*linear)", intermediate_layer)
 
       intermediate_output = gmm_fn(intermediate_layer, wo, tiling=wo_tile_size)
+      _maybe_probe("intermediate_output(wo)  ", intermediate_output)
       if self.get_tensor_parallelism_size() > 1:
         intermediate_output = jax.lax.psum_scatter(intermediate_output, "tensor", scatter_dimension=1, tiled=True)
       if self.config.mlp_bias:
