@@ -897,15 +897,22 @@ def setup_initial_state(
   return state, state_mesh_annotations, state_mesh_shardings, data_iterator
 
 
-def _eagerly_bootstrap_deepep(config):
+def _eagerly_bootstrap_deepep(config, mesh):
   """Bootstrap DeepEP IPC buffers before any JAX tracing begins.
 
   In per_process mode, DeepEP exchanges IPC handles via
   process_allgather — a real collective that cannot run inside
   jax.eval_shape (arrays are Tracers there).  We call warmup() here,
   eagerly, so the buffers are ready before tracing starts.
+
+  Before warmup, pin DeepEP's EP group to the mesh ``expert`` axis
+  so its IPC buffer sizing matches the actual EP rank set rather than
+  defaulting to ``jax.process_count()`` (which equals world size and
+  over-allocates by ~``world_size / ep_size`` × on multi-axis 1-GPU/proc
+  runs — e.g. dcn_fsdp=8 × ici_ep=8 with 64 processes wastes 8×).
   """
   try:
+    from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
     from primus_turbo.jax.lax.moe import warmup as deepep_warmup
     # ``set_default_num_sms`` is only re-exported from ``primus_turbo.jax.lax.moe``
     # in newer versions; import from the submodule directly to stay
@@ -915,6 +922,13 @@ def _eagerly_bootstrap_deepep(config):
     )
   except ImportError:
     return
+
+  # Pin the EP group from the mesh's ``expert`` axis when available.
+  # No-op on older Primus-Turbo without ``pin_ep_group_from_jax_mesh``;
+  # no-op on 1-node/proc layouts (intra-process EP axis).
+  _pin = getattr(deep_ep_runtime, "pin_ep_group_from_jax_mesh", None)
+  if _pin is not None:
+    _pin(mesh)
 
   # Override the library default (currently 64) so that EP NVL/RDMA buffer
   # sizes don't balloon and squeeze the XLA prefill memory pool — that has
@@ -931,7 +945,7 @@ def _eagerly_bootstrap_deepep(config):
 def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
   """Get a shaped abstraction of the state (including optimizer)"""
   if config.use_deepep_dispatch:
-    _eagerly_bootstrap_deepep(config)
+    _eagerly_bootstrap_deepep(config, mesh)
 
   init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training, rng)
 
