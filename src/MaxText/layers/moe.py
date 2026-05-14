@@ -97,6 +97,65 @@ _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_
 
 
 _deepep_dispatch_logged = False
+_deepep_ep_group_pinned = False
+
+
+def _maybe_pin_deepep_ep_group(mesh, deep_ep_runtime) -> None:
+  """Pin Primus-Turbo DeepEP's EP group to the mesh ``expert`` axis.
+
+  Background — ``DeepEP`` historically derived ``ep_size`` from
+  ``jax.process_count()`` (in PER_PROCESS mode), which silently equates
+  "EP rank set" with "JAX world".  That equation breaks under
+  1-GPU/proc multi-axis sharding (e.g. ``dcn_fsdp=8 × ici_ep=8`` on 64
+  processes): the world is 64, but the EP axis is only 8 (or 16 with
+  internode EP).  Without an explicit group, DeepEP allocates IPC buffers
+  for 64 peers and abstract-evals ``num_worst_tokens = num_tokens × 64``,
+  causing 506 GiB single-tensor allocations and immediate OOM.
+
+  This helper walks the ``expert`` axis of ``mesh.devices`` for the calling
+  process's slot, collects the ``process_index`` of each EP-axis peer in
+  rank order, and pushes that list to ``deep_ep_runtime.set_ep_group``.
+
+  In 1-node/proc mode (expert axis = intra-process devices), every peer
+  share the same ``process_index`` so the collected list has duplicates;
+  we detect this and leave DeepEP's group unset, falling back to the legacy
+  "EP == world == process_count" semantics that 1-node/proc has always used.
+
+  Idempotent: the first invocation pins the group; subsequent invocations
+  re-validate the group hasn't changed (re-entry from later layers / steps
+  sees the already-pinned group and returns immediately).
+  """
+  global _deepep_ep_group_pinned
+  if _deepep_ep_group_pinned:
+    return
+  if "expert" not in mesh.axis_names:
+    return
+  expert_axis_idx = mesh.axis_names.index("expert")
+  devices_arr = np.asarray(mesh.devices)
+  my_proc = jax.process_index()
+  coords_my = None
+  for idx in np.ndindex(*devices_arr.shape):
+    if devices_arr[idx].process_index == my_proc:
+      coords_my = idx
+      break
+  if coords_my is None:
+    raise RuntimeError(
+        f"jax.process_index()={my_proc} not found in mesh.devices; "
+        "cannot derive DeepEP EP group."
+    )
+  ep_ranks = []
+  for v in range(devices_arr.shape[expert_axis_idx]):
+    coords = list(coords_my)
+    coords[expert_axis_idx] = v
+    ep_ranks.append(int(devices_arr[tuple(coords)].process_index))
+  if len(set(ep_ranks)) != len(ep_ranks):
+    # 1-node/proc mode: EP axis is intra-process — every entry is the
+    # same process_index.  DeepEP's INPROC path or default
+    # PER_PROCESS-with-ep_size==process_count path is correct here.
+    _deepep_ep_group_pinned = True  # remember we've evaluated this
+    return
+  deep_ep_runtime.set_ep_group(ep_ranks)
+  _deepep_ep_group_pinned = True
 
 
 class _DeepEPCombineState(NamedTuple):
@@ -1202,6 +1261,18 @@ class RoutedMoE(nnx.Module):
               moe_combine as _deepep_moe_combine,
               moe_dispatch as _deepep_moe_dispatch,
           )
+
+          # ── EP group pinning (decouple "EP rank set" from "JAX world") ────
+          # In 1-GPU/proc + multi-axis mesh runs, ``jax.process_count()`` is
+          # the world size but the EP communication domain is only the
+          # ``expert`` axis (= ``ici_expert_parallelism × dcn_expert_parallelism``).
+          # Pin DeepEP's runtime to the actual EP-axis processes so its IPC
+          # buffer sizes, RDMA QP counts, and ``num_worst_tokens = num_tokens *
+          # ep_size`` are computed against the right rank count.  In
+          # 1-node/proc mode the expert axis spans intra-process devices —
+          # all entries collapse to the same ``process_index``; we detect
+          # that and leave the runtime unpinned (legacy "EP == world" path).
+          _maybe_pin_deepep_ep_group(self.mesh, deep_ep_runtime)
 
           deep_ep_runtime.auto_detect_mode()
           deep_ep_mode = deep_ep_runtime.get_mode()
