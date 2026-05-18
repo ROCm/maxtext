@@ -969,6 +969,21 @@ class AttentionOp(nnx.Module):
               wv_product_einsum=wv_product_einsum,
           )
         else:
+          if sinks is not None:
+            return self.apply_attention_dot(
+                query,
+                key,
+                value,
+                decoder_segment_ids,
+                model_mode,
+                previous_chunk,
+                bidirectional_mask=bidirectional_mask,
+                sinks=sinks,
+                indexer_mask=indexer_mask,
+                record_max_logits=record_max_logits,
+                qk_product_einsum=qk_product_einsum,
+                wv_product_einsum=wv_product_einsum,
+              )
           validate_gpu_flash_attention(sinks, record_max_logits)
           head_axis = -2
           num_query_heads = query.shape[head_axis]
