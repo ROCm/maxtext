@@ -699,6 +699,7 @@ def train_loop(config, recorder, state=None):
             if config.shard_optimizer_over_data and isinstance(model, nn.Module):
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, *step_rng_args)
+          jax.block_until_ready(state)
 
         step_time_delta = datetime.datetime.now() - last_step_completion
 
