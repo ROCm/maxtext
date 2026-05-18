@@ -1435,7 +1435,8 @@ def setup_decode_state(config, mesh, checkpoint_manager, init_state_fn):
       )
     state = init_decode_state(None, params)
 
-  state = max_utils.unbox_logicallypartioned(state)
+  with jax.set_mesh(mesh):
+    state = max_utils.unbox_logicallypartioned(state)
   return state, state_mesh_annotations
 
 
@@ -1551,7 +1552,8 @@ def setup_initial_state(
           else:
             state = state.replace(params=raw_params)
   if not config.pure_nnx:
-    state = max_utils.unbox_logicallypartioned(state)
+    with jax.set_mesh(mesh):
+      state = max_utils.unbox_logicallypartioned(state)
   return state, state_mesh_annotations, state_mesh_shardings, data_iterator
 
 
@@ -1571,7 +1573,7 @@ def get_abstract_state(config, mesh, init_state_fn, is_training=True):
 
   init_state_partial = init_state_fn
 
-  with nn_partitioning.axis_rules(config.logical_axis_rules):
+  with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
     abstract_state = jax.eval_shape(init_state_partial)
 
   state_logical_annotations = nn.get_partition_spec(abstract_state)
@@ -1579,10 +1581,12 @@ def get_abstract_state(config, mesh, init_state_fn, is_training=True):
   state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
   if is_training and config.shard_optimizer_over_data:
     # Add data to sharding for optimizer state
+    with jax.set_mesh(mesh):
+      unboxed_opt_state = max_utils.unbox_logicallypartioned(abstract_state).opt_state
     state_mesh_shardings = state_mesh_shardings.replace(
         opt_state=jax.tree.map_with_path(
             functools.partial(sharding.add_data_to_sharding, mesh),
-            max_utils.unbox_logicallypartioned(abstract_state).opt_state,
+            unboxed_opt_state,
             state_mesh_shardings.opt_state,
         )
     )
@@ -1601,8 +1605,8 @@ def get_abstract_state(config, mesh, init_state_fn, is_training=True):
 
   abstract_sharded_state = jax.jit(init_state_partial, in_shardings=None, out_shardings=state_mesh_shardings).eval_shape()
 
-  unboxed_abstract_sharded_state = max_utils.unbox_logicallypartioned(abstract_sharded_state)
-  # Initialization
+  with jax.set_mesh(mesh):
+    unboxed_abstract_sharded_state = max_utils.unbox_logicallypartioned(abstract_sharded_state)
   with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
     state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
   return (
