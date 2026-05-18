@@ -235,7 +235,7 @@ def main(_argv: Sequence[str]) -> None:
   # will call it right before the computation once b/301309635 is resolved
   # pylint: disable=not-callable
   activate_profiler(args.profiler_path)
-  with Mesh(mesh.devices, mesh.axis_names):
+  with jax.set_mesh(Mesh(mesh.devices, mesh.axis_names)):
     key = jax.random.PRNGKey(0)
     presharded_X = jax.block_until_ready(jit_gen_data(key))
     presharded_layers = jax.block_until_ready(jit_gen_layers(key))
