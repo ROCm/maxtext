@@ -1005,6 +1005,9 @@ def train_loop(config, recorder, state=None):
     while python_vars["step"] < immutable_data["steps"]:
       step = python_vars["step"]
       metrics = training_loop_iteration(jax_device_state, python_vars, immutable_data)
+      # sync between each step: block on the updated state to prevent async dispatch
+      # from racing ahead (ported from release/v26.5 commit a7c6c7e5).
+      jax.block_until_ready(jax_device_state["state"])
       python_vars["step"] += 1
 
       if getattr(config, "te_moe_block", False):
