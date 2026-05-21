@@ -957,6 +957,31 @@ def _eagerly_bootstrap_deepep(config, mesh):
   else:
     _say("pin_ep_group_from_jax_mesh unavailable on this primus_turbo version")
 
+  # ── Cross-process barrier before C++ buffer allocation ───────────────────
+  # Background: in jobs prior to 2026-05-21, ~50% of t5 dry-runs (3/6) hit
+  # silent rank deaths inside DeepEP's per-process buffer / rocSHMEM init
+  # (SIGSEGV in jaxlib for the early variant, SIGABRT via PollForError for
+  # the later variant — see report §14.7.4).  Multiple ranks would silent-
+  # die nearly simultaneously, suggesting a race condition where some ranks
+  # entered ``create_per_process_buffer`` / ``sync_per_process_buffer``
+  # before others had finished ``set_ep_group`` (the EP-group module
+  # globals live in Python — they cannot be picked up by C++ until the
+  # owning Python thread returns).
+  #
+  # We saw the failure rate drop from 3/6 to 0/10 after instrumenting
+  # this path with stderr logging (which incidentally serialized timing).
+  # That heuristic "fix" is not robust to future code that runs the same
+  # phases faster.  Install an explicit ``jax.experimental.multihost_utils
+  # .sync_global_devices`` barrier here so every rank has observed
+  # ``set_ep_group`` before the first C++ buffer call runs.
+  try:
+    from jax.experimental.multihost_utils import sync_global_devices as _sgd
+    _say("sync_global_devices('deepep-pre-warmup') start")
+    _sgd("deepep-pre-warmup")
+    _say("sync_global_devices('deepep-pre-warmup') done")
+  except Exception as _e:  # pylint: disable=broad-except
+    _say(f"sync_global_devices unavailable / failed: {_e!r} — continuing without barrier")
+
   # Override the library default (currently 64) so that EP NVL/RDMA buffer
   # sizes don't balloon and squeeze the XLA prefill memory pool — that has
   # been observed to surface as BFC fragmentation OOM on the v1.2 image.
