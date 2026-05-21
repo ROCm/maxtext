@@ -16,6 +16,7 @@
 """ Utils that are only interesting to MaxText. """
 
 import functools
+import os
 import pickle
 
 from flax import linen as nn
@@ -911,6 +912,24 @@ def _eagerly_bootstrap_deepep(config, mesh):
   over-allocates by ~``world_size / ep_size`` × on multi-axis 1-GPU/proc
   runs — e.g. dcn_fsdp=8 × ici_ep=8 with 64 processes wastes 8×).
   """
+  import sys as _sys
+  import time as _time
+  # Explicit breadcrumbs to stderr — primus_turbo's own log.info() calls go to
+  # Python's default logger which is silenced unless the user configured
+  # logging.basicConfig().  We saw bootstraps silently die between
+  # set_ep_group() and create_per_process_buffer() with no log signal at all
+  # (job 27273), so we instrument the eager init explicitly here.
+  def _say(msg):
+    try:
+      pid = os.getpid()
+      proc_idx = jax.process_index()
+    except Exception:
+      pid, proc_idx = -1, -1
+    _sys.stderr.write(f"[deepep-init] proc={proc_idx} pid={pid} t={_time.time():.3f} {msg}\n")
+    _sys.stderr.flush()
+
+  _say("entry")
+
   try:
     from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
     from primus_turbo.jax.lax.moe import warmup as deepep_warmup
@@ -921,14 +940,22 @@ def _eagerly_bootstrap_deepep(config, mesh):
         set_default_num_sms as _deepep_set_default_num_sms,
     )
   except ImportError:
+    _say("ImportError (primus_turbo not installed) — skipping eager bootstrap")
     return
+
+  _say("imports done")
 
   # Pin the EP group from the mesh's ``expert`` axis when available.
   # No-op on older Primus-Turbo without ``pin_ep_group_from_jax_mesh``;
   # no-op on 1-node/proc layouts (intra-process EP axis).
   _pin = getattr(deep_ep_runtime, "pin_ep_group_from_jax_mesh", None)
   if _pin is not None:
+    _say("pin_ep_group_from_jax_mesh(mesh) start")
     _pin(mesh)
+    pinned = getattr(deep_ep_runtime, "get_ep_group_ranks", lambda: None)()
+    _say(f"pin_ep_group_from_jax_mesh done; ep_group_ranks={pinned!r}")
+  else:
+    _say("pin_ep_group_from_jax_mesh unavailable on this primus_turbo version")
 
   # Override the library default (currently 64) so that EP NVL/RDMA buffer
   # sizes don't balloon and squeeze the XLA prefill memory pool — that has
@@ -937,9 +964,12 @@ def _eagerly_bootstrap_deepep(config, mesh):
   # Allow per-run override via the model config: ``deepep_num_sms: <int>``.
   deepep_num_sms = int(getattr(config, "deepep_num_sms", 32))
   _deepep_set_default_num_sms(deepep_num_sms)
+  _say(f"set_default_num_sms({deepep_num_sms}) done")
 
   hidden_bytes = config.emb_dim * max(jnp.dtype(config.dtype).itemsize, 2)
+  _say(f"deepep_warmup(hidden_bytes={hidden_bytes}) start")
   deepep_warmup(hidden_bytes)
+  _say("deepep_warmup done")
 
 
 def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
