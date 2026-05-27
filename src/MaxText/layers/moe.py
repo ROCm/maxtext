@@ -1197,49 +1197,28 @@ class RoutedMoE(nnx.Module):
       else:
 
         if self.config.use_deepep_dispatch and num_expert_parallelism > 1:
-          from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime  # pylint: disable=g-import-not-at-top
+          # Bootstrap is owned end-to-end by ``maxtext_utils._eagerly_bootstrap_deepep``
+          # (called from ``get_abstract_state`` before tracing begins),
+          # which delegates to ``primus_turbo.jax.lax.moe.setup``.  Under
+          # Primus-Turbo's strict-freeze contract, ``setup()`` pins the
+          # EP group from the mesh, locks the launch mode (INPROC vs
+          # PER_PROCESS), validates internode invariants (ep_size %% 8 == 0),
+          # eagerly allocates the per-process buffer with a cross-process
+          # barrier, and freezes the runtime state.  Any code path that
+          # reaches ``_deepep_moe_dispatch`` without ``setup()`` having
+          # been called raises a clear RuntimeError from within
+          # primus_turbo — no redundant safety nets are needed here.
           from primus_turbo.jax.lax.moe import (  # pylint: disable=g-import-not-at-top
+              is_internode as _deepep_is_internode,
               moe_combine as _deepep_moe_combine,
               moe_dispatch as _deepep_moe_dispatch,
           )
-
-          # ── EP group pinning (decouple "EP rank set" from "JAX world") ────
-          # In 1-GPU/proc + multi-axis mesh runs, ``jax.process_count()`` is
-          # the world size but the EP communication domain is only the
-          # ``expert`` axis (= ``ici_expert_parallelism × dcn_expert_parallelism``).
-          # Pin DeepEP's runtime to the actual EP-axis processes so its IPC
-          # buffer sizes, RDMA QP counts, and ``num_worst_tokens = num_tokens *
-          # ep_size`` are computed against the right rank count.  In
-          # 1-node/proc mode the expert axis spans intra-process devices —
-          # all entries collapse to the same ``process_index``; the helper
-          # detects that and leaves the runtime unpinned (legacy "EP == world").
-          # Note: ``maxtext_utils._eagerly_bootstrap_deepep`` already does this
-          # before tracing begins, so this call is normally a no-op
-          # (idempotent — ``set_ep_group`` short-circuits on identical group).
-          # It stays here as a safety net for callers that bypass
-          # ``get_abstract_state`` (e.g. ad-hoc forward-only invocations).
-          _pin = getattr(deep_ep_runtime, "pin_ep_group_from_jax_mesh", None)
-          if _pin is not None:
-            _pin(self.mesh)
-
-          deep_ep_runtime.auto_detect_mode()
-          deep_ep_mode = deep_ep_runtime.get_mode()
-          if (
-              num_expert_parallelism > deep_ep_runtime.NUM_MAX_NVL_PEERS
-              and deep_ep_mode is not deep_ep_runtime.MODE_PER_PROCESS
-          ):
-            raise ValueError(
-                "use_deepep_dispatch with internode expert parallelism currently "
-                "requires Primus-Turbo DeepEP per_process mode. "
-                f"Got expert_parallelism={num_expert_parallelism}, "
-                f"mode={deep_ep_mode.mode_name}."
-            )
 
           global _deepep_dispatch_logged  # pylint: disable=global-statement
           if not _deepep_dispatch_logged:
             max_logging.log(
                 f"Using Primus-Turbo DeepEP dispatch/combine "
-                f"(EP={num_expert_parallelism}, mode={deep_ep_mode.mode_name})"
+                f"(EP={num_expert_parallelism}, internode={_deepep_is_internode()})"
             )
             _deepep_dispatch_logged = True
 
@@ -1266,7 +1245,7 @@ class RoutedMoE(nnx.Module):
               expert_alignment=1,
           )
 
-          if deep_ep_runtime.is_internode(lock=True):
+          if _deepep_is_internode():
             recv_gbl_rank_prefix_sum = deepep_handle[6]
             actual_num_recv = recv_gbl_rank_prefix_sum[-1]
           else:

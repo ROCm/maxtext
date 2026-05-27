@@ -901,100 +901,32 @@ def setup_initial_state(
 def _eagerly_bootstrap_deepep(config, mesh):
   """Bootstrap DeepEP IPC buffers before any JAX tracing begins.
 
-  In per_process mode, DeepEP exchanges IPC handles via
-  process_allgather — a real collective that cannot run inside
-  jax.eval_shape (arrays are Tracers there).  We call warmup() here,
+  In per_process mode, DeepEP exchanges IPC handles via process_allgather
+  — a real collective that cannot run inside jax.eval_shape (arrays are
+  Tracers there).  We trigger the per-process buffer allocation here,
   eagerly, so the buffers are ready before tracing starts.
 
-  Before warmup, pin DeepEP's EP group to the mesh ``expert`` axis
-  so its IPC buffer sizing matches the actual EP rank set rather than
-  defaulting to ``jax.process_count()`` (which equals world size and
-  over-allocates by ~``world_size / ep_size`` × on multi-axis 1-GPU/proc
-  runs — e.g. dcn_fsdp=8 × ici_ep=8 with 64 processes wastes 8×).
+  Delegates everything to ``primus_turbo.jax.lax.moe.setup`` which
+  internally handles EP-group pinning, mode auto-detection, num_sms
+  override, eager C++ buffer allocation, and the cross-process barrier
+  that prevents the rocSHMEM init race observed at ~50 % rate on
+  multi-host runs prior to Primus-Turbo's ``_bootstrap_barrier`` fix.
+  After ``setup`` returns, the runtime state is frozen so subsequent
+  ``moe_dispatch`` / ``moe_combine`` calls fail loudly if the bootstrap
+  was skipped.
   """
-  import sys as _sys
-  import time as _time
-  # Explicit breadcrumbs to stderr — primus_turbo's own log.info() calls go to
-  # Python's default logger which is silenced unless the user configured
-  # logging.basicConfig().  We saw bootstraps silently die between
-  # set_ep_group() and create_per_process_buffer() with no log signal at all
-  # (job 27273), so we instrument the eager init explicitly here.
-  def _say(msg):
-    try:
-      pid = os.getpid()
-      proc_idx = jax.process_index()
-    except Exception:
-      pid, proc_idx = -1, -1
-    _sys.stderr.write(f"[deepep-init] proc={proc_idx} pid={pid} t={_time.time():.3f} {msg}\n")
-    _sys.stderr.flush()
-
-  _say("entry")
-
   try:
-    from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
-    from primus_turbo.jax.lax.moe import warmup as deepep_warmup
-    # ``set_default_num_sms`` is only re-exported from ``primus_turbo.jax.lax.moe``
-    # in newer versions; import from the submodule directly to stay
-    # version-agnostic.
-    from primus_turbo.jax.lax.moe.moe_dispatch_combine import (
-        set_default_num_sms as _deepep_set_default_num_sms,
-    )
+    from primus_turbo.jax.lax.moe import setup as _deepep_setup
   except ImportError:
-    _say("ImportError (primus_turbo not installed) — skipping eager bootstrap")
     return
 
-  _say("imports done")
-
-  # Pin the EP group from the mesh's ``expert`` axis when available.
-  # No-op on older Primus-Turbo without ``pin_ep_group_from_jax_mesh``;
-  # no-op on 1-node/proc layouts (intra-process EP axis).
-  _pin = getattr(deep_ep_runtime, "pin_ep_group_from_jax_mesh", None)
-  if _pin is not None:
-    _say("pin_ep_group_from_jax_mesh(mesh) start")
-    _pin(mesh)
-    pinned = getattr(deep_ep_runtime, "get_ep_group_ranks", lambda: None)()
-    _say(f"pin_ep_group_from_jax_mesh done; ep_group_ranks={pinned!r}")
-  else:
-    _say("pin_ep_group_from_jax_mesh unavailable on this primus_turbo version")
-
-  # ── Cross-process barrier before C++ buffer allocation ───────────────────
-  # Background: in jobs prior to 2026-05-21, ~50% of t5 dry-runs (3/6) hit
-  # silent rank deaths inside DeepEP's per-process buffer / rocSHMEM init
-  # (SIGSEGV in jaxlib for the early variant, SIGABRT via PollForError for
-  # the later variant — see report §14.7.4).  Multiple ranks would silent-
-  # die nearly simultaneously, suggesting a race condition where some ranks
-  # entered ``create_per_process_buffer`` / ``sync_per_process_buffer``
-  # before others had finished ``set_ep_group`` (the EP-group module
-  # globals live in Python — they cannot be picked up by C++ until the
-  # owning Python thread returns).
-  #
-  # We saw the failure rate drop from 3/6 to 0/10 after instrumenting
-  # this path with stderr logging (which incidentally serialized timing).
-  # That heuristic "fix" is not robust to future code that runs the same
-  # phases faster.  Install an explicit ``jax.experimental.multihost_utils
-  # .sync_global_devices`` barrier here so every rank has observed
-  # ``set_ep_group`` before the first C++ buffer call runs.
-  try:
-    from jax.experimental.multihost_utils import sync_global_devices as _sgd
-    _say("sync_global_devices('deepep-pre-warmup') start")
-    _sgd("deepep-pre-warmup")
-    _say("sync_global_devices('deepep-pre-warmup') done")
-  except Exception as _e:  # pylint: disable=broad-except
-    _say(f"sync_global_devices unavailable / failed: {_e!r} — continuing without barrier")
-
-  # Override the library default (currently 64) so that EP NVL/RDMA buffer
-  # sizes don't balloon and squeeze the XLA prefill memory pool — that has
-  # been observed to surface as BFC fragmentation OOM on the v1.2 image.
-  # 32 mirrors the working DeepSeek-3 671B internode smoke run (job 25221).
-  # Allow per-run override via the model config: ``deepep_num_sms: <int>``.
-  deepep_num_sms = int(getattr(config, "deepep_num_sms", 32))
-  _deepep_set_default_num_sms(deepep_num_sms)
-  _say(f"set_default_num_sms({deepep_num_sms}) done")
-
   hidden_bytes = config.emb_dim * max(jnp.dtype(config.dtype).itemsize, 2)
-  _say(f"deepep_warmup(hidden_bytes={hidden_bytes}) start")
-  deepep_warmup(hidden_bytes)
-  _say("deepep_warmup done")
+  # 32 mirrors the working DeepSeek-3 671B internode smoke run (job 25221).
+  # The library default (64) balloons NVL/RDMA buffer sizes and has been
+  # observed to surface as XLA prefill-pool fragmentation OOM on v1.2.
+  num_sms = int(getattr(config, "deepep_num_sms", 32))
+
+  _deepep_setup(mesh=mesh, hidden_bytes=hidden_bytes, num_sms=num_sms)
 
 
 def get_abstract_state(model, tx, config, rng, mesh, is_training=True):
