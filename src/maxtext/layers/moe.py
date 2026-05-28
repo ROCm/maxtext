@@ -2449,6 +2449,30 @@ class RoutedMoE(nnx.Module):
             **({"out_is_3d": True} if out_is_3d else {}),
             **({"tc_routing": tc_routing, "tc_unsort_cfg": tc_unsort_cfg} if tc_unsort_cfg is not None else {}),
         )
+      elif self.config.use_turbo_grouped_gemm:
+        try:
+          from primus_turbo.jax.lax.grouped_gemm import grouped_gemm as turbo_grouped_gemm
+        except ImportError as e:
+          raise ImportError(
+              "use_turbo_grouped_gemm=True requires the primus_turbo package to be installed."
+          ) from e
+        if not getattr(turbo_grouped_gemm, "_logged", False):
+          max_logging.log("Using primus_turbo grouped_gemm in MoE sparse matmul")
+          turbo_grouped_gemm._logged = True
+        # Thread-local x64: CK kernel requires int64 group_sizes, but
+        # global x64 breaks argsort (XLA-ROCm s32/s64 scatter mismatch).
+        # Use jax.experimental.enable_x64() for thread-local scope,
+        # safe for concurrent shard_map threads.
+        # Remove this once primus_turbo accepts int32 group_lens natively.
+        with jax.experimental.enable_x64():
+          output = turbo_grouped_gemm(
+              inputs,
+              kernel,
+              group_sizes.astype(jnp.int64),
+              transA=False,
+              transB=False,
+              num_cu=-1,
+          )
       else:
         # jax.lax.ragged_dot
         output = jax_ragged_dot_gmm(

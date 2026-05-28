@@ -1481,6 +1481,12 @@ class MoEKernels(BaseModel):
 
   megablox: bool = Field(True, description="Whether to use Megablox kernels for MoE.")
   sparse_matmul: bool = Field(True, description="Whether to use sparse matmul kernels for MoE.")
+  use_turbo_grouped_gemm: bool = Field(
+      False,
+      description="Use Primus-Turbo grouped GEMM for MoE sparse matmul. "
+      "Requires sparse_matmul=True and megablox=False. "
+      "Requires the primus_turbo package to be installed.",
+  )
   wi_tile_fwd_batch_seq: int = Field(
       512,
       description="forward pass tiling dimension for batch/sequence in GMM for wi.",
@@ -5314,6 +5320,17 @@ class MaxTextConfig(
     self.validate_mllog()
     self.validate_splash_diag_skip()
     self.validate_retry_dropless_first_steps_and_first_phase_buffer()
+    if self.use_turbo_grouped_gemm:
+      if self.quantization:
+        raise ValueError("use_turbo_grouped_gemm is not compatible with quantization.")
+      if not self.sparse_matmul:
+        raise ValueError("use_turbo_grouped_gemm requires sparse_matmul=True.")
+      if self.megablox:
+        raise ValueError("use_turbo_grouped_gemm requires megablox=False.")
+      try:
+        import primus_turbo.jax.lax.grouped_gemm  # pylint: disable=import-outside-toplevel,unused-import
+      except ImportError as e:
+        raise ValueError("use_turbo_grouped_gemm requires the primus_turbo package.") from e
 
     if self.enable_streaming_diloco:
       if not self.scan_layers:
