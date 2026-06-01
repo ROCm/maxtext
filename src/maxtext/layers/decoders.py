@@ -29,7 +29,6 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import Config, DecoderBlockType, ShardMode
 from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_PREFILL, MODEL_MODE_TRAIN
-from maxtext.inference import page_manager
 from maxtext.layers import linears
 from maxtext.layers import mhc
 from maxtext.layers import normalizations
@@ -95,7 +94,6 @@ class DecoderLayer(nn.Module):
       model_mode,
       previous_chunk=None,
       slot: None | int = None,
-      page_state: None | page_manager.PageState = None,
       kv_cache: jax.Array | None = None,
       attention_metadata: dict[str, Any] | None = None,
   ):
@@ -249,7 +247,6 @@ class SequentialBlockDecoderLayers(nn.Module):
       deterministic: bool,
       model_mode,
       slot: None | int = None,
-      page_state: None | page_manager.PageState = None,
   ) -> jnp.ndarray:
     for lyr in range(self.num_decoder_layers):
       inputs = self.decoder_layer(
@@ -261,7 +258,6 @@ class SequentialBlockDecoderLayers(nn.Module):
           deterministic,
           model_mode,
           slot=slot,
-          page_state=page_state,
       )
       if self.config.scan_layers:
         inputs = inputs[0]  #  When scan_layers is True the decoder layers return (outputs, None).
@@ -646,6 +642,9 @@ class Decoder(nn.Module):
       image_embeddings = multimodal_input.image_embeddings
       bidirectional_mask = multimodal_input.bidirectional_mask
       image_masks = multimodal_input.image_masks
+      video_embeddings = getattr(multimodal_input, "video_embeddings", None)
+      video_masks = getattr(multimodal_input, "video_masks", None)
+      bidirectional_mask_video = getattr(multimodal_input, "bidirectional_mask_video", None)
       audio_embeddings = multimodal_input.audio_embeddings
       audio_masks = multimodal_input.audio_masks
 
@@ -672,6 +671,17 @@ class Decoder(nn.Module):
         # TODO(hengtaoguo): Add support for other multimodal models such as Llama4, refactor if needed
         else:
           raise ValueError(f"Unsupported model_name for multimodal: {cfg.model_name}")
+
+      if video_embeddings is not None and cfg.use_multimodal:
+        if cfg.model_name in ["qwen3-omni-30b-a3b", "qwen3.5-397b-a17b"]:
+          y = mm_utils.merge_mm_embeddings(
+              text_embeddings=y,
+              multimodal_embeddings=video_embeddings,
+              mask=bidirectional_mask_video,
+              token_masks=video_masks,
+          )
+        else:
+          raise ValueError(f"Unsupported model_name for video: {cfg.model_name}")
 
       if audio_embeddings is not None and cfg.use_audio:
         if cfg.model_name in ["qwen3-omni-30b-a3b"]:
@@ -779,7 +789,6 @@ class Decoder(nn.Module):
       model_mode=MODEL_MODE_TRAIN,
       previous_chunk=None,
       slot: None | int = None,
-      page_state: None | page_manager.PageState = None,
       multimodal_input=None,
       kv_caches: list[jax.Array] | None = None,
       attention_metadata=None,
@@ -868,7 +877,6 @@ class Decoder(nn.Module):
         if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
           assert len(RemattedBlockLayers) == 2, "Scanned layers must have a length of 2 using deepseek."
           layer_call_kwargs = {
-              "page_state": page_state,
               "previous_chunk": previous_chunk,
               "slot": slot,
           }
@@ -976,7 +984,6 @@ class Decoder(nn.Module):
               model_mode,
               bidirectional_mask_value,
               previous_chunk,
-              page_state,
               slot,
           )
         elif cfg.decoder_block == DecoderBlockType.GEMMA4:
@@ -989,7 +996,6 @@ class Decoder(nn.Module):
               model_mode,
               bidirectional_mask_value,
               previous_chunk,
-              page_state,
               slot,
           )
         else:
@@ -1015,9 +1021,9 @@ class Decoder(nn.Module):
 
             # We don't pass kv_cache as a scanned argument anymore
 
-            # Pass None for previous_chunk, slot, page_state, kv_cache to align with __call__ signature
-            current_broadcast_args.extend([None, None, None, None, attention_metadata])
-            current_in_axes_tuple.extend([nn.broadcast] * 5)
+            # Pass None for previous_chunk, slot, kv_cache to align with __call__ signature
+            current_broadcast_args.extend([None, None, None, attention_metadata])
+            current_in_axes_tuple.extend([nn.broadcast] * 4)
 
             max_logging.info(f"DEBUG: len(current_broadcast_args)={len(current_broadcast_args)}")
             max_logging.info(f"DEBUG: current_broadcast_args={[type(a) for a in current_broadcast_args]}")
@@ -1084,7 +1090,6 @@ class Decoder(nn.Module):
                   deterministic,
                   model_mode,
                   previous_chunk=previous_chunk,
-                  page_state=page_state,
                   slot=slot,
                   kv_cache=kv_cache,
                   attention_metadata=attention_metadata,
@@ -1105,7 +1110,6 @@ class Decoder(nn.Module):
               kv_caches=kv_caches,
               attention_metadata=attention_metadata,
               previous_chunk=previous_chunk,
-              page_state=page_state,
               slot=slot,
           )
         else:
@@ -1152,7 +1156,6 @@ class Decoder(nn.Module):
                 deterministic,
                 model_mode,
                 previous_chunk=previous_chunk,
-                page_state=page_state,
                 slot=slot,
                 kv_cache=kv_cache,
                 attention_metadata=attention_metadata,
@@ -1219,7 +1222,6 @@ class Decoder(nn.Module):
       model_mode,
       bidirectional_mask,
       previous_chunk,
-      page_state,
       slot,
   ):
     """Applies Gemma3 scanned decoder blocks, handling main scan and remainders."""
@@ -1271,7 +1273,6 @@ class Decoder(nn.Module):
           deterministic,
           model_mode,
           previous_chunk=previous_chunk,
-          page_state=page_state,
           slot=slot,
           **layer_call_kwargs,
       )
@@ -1286,7 +1287,6 @@ class Decoder(nn.Module):
       model_mode,
       bidirectional_mask,
       previous_chunk,
-      page_state,
       slot,
   ):
     """Applies Gemma4 scanned decoder blocks, handling main scan and remainders."""
@@ -1305,7 +1305,6 @@ class Decoder(nn.Module):
         deterministic,
         model_mode,
         slot,
-        page_state,
         previous_chunk,
         bidirectional_mask,
     )
@@ -1371,7 +1370,6 @@ class Decoder(nn.Module):
       kv_caches=None,
       attention_metadata=None,
       previous_chunk=None,
-      page_state=None,
       slot=None,
   ):
     """Apply Gemma 4 small (E2B / E4B) decoder layers.
@@ -1443,7 +1441,6 @@ class Decoder(nn.Module):
           deterministic,
           model_mode,
           previous_chunk=previous_chunk,
-          page_state=page_state,
           slot=slot,
           bidirectional_mask=bidirectional_mask_value,
           kv_cache=kv_cache,

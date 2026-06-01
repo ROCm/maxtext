@@ -374,7 +374,10 @@ def _build_multi_axis_stacked_tensor(
     layer_tensors_for_expert = []
     # Inner loop iterates through layers for the current expert
     for hf_key_single in layer_keys_for_expert:
-      hf_tensor_numpy = tensor_getter_fn(hf_key_single)
+      if isinstance(hf_key_single, (list, tuple)):
+        hf_tensor_numpy = tuple(tensor_getter_fn(k) for k in hf_key_single)
+      else:
+        hf_tensor_numpy = tensor_getter_fn(hf_key_single)
       processed_hf_tensor = apply_hook_fns(hf_tensor_numpy, mt_slice_shape, hook_fns)
       layer_tensors_for_expert.append(processed_hf_tensor)
     all_expert_tensors.append(np.stack(layer_tensors_for_expert, axis=0))
@@ -419,7 +422,10 @@ def _build_single_axis_stacked_tensor(
   mt_slice_shape = tuple(mt_slice_shape_list)
 
   for hf_key_single in hf_source_keys:
-    hf_tensor_numpy = tensor_getter_fn(hf_key_single)
+    if isinstance(hf_key_single, (list, tuple)):
+      hf_tensor_numpy = tuple(tensor_getter_fn(k) for k in hf_key_single)
+    else:
+      hf_tensor_numpy = tensor_getter_fn(hf_key_single)
     processed_hf_tensor = apply_hook_fns(hf_tensor_numpy, mt_slice_shape, hook_fns)
     tensors_to_stack.append(processed_hf_tensor)
 
@@ -429,6 +435,12 @@ def _build_single_axis_stacked_tensor(
 
 def _get_hf_loading_function(hf_source_keys_or_key, tensor_getter, hook_fn, mt_target_shape_or_shapes, config):
   """Determine the loading function for HF keys.
+
+  This function natively supports `composite_hf_key` mapping (where multiple HF keys
+  combine into a single MaxText parameter, like Qwen3.5's qkv and z -> in_proj_qkvz).
+  If the input is a tuple of strings, they are fetched as a tuple of arrays and passed
+  together into the model hook.
+
   HF keys can take four forms:
     Case 1: Unscanned (single string)
     Case 2: Scanned (list of strings)
@@ -439,6 +451,9 @@ def _get_hf_loading_function(hf_source_keys_or_key, tensor_getter, hook_fn, mt_t
   if not isinstance(hf_source_keys_or_key, list):
     # Case 1: Single hf key (str)
     def _loader(getter, key, shape, hook):
+      if isinstance(key, (list, tuple)):
+        tensors = tuple(getter(k) for k in key)
+        return apply_hook_fns(tensors, shape, hook)
       return apply_hook_fns(getter(key), shape, hook)
 
     load_fn = partial(
@@ -479,7 +494,8 @@ def _get_maxtext_indices_and_shapes(mt_param_key_or_keys, maxtext_abstract_dict)
   The index is the parameter's order in `maxtext_abstract_dict.keys()`.
   This function handles two forms of MaxText keys:
   - `atomic_mt_key`: A single string representing one MaxText parameter that map to HF parameter(s).
-  - `composite_mt_key`: A tuple of strings for multiple MaxText parameters that map to HF parameter(s).
+  - `composite_mt_key`: A tuple of strings representing multiple MaxText parameters derived from
+    a single/bundled HF parameter source (e.g., HF gate_up_proj splitting into MT wi_0 and wi_1).
   """
   is_composite_mt_key = isinstance(mt_param_key_or_keys, tuple)
   # atomic_mt_key
@@ -923,6 +939,21 @@ def main(
       unique_dtypes = {tensor.dtype for tensor in hf_state_dict_numpy.values()}
       max_logging.log(f"HuggingFace model loaded. dtypes: {unique_dtypes}")
       print_ram_usage("After full HF model load")
+
+      # transformers>=5.8 removed the intermediate `vision_model` attribute,
+      # so keys are now `model.vision_tower.embeddings.*` instead
+      # of `model.vision_tower.vision_model.embeddings.*`.
+      # Remap to the old format so that the param_mapping continues to work.
+      if eager_load_method == "transformers" and config.use_multimodal:
+        old_prefix = "model.vision_tower.vision_model."
+        new_prefix = "model.vision_tower."
+        needs_remap = any(k.startswith(new_prefix) and not k.startswith(old_prefix) for k in hf_state_dict_numpy)
+        if needs_remap:
+          max_logging.log("Detected new-style key layout; remapping vision_tower keys.")
+          hf_state_dict_numpy = {
+              (old_prefix + k[len(new_prefix) :] if k.startswith(new_prefix) and not k.startswith(old_prefix) else k): v
+              for k, v in hf_state_dict_numpy.items()
+          }
 
       def _eager_getter(key):
         if key not in hf_state_dict_numpy:

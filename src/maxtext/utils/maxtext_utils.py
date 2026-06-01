@@ -46,7 +46,6 @@ from maxtext.common.common_types import (
     ShardMode,
 )
 from maxtext.configs import types
-from maxtext.inference.page_manager import PageState
 from maxtext.common import checkpointing
 from maxtext.multimodal import processor as mm_processor
 from maxtext.utils import gcs_utils
@@ -682,13 +681,23 @@ def calculate_ffn_mamtul_tflops_per_device(config, mlp_dim, in_dim=None):
   return ffn1_flops + ffn2_flops
 
 
+def get_shared_expert_mlp_dim(config):
+  """Returns the MLP dimension used by the shared expert.
+
+  GEMMA4 shared experts use mlp_dim, while other MoE blocks use moe_mlp_dim. See moe.py.
+  """
+  return config.mlp_dim if config.decoder_block == DecoderBlockType.GEMMA4 else config.moe_mlp_dim
+
+
 def calculate_routed_and_shared_ffn_tflops_per_device(config):
   """Helper function to calculate DeepSeek-style ffn TFLOP"""
   gate_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.num_experts
   # Due to the mixed decoder layers, the flops is multiplied by num of layers for both dense and moe
   num_dense_layers, num_moe_layers = get_dense_moe_layers(config)
   dense_ffn_flops = calculate_ffn_mamtul_tflops_per_device(config, config.mlp_dim) * num_dense_layers
-  shared_experts_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.shared_experts
+  shared_experts_flops = (
+      calculate_ffn_mamtul_tflops_per_device(config, get_shared_expert_mlp_dim(config)) * config.shared_experts
+  )
   routed_experts_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.num_experts_per_tok
   moe_ffn_flops = (gate_flops + shared_experts_flops + routed_experts_flops) * num_moe_layers
   total_ffn_flops = dense_ffn_flops + moe_ffn_flops
@@ -1114,7 +1123,9 @@ def calculate_tflops_training_per_device(config, log=True):
           DecoderBlockType.QWEN3_NEXT,
           DecoderBlockType.GEMMA4,
       ):
-        shared_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.shared_experts
+        shared_flops = (
+            calculate_ffn_mamtul_tflops_per_device(config, get_shared_expert_mlp_dim(config)) * config.shared_experts
+        )
         routed_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.num_experts_per_tok
         last_layer_ffn_flops = gate_flops + shared_flops + routed_flops
       else:
@@ -1750,7 +1761,7 @@ def get_abstract_state_nnx(config, mesh, nnx_init_trainstate_fn, is_training=Tru
   )
 
 
-def get_prefill_kv_cache_annotations(model, config, rng, mesh, page_state: None | PageState = None):
+def get_prefill_kv_cache_annotations(model, config, rng, mesh):
   """Get a shaped abstraction of the state (including optimizer)"""
 
   def init_kv_cache(model, config):
@@ -1771,7 +1782,6 @@ def get_prefill_kv_cache_annotations(model, config, rng, mesh, page_state: None 
         encoder_audios=jnp.ones(audio_shape) if config.use_audio else None,
         model_mode=MODEL_MODE_PREFILL,
         slot=0,
-        page_state=page_state,
     )
     return model_vars["cache"]
 
@@ -1784,7 +1794,7 @@ def get_prefill_kv_cache_annotations(model, config, rng, mesh, page_state: None 
   return state_mesh_annotations
 
 
-def get_kv_cache_annotations(model, config, rng, mesh, page_state: None | PageState = None):
+def get_kv_cache_annotations(model, config, rng, mesh):
   """Get a shaped abstraction of the state (including optimizer)"""
 
   def init_kv_cache(model, config):
@@ -1802,7 +1812,6 @@ def get_kv_cache_annotations(model, config, rng, mesh, page_state: None | PageSt
         encoder_audios=jnp.ones(audio_shape) if config.use_audio else None,
         model_mode=MODEL_MODE_AUTOREGRESSIVE,
         slot=0,
-        page_state=page_state,
     )
     return model_vars["cache"]
 
@@ -1813,6 +1822,30 @@ def get_kv_cache_annotations(model, config, rng, mesh, page_state: None | PageSt
   with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
     state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
   return state_mesh_annotations
+
+
+def _nnx_cache_partition_specs(abstract_model, config, mesh):
+  """Per-leaf PartitionSpec tree for the abstract model's nnx.Cache vars.
+
+  Returned as a pure dict so the engine can wrap it in NamedSharding the same
+  way it does for the Linen helpers below.
+  """
+  _, cache_state, _ = nnx.split(abstract_model, nnx.Cache, ...)
+  # get_nnx_named_sharding_with_scan_axis reads logical axis rules from the
+  # active flax partitioning context, so wrap.
+  with nn_partitioning.axis_rules(config.logical_axis_rules):
+    named_state = get_nnx_named_sharding_with_scan_axis(cache_state, mesh)
+  return jax.tree.map(lambda s: s.spec, named_state.to_pure_dict())
+
+
+def get_prefill_kv_cache_annotations_nnx(abstract_model, config, mesh):
+  """NNX equivalent of get_prefill_kv_cache_annotations."""
+  return _nnx_cache_partition_specs(abstract_model, config, mesh)
+
+
+def get_kv_cache_annotations_nnx(abstract_model, config, mesh):
+  """NNX equivalent of get_kv_cache_annotations."""
+  return _nnx_cache_partition_specs(abstract_model, config, mesh)
 
 
 def save_quantized_checkpoint_if_configured(config, params):
