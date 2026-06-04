@@ -1,0 +1,48 @@
+base_config: "base.yml"
+
+# ---- runtime ----
+steps: 5
+hardware: "gpu"
+# Must be "default" — otherwise MaxText loads sibling gemma3-4b.yml (with a
+# dash) and overlays its full-size dims (emb=2560, mlp=10240, vocab=262144,
+# layers=34) on top of these shrunk values. See
+# configs/pyconfig_deprecated.py:895. decoder_block: "gemma3" below still
+# selects the gemma3 architecture.
+model_name: "gemma3-4b"
+dataset_type: "synthetic"
+attention: "dot_product"          # avoid FMHA / Triton-flash on FFM
+enable_checkpointing: False
+max_segments_per_seq: 1
+
+# ---- FFM training tensor shapes ----
+# Sized so total memory stays ~2-3 GB (well under FFM limit) but FLOPs/step
+# are large enough to register on the %.2f display (~0.2 TFLOPs/step).
+per_device_batch_size: 1
+max_target_length: 256
+max_prefill_predict_length: 64
+
+# ---- decoder dimensions ----
+# Canonical gemma3-4b is layers=34, emb=2560, mlp=10240, heads=8, kv=4, head_dim=256, vocab=262144.
+# We keep the same architectural ratios but shrink by ~2-8x per axis.
+# Param count ~150 M, FP32 + Adam ~2.4 GB.
+base_num_decoder_layers: 8
+base_emb_dim: 1024
+base_num_query_heads: 8
+base_num_kv_heads: 4
+base_mlp_dim: 4096
+head_dim: 128
+mlp_activations: ["gelu","linear"]
+vocab_size: 16384
+decoder_block: "gemma3"
+normalization_layer_epsilon: 1e-6
+logits_via_embedding: True
+
+# ---- gemma3 architectural features (kept) ----
+sliding_window_size: 128          # < max_target_length, still exercises sliding path
+use_post_attn_norm: true
+use_post_ffw_norm: true
+local_rope_max_timescale: 10_000
+rope_max_timescale: 1_000_000
+rope_linear_scaling_factor: 8.0
+
+# Multimodal stays disabled (use_multimodal defaults to false in base.yml).

@@ -1,0 +1,360 @@
+# Copyright 2025 Google LLC
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+
+#     https://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This workflow will build maxtext python package and run tests.
+
+name: MaxText Package Tests
+
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      rocm_only:
+        description: 'Run only ROCm jobs (manual runs only)'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '0 3 * * *'  # Daily 03:00 UTC
+
+concurrency:
+  # Cancel previous runs for same PR (all actors), scheduled runs,
+  # and manual runs per (branch + actor).
+  group: >
+    ${{
+      github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) ||
+      github.event_name == 'schedule' && format('{0}-schedule', github.workflow) ||
+      github.event_name == 'workflow_dispatch' && format('{0}-manual-{1}-{2}', github.workflow, github.ref, github.actor) ||
+      github.run_id
+    }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+jobs:
+  analyze_code_changes:
+    name: Analyze Code Changes for Test Orchestration
+    runs-on: ubuntu-latest
+    outputs:
+      run_tests: ${{ steps.check.outputs.run_tests }}
+      run_notebooks: ${{ steps.check.outputs.run_notebooks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check for Code Changes
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Not a pull request, running all tests"
+            echo "run_tests=true" >> $GITHUB_OUTPUT
+            echo "run_notebooks=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git fetch origin ${GITHUB_BASE_REF}
+          CHANGED_FILES=$(git diff --name-only origin/${GITHUB_BASE_REF}...HEAD)
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No files detected or diff failed. Running everything as a fail-safe."
+            echo "run_tests=true" >> $GITHUB_OUTPUT
+            echo "run_notebooks=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # default to running everything if something goes wrong with the checks
+          echo "run_tests=true" >> $GITHUB_OUTPUT
+          echo "run_notebooks=true" >> $GITHUB_OUTPUT
+
+          # 1. Check if only documentation files (.md) were changed
+          if ! echo "$CHANGED_FILES" | grep -v -E '\.md$' > /dev/null; then
+            echo "Documentation-only files changed, skipping all tests and notebooks."
+            echo "run_tests=false" >> $GITHUB_OUTPUT
+            echo "run_notebooks=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 2. Check if dependencies or Github workflows were changed
+          if echo "$CHANGED_FILES" | grep -E '(^|/)(src/dependencies/|\.github/workflows/)' > /dev/null; then
+            echo "Core files (dependencies, workflows) changed, enabling all tests and notebooks."
+            echo "run_tests=true" >> $GITHUB_OUTPUT
+            echo "run_notebooks=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 3. Check if post-training files were changed
+          if echo "$CHANGED_FILES" | grep -E 'src/maxtext/trainers/post_train/' > /dev/null; then
+            echo "run_tests=true" >> $GITHUB_OUTPUT
+            echo "run_notebooks=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 4. Check for source code changes (anything not .md and not .ipynb)
+          if echo "$CHANGED_FILES" | grep -v -E '\.(md|ipynb)$' > /dev/null; then
+            echo "Source code changed, enabling unit tests."
+            echo "run_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "No source code changes (only notebook/doc), skipping unit tests."
+            echo "run_tests=false" >> $GITHUB_OUTPUT
+          fi
+
+          # 5. Check for notebook (.ipynb) changes
+          if echo "$CHANGED_FILES" | grep '\.ipynb$' > /dev/null; then
+            echo "Notebook files changed, enabling notebook run."
+            echo "run_notebooks=true" >> $GITHUB_OUTPUT
+          else
+            echo "No notebook changes, skipping notebook run."
+            echo "run_notebooks=false" >> $GITHUB_OUTPUT
+          fi
+
+  build_and_upload_maxtext_package:
+    needs: analyze_code_changes
+    # Run if either tests or notebooks need to run
+    if: ${{ vars.ROCM_ONLY == 'true' || needs.analyze_code_changes.outputs.run_tests == 'true' || needs.analyze_code_changes.outputs.run_notebooks == 'true' }}
+    uses: ./.github/workflows/build_package.yml
+    with:
+      device_type: ${{ vars.ROCM_ONLY == 'true' && 'rocm' || 'tpu' }}
+      device_name: ${{ vars.ROCM_ONLY == 'true' && 'mi355' || 'v4-8' }}
+      cloud_runner: ${{ vars.ROCM_ONLY == 'true' && 'linux-x86-64-4gpu-amd' || 'linux-x86-n2-16-buildkit' }}
+
+  maxtext_jupyter_notebooks:
+    needs: build_and_upload_maxtext_package
+    if: ${{ vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && needs.analyze_code_changes.outputs.run_notebooks == 'true' }}
+    uses: ./.github/workflows/run_jupyter_notebooks.yml
+    strategy:
+        fail-fast: false
+    with:
+      device_type: tpu
+      device_name: v6e-8
+      base_image: maxtext-unit-test-tpu:py312
+      cloud_runner: linux-x86-ct6e-180-8tpu
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  tpu-tests:
+    name: ${{ matrix.flavor }} tests
+    needs: [build_and_upload_maxtext_package]
+    if: ${{ vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && needs.analyze_code_changes.outputs.run_tests == 'true' }}
+    uses: ./.github/workflows/run_tests_coordinator.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [tpu-unit, tpu-integration, tpu-post-training-unit]
+    with:
+      flavor: ${{ matrix.flavor }}
+      base_image: maxtext-unit-test-tpu:py312
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
+  gpu-tests:
+    name: ${{ matrix.flavor }} tests
+    needs: [build_and_upload_maxtext_package]
+    if: ${{ vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && needs.analyze_code_changes.outputs.run_tests == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [gpu-unit, gpu-integration]
+    uses: ./.github/workflows/run_tests_coordinator.yml
+    with:
+      flavor: ${{ matrix.flavor }}
+      base_image: maxtext-unit-test-cuda12:py312
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
+  cpu-tests:
+    name: ${{ matrix.flavor }} tests
+    needs: [build_and_upload_maxtext_package]
+    if: ${{ vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && needs.analyze_code_changes.outputs.run_tests == 'true' }}
+    uses: ./.github/workflows/run_tests_coordinator.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [cpu-unit, cpu-post-training-unit]
+    with:
+      flavor: ${{ matrix.flavor }}
+      base_image: maxtext-unit-test-tpu:py312
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
+  maxtext_tpu_pathways_unit_tests:
+    needs: build_and_upload_maxtext_package
+    if: ${{ vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && needs.analyze_code_changes.outputs.run_tests == 'true' }}
+    uses: ./.github/workflows/run_pathways_tests.yml
+    strategy:
+        fail-fast: false
+    with:
+      device_type: tpu
+      device_name: v6e-4
+      base_image: maxtext-unit-test-tpu:py312
+      cloud_runner: linux-x86-ct6e-180-4tpu
+      pytest_marker: 'not cpu_only and not gpu_only and not integration_test and not post_training'
+      pytest_addopts: '--ignore=tests/post_training'
+      xla_python_client_mem_fraction: 0.75
+      tf_force_gpu_allow_growth: false
+      container_resource_option: "--privileged"
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
+  maxtext_tpu_pathways_integration_tests:
+    needs: build_and_upload_maxtext_package
+    if: ${{ vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && needs.analyze_code_changes.outputs.run_tests == 'true' }}
+    uses: ./.github/workflows/run_pathways_tests.yml
+    strategy:
+        fail-fast: false
+    with:
+      device_type: tpu
+      device_name: v6e-4
+      base_image: maxtext-unit-test-tpu:py312
+      cloud_runner: linux-x86-ct6e-180-4tpu
+      pytest_marker: 'not cpu_only and not gpu_only and integration_test and not post_training'
+      pytest_addopts: '--ignore=tests/post_training --ignore=tests/integration/hlo_diff_test.py'
+      xla_python_client_mem_fraction: 0.75
+      tf_force_gpu_allow_growth: false
+      container_resource_option: "--privileged"
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
+  rocm-tests:
+    name: ${{ matrix.flavor }} tests
+    needs: [build_and_upload_maxtext_package]
+    if: ${{ vars.ROCM_ONLY != 'true' && needs.analyze_code_changes.outputs.run_tests == 'true' }}
+    uses: ./.github/workflows/run_tests_coordinator.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [rocm-unit]
+    with:
+      flavor: ${{ matrix.flavor }}
+      base_image: 'rocm-placeholder'
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
+  rocm-decoupled-tests:
+    name: ${{ matrix.flavor }} tests
+    needs: [build_and_upload_maxtext_package]
+    if: ${{ vars.ROCM_ONLY == 'true' || (github.event_name == 'workflow_dispatch' && inputs.rocm_only) || needs.analyze_code_changes.outputs.run_tests == 'true' }}
+    uses: ./.github/workflows/run_tests_coordinator.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [rocm-decoupled]
+    with:
+      flavor: ${{ matrix.flavor }}
+      base_image: 'rocm-placeholder'
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
+  all_tests_passed:
+    name: All Required Tests Passed
+    needs: [analyze_code_changes, build_and_upload_maxtext_package, tpu-tests, gpu-tests, cpu-tests, maxtext_tpu_pathways_unit_tests, maxtext_tpu_pathways_integration_tests, rocm-tests, rocm-decoupled-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check test results
+        run: |
+          if [ "${NEEDS_ANALYZE_CHANGES_OUTPUTS_RUN_TESTS}" == "false" ]; then
+            echo "Tests were skipped"
+            exit 0
+          fi
+
+          # Otherwise, check that build and all tests passed or were skipped
+          echo "Build result: ${NEEDS_BUILD_AND_UPLOAD_MAXTEXT_PACKAGE_RESULT}"
+          echo "TPU Tests (Matrix) result: ${NEEDS_TPU_TESTS_RESULT}"
+          echo "GPU Tests (Matrix) result: ${NEEDS_GPU_TESTS_RESULT}"
+          echo "CPU Tests (Matrix) result: ${NEEDS_CPU_TESTS_RESULT}"
+          echo "Pathways Unit result: ${NEEDS_MAXTEXT_TPU_PATHWAYS_UNIT_TESTS_RESULT}"
+          echo "Pathways Integration result: ${NEEDS_MAXTEXT_TPU_PATHWAYS_INTEGRATION_TESTS_RESULT}"
+          echo "ROCm Tests (Matrix) result: ${NEEDS_ROCM_TESTS_RESULT}"
+          echo "ROCm Decoupled Tests (Matrix) result: ${NEEDS_ROCM_DECOUPLED_TESTS_RESULT}"
+
+          # Fail only if any job failed or was cancelled (skipped is OK)
+          if [ "${{ contains(needs.*.result, 'failure') }}" == "true" ] || [ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]; then
+            echo "One or more jobs failed or were cancelled"
+            exit 1
+          fi
+
+          echo "All required tests passed successfully"
+        env:
+          NEEDS_ANALYZE_CODE_CHANGES_OUTPUTS_RUN_TESTS: ${{ needs.analyze_code_changes.outputs.run_tests }}
+          NEEDS_BUILD_AND_UPLOAD_MAXTEXT_PACKAGE_RESULT: ${{ needs.build_and_upload_maxtext_package.result }}
+          NEEDS_CPU_TESTS_RESULT: ${{ needs.cpu-tests.result }}
+          NEEDS_TPU_TESTS_RESULT: ${{ needs.tpu-tests.result }}
+          NEEDS_GPU_TESTS_RESULT: ${{ needs.gpu-tests.result }}
+          NEEDS_MAXTEXT_TPU_PATHWAYS_UNIT_TESTS_RESULT: ${{ needs.maxtext_tpu_pathways_unit_tests.result }}
+          NEEDS_MAXTEXT_TPU_PATHWAYS_INTEGRATION_TESTS_RESULT: ${{ needs.maxtext_tpu_pathways_integration_tests.result }}
+          NEEDS_ROCM_TESTS_RESULT: ${{ needs.rocm-tests.result }}
+          NEEDS_ROCM_DECOUPLED_TESTS_RESULT: ${{ needs.rocm-decoupled-tests.result }}
+
+  all_notebooks_passed:
+    name: All Notebooks Passed
+    needs: [analyze_code_changes, build_and_upload_maxtext_package, maxtext_jupyter_notebooks]
+    if: ${{ vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check notebooks results
+        run: |
+          if [ "${NEEDS_ANALYZE_CODE_CHANGES_OUTPUTS_RUN_NOTEBOOKS}" == "false" ]; then
+            echo "Non-notebook changes detected, runs were skipped"
+            exit 0
+          fi
+
+          # Otherwise, check that build and notebooks run passed or were skipped
+          echo "Build result: ${NEEDS_BUILD_AND_UPLOAD_MAXTEXT_PACKAGE_RESULT}"
+          echo "Jupyter Notebooks result: ${NEEDS_MAXTEXT_JUPYTER_NOTEBOOKS_RESULT}"
+
+          # Fail only if any job failed or was cancelled (skipped is OK)
+          if [ "${{ contains(needs.*.result, 'failure') }}" == "true" ] || [ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]; then
+            echo "One or more jobs failed or were cancelled"
+            exit 1
+          fi
+
+          echo "All required notebooks passed successfully"
+        env:
+          NEEDS_ANALYZE_CODE_CHANGES_OUTPUTS_RUN_NOTEBOOKS: ${{ needs.analyze_code_changes.outputs.run_notebooks }}
+          NEEDS_BUILD_AND_UPLOAD_MAXTEXT_PACKAGE_RESULT: ${{ needs.build_and_upload_maxtext_package.result }}
+          NEEDS_MAXTEXT_JUPYTER_NOTEBOOKS_RESULT: ${{ needs.maxtext_jupyter_notebooks.result }}
+
+  notify_failure:
+    name: Notify failed build # creates an issue or modifies last open existing issue for failed build
+    needs: [tpu-tests, gpu-tests, cpu-tests, maxtext_jupyter_notebooks, maxtext_tpu_pathways_unit_tests, maxtext_tpu_pathways_integration_tests, rocm-tests, rocm-decoupled-tests]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Check whether one of the jobs failed
+        if: ${{ contains(needs.*.result, 'failure') && github.event_name == 'schedule' }}
+        uses: jayqi/failed-build-issue-action@1a893bbf43ef1c2a8705e2b115cd4f0fe3c5649b  # v1.2.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  investigate_failure:
+    name: Investigate failed build # investigates failure of scheduled run and comments on tracking issue
+    needs: [tpu-tests, gpu-tests, cpu-tests, maxtext_jupyter_notebooks, maxtext_tpu_pathways_unit_tests, maxtext_tpu_pathways_integration_tests, notify_failure]
+    if: ${{ always() && contains(needs.*.result, 'failure') && github.event_name == 'schedule' }}
+    uses: ./.github/workflows/gemini-investigate.yml
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      issues: 'write'
+      pull-requests: 'write'
+      actions: 'read'
+    with:
+      failed_run_id: '${{ github.run_id }}'
+    secrets: inherit

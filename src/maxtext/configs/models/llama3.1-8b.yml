@@ -1,0 +1,56 @@
+# Copyright 2023–2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# FFM-shrunk model config for llama3.1-8b.
+#
+# This file is auto-loaded by MaxText pyconfig whenever model_name="llama3.1-8b"
+# (see configs/pyconfig_deprecated.py:895), so its values OVERLAY anything the
+# user set in their launching YAML. Mirrors the gemma3-4b.yml FFM shrink:
+# canonical 8B-param shape kept architecturally identical (GQA 4:1, silu+linear
+# gated MLP, RoPE max_timescale=500_000, llama2 decoder block), dimensions cut
+# ~4-8x per axis to land at ~170 M params / ~2.7 GB total memory / ~0.26
+# TFLOPs/step on FFM.
+
+base_config: "base.yml"
+
+# ---- runtime ----
+steps: 5
+hardware: "gpu"
+model_name: "llama3.1-8b"
+dataset_type: "synthetic"
+attention: "dot_product"          # avoid FMHA / Triton-flash on FFM
+enable_checkpointing: False
+max_segments_per_seq: 1
+
+# ---- FFM training tensor shapes ----
+per_device_batch_size: 1
+max_target_length: 256
+max_prefill_predict_length: 64
+
+# ---- decoder dimensions ----
+# Canonical llama3.1-8b is layers=32, emb=4096, mlp=14336, heads=32, kv=8,
+# head_dim=128, vocab=128256. Shrunk to ~170 M params, ~2.7 GB total memory.
+base_emb_dim: 1024
+base_num_query_heads: 8
+base_num_kv_heads: 4
+base_num_decoder_layers: 8
+base_mlp_dim: 4096
+head_dim: 128
+mlp_activations: ["silu","linear"]
+vocab_size: 16384
+enable_dropout: false
+logits_via_embedding: false
+normalization_layer_epsilon: 1.0e-5
+rope_max_timescale: 500_000
+decoder_block: "llama2"           # llama3 reuses the llama2 decoder block
