@@ -311,8 +311,8 @@ class Decoder(nn.Module):
           config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy
       )
 
-  def minimal_policy(self, with_context=False, with_quantization=False):
-    """Helper for creating minimal checkpoint policies."""
+  def _minimal_names(self, with_context=False, with_quantization=False):
+    """The intermediate names saved by the 'minimal' family of remat policies."""
     names = [
         "query_proj",
         "value_proj",
@@ -328,7 +328,13 @@ class Decoder(nn.Module):
       names.append("context")
     if with_quantization:
       names.append("quantization")
-    return jax.checkpoint_policies.save_only_these_names(*names)
+    return names
+
+  def minimal_policy(self, with_context=False, with_quantization=False):
+    """Helper for creating minimal checkpoint policies."""
+    return jax.checkpoint_policies.save_only_these_names(
+        *self._minimal_names(with_context=with_context, with_quantization=with_quantization)
+    )
 
   def get_remat_policy(self):
     """Get remat policy"""
@@ -341,6 +347,27 @@ class Decoder(nn.Module):
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
         policy = self.minimal_policy(with_context=True)
+      elif cfg.remat_policy in (
+          "minimal_flash_save_fp4_wtcol",
+          "minimal_flash_save_fp4col",
+      ):
+        # minimal_flash (== minimal_with_context) PLUS save the jax-aiter MXFP4
+        # columnwise dual-cast residuals so the backward dgrad/wgrad reuse them
+        # instead of re-firing CastMxfp4DualJA (the rematerialized re-casts, see
+        # mxfp4_analysis/parsed/remat_recast_sizing.md). jax-aiter tags those
+        # residuals via checkpoint_name when JA_FP4_REMAT_SAVE_COL is set
+        # ('wt' / 'act' / 'both'); the names must match here. Saving (vs
+        # recompute) is a graph-scheduling change only -> numerics are
+        # byte-identical. '_wtcol' saves only the small weight-col residual
+        # (~6 ms/step floor at 8B, lowest extra memory); the full variant also
+        # saves the larger activation-col residual.
+        fp4_names = ["mxfp4_wt_col"]
+        if cfg.remat_policy == "minimal_flash_save_fp4col":
+          fp4_names.append("mxfp4_act_col")
+        policy = jax.checkpoint_policies.save_only_these_names(
+            *self._minimal_names(with_context=True),
+            *fp4_names,
+        )
       elif cfg.remat_policy == "minimal":
         # save all except context
         policy = self.minimal_policy()
