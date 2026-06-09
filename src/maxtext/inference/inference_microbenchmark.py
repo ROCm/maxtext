@@ -369,20 +369,27 @@ def run_benchmarks(config):
           benchmark_loop_iters,
       )
 
-      prefill_insert_time, decode_state = prefill_insert_benchmark(
-          config,
-          prefill_insert_executable[prefill_length],
-          decode_state,
-          params,
-          engine.max_concurrent_decodes,
-          prefill_tokens[prefill_length],
-          prefill_true_lengths[prefill_length],
-          benchmark_loop_iters,
-      )
-      benchmark_results["insert"][prefill_length] = {}
-      benchmark_results["insert"][prefill_length]["time_in_ms"] = (
-          prefill_insert_time["time_in_ms"] - benchmark_results["prefill"][prefill_length]["time_in_ms"]
-      )
+      # prefill+insert and generate use AOT executables whose XLA auto-resolved
+      # decode_state layouts are non-deterministic across compiles on this jaxlib
+      # (jaxlib 0.8.2+rocm), so they intermittently raise "input layouts disagree".
+      # Guard them so a layout flake never discards the (reliable) prefill numbers.
+      try:
+        prefill_insert_time, decode_state = prefill_insert_benchmark(
+            config,
+            prefill_insert_executable[prefill_length],
+            decode_state,
+            params,
+            engine.max_concurrent_decodes,
+            prefill_tokens[prefill_length],
+            prefill_true_lengths[prefill_length],
+            benchmark_loop_iters,
+        )
+        benchmark_results["insert"][prefill_length] = {}
+        benchmark_results["insert"][prefill_length]["time_in_ms"] = (
+            prefill_insert_time["time_in_ms"] - benchmark_results["prefill"][prefill_length]["time_in_ms"]
+        )
+      except Exception as e:  # pylint: disable=broad-except
+        print(f"[microbench] insert benchmark skipped for length {prefill_length}: {type(e).__name__}")
 
   if "prefill-multisampling" in stages_to_benchmark:
     benchmark_results["prefill-multisampling"] = {}
@@ -413,9 +420,22 @@ def run_benchmarks(config):
       )
 
   if "generate" in stages_to_benchmark:
+    # Use non-AOT generate for the AR loop. The AOT generate executable has a
+    # non-deterministic XLA auto-layout requirement on this jaxlib that
+    # intermittently mismatches decode_state ("input layouts disagree"). Regular
+    # jit dispatch compiles for the actual decode_state layout, so it is robust --
+    # this is the same generate path compare_decode uses. generate_aot(params,
+    # decode_state, rng) matches ar_benchmark's call convention; donate decode_state
+    # to keep the step representative.
+    # Rebuild a fresh decode_state for the AR loop: the donated decode_state from
+    # decode_state_executable may have been consumed/deleted by the prefill+insert
+    # steps above (especially if an insert was skipped after partial donation),
+    # which otherwise surfaces as "Array has been deleted" in the first AR step.
+    decode_state = decode_state_executable(rng_init_decode)
+    generate_fn = jax.jit(engine.generate_aot, donate_argnames=("decode_state",))
     benchmark_results["autoregressive"], decode_state = ar_benchmark(
         config,
-        generate_executable,
+        generate_fn,
         params,
         decode_state,
         engine.max_concurrent_decodes,

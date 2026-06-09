@@ -155,14 +155,21 @@ class MaxEngine(_BaseEngine):
     """Optimal memory layout for params and decode_state."""
 
     param_layout = Format(DLL.AUTO)
-    decode_state_layout = Format(DLL.AUTO)
+    # decode_state uses the default (canonical) layout instead of XLA auto-layout.
+    # decode_state is shared across three separately-compiled executables
+    # (decode_state_executable, the prefill-insert executable, and generate), all
+    # keyed on engine.decode_state_layouts. With Format(DLL.AUTO) the resolved
+    # layout is not stable across those compiles on this jaxlib, so insert/generate
+    # raise "input layouts disagree". Pinning decode_state to the default layout
+    # keeps all three aligned (params stay auto-laid and are relaid via _iterated_layout).
+    decode_state_layout = None
     # Keyword arguments are not yet supported in JAX for specifying shardings. Therefore, all AOT
     # compiled functions use arguments instead.
     compiled_generate = (
         jax.jit(
             self.generate_aot,
             in_shardings=(param_layout, decode_state_layout, None),
-            out_shardings=(Format(DLL.AUTO), Format(DLL.AUTO)),
+            out_shardings=(None, Format(DLL.AUTO)),
             donate_argnames=("decode_state",),
         ).lower(params, decode_state, rng_shape)
     ).compile(compiler_options=xla_flags)
