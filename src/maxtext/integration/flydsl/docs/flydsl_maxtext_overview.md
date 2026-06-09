@@ -1,0 +1,523 @@
+# FlyDSL + MaxText MoE — Technical Overview
+
+Working document for the FlyDSL MoE integration in MaxText: JAX bridge, kernel
+design, configs, lowering, correctness, and performance on MI355X (gfx950, ROCm).
+
+Shorter validation summary: [flydsl_moe_validation.md](flydsl_moe_validation.md).
+
+---
+
+## 0. The two layers
+
+1. **FlyDSL** — MLIR-native kernel DSL for AMD GPUs (gfx950 / gfx942). Python kernels
+   compile to MLIR → ROCDL → **HSACO** binaries using matrix cores (MFMA). Pinned in
+   `flydsl_pin.txt`; imported as `kernels.*` and `flydsl.*`.
+2. **`jax-flydsl`** (`jax_flydsl/`) — bridge that makes a FlyDSL `@flyc.jit` kernel
+   callable from JAX as a primitive, **no PyTorch dependency**.
+
+On top: **`maxtext_moe/`** swaps MaxText's routed-MoE layer for FlyDSL grouped GEMM.
+
+---
+
+## 1. `jax-flydsl`: the JAX ↔ FlyDSL bridge
+
+| file | role |
+|---|---|
+| `flydsl_lib.py` | `flydsl_call` primitive: eager impl + jit lowering, MLIR compile cache |
+| `adapter.py` | `JaxTensorAdaptor` — MLIR types from `jax.Array` via DLPack |
+| `bridge.py` | compiles C trampoline, registers XLA custom-call target, slot table |
+| `_flydsl_bridge.c` | lock-free C trampoline on XLA's dispatch thread |
+
+### 1.1 Type inference — `adapter.py`
+
+FlyDSL's MLIR emission needs shape/dtype/layout per argument. `adapter.py` registers
+`JaxTensorAdaptor` for `jax.Array` (replacing the default torch adaptor):
+
+- DLPack export (`array.__dlpack__(stream=0)`) for GPU pointer + metadata
+- FP8 dtypes viewed as `uint8` for DLPack (bit pattern preserved)
+
+### 1.2 The primitive — `flydsl_lib.py`
+
+Entry point:
+
+```
+flydsl_call(args, kernel, out_shape, scalars, output_positions, input_output_aliases)
+```
+
+Steps:
+
+- **Launcher introspection** (`_inspect_launcher_layout`): classify each `@flyc.jit`
+  parameter → `buffer` (`fx.Tensor`), `scalar` (`fx.Int32`), or `stream` (`fx.Stream`).
+- **`_abstract_eval`**: output `ShapedArray`s (shape/dtype only).
+- **Eager mode**: `def_impl` = `xla.apply_primitive` — compiles+runs a one-op program.
+- **JIT mode**: `mlir.register_lowering(flydsl_call_p, _lowering, platform="rocm")`.
+
+### 1.3 `_lowering` (jit path)
+
+1. Build **slot map**: scalar vs buffer per launcher param; `buf_idx[]` maps XLA
+   buffers to FlyDSL slots (`output_positions` can place output at arbitrary slot).
+2. `build_module(kernel, *dummies, **scalars)` → MLIR module (GPU module + ciface).
+3. **Compile cache**: `cache_key = sha256(mlir_asm)`. On miss → `MlirCompiler.compile`
+   → HSACO + host func ptr → `register_kernel` → C slot table → `slot_idx`.
+4. Emit `jax.ffi.ffi_lowering` XLA custom call with `backend_config=slot_idx` and
+   `operand_output_aliases`.
+
+Compile once per unique `(shape, tile, activation, dtype)` — handful per model.
+
+### 1.4 The C trampoline — `bridge.py` + `_flydsl_bridge.c`
+
+- Auto-compiles `_flydsl_bridge.c` → `_flydsl_bridge.so` on first import.
+- Registers `flydsl_bridge_dispatch` as XLA custom-call target.
+- Slot table: `g_slots[MAX_SLOTS=1024]`, lock-free dispatch (registration mutex only).
+- Runtime: XLA → `flydsl_bridge_dispatch(stream, buffers, opaque)` → repack buffers +
+  scalars + stream into `void** packed` → call HSACO `func(packed)`.
+
+### 1.5 Compilation path (diagram)
+
+> **[ INSERT DIAGRAM 1 — `docs/flydsl_bridge_diagram.png` ]**
+> JAX ↔ FlyDSL bridge: eager vs jit, MLIR compile cache, C trampoline → HSACO.
+
+**Scope:** inference-only (no `jvp`/`transpose` — forward prefill/decode, not training).
+
+---
+
+## 2. What makes FlyDSL good for MoE
+
+- **MLIR-native MFMA kernels** — direct matrix-core intrinsics, LDS control.
+- **Fills ROCm stack gaps** — bf16/fp8 **grouped-GEMM MoE** on gfx950 where stock
+  `ragged_dot` has no grouped-GEMM lowering (§11).
+- **Epilogue fusion** — SwiGLU/GeGLU in stage-1; weighted combine in stage-2.
+- **Pre-shuffled weights** — offline MFMA tile layout; no runtime swizzle.
+- **Software-pipelined K-loop** — double-buffered LDS, XOR16 swizzle.
+
+Also: layernorm, rmsnorm, softmax, preshuffle GEMM, flash attention, etc.
+
+---
+
+## 3. Repo layout (essentials)
+
+```
+jax-flydsl/
+├── jax_flydsl/           # JAX ↔ FlyDSL bridge
+├── maxtext_moe/          # MaxText MoE integration
+├── benchmarks/           # kernel + MoE microbenchmarks
+├── tests/                # kernel + MoE correctness
+├── scripts/              # setup + MaxText run scripts
+├── docs/                 # this overview + validation + diagrams
+├── results/              # compare_backends / decode reports
+└── flydsl_pin.txt
+```
+
+---
+
+## 4. jax-flydsl benchmarks — MI355X (gfx950, ROCm 7.2)
+
+All wall-clock, median of 50 iters. **Speedup = pure JAX / jax-flydsl** (>1 = FlyDSL faster).
+Single GPU. Setup: AMD MI355X (gfx950), ROCm 7.2, 8 TB/s HBM3E.
+
+### 4.0 How to rerun
+
+**Environment** (inside `flydsl-dev` container):
+
+```bash
+source /workspace/.flydsl_env
+export HIP_VISIBLE_DEVICES=2    # pin to one GPU (or FLYDSL_BENCH_DEVICE=N)
+```
+
+**Harness** (`benchmarks/bench_utils.py` — shared by all `bench_*.py`):
+
+- `jax.config` `jax_default_device` pinned to one GPU
+- `bench_one(fn, warmup, iters, flush)`: warmup iters, then **median wall-clock** of
+  `iters` timed runs with `fn(...).block_until_ready()`
+- GC disabled during measurement
+- **Norm benches:** `flush_l2()` before each timed iter (cold-cache, bandwidth-realistic)
+- **GEMM bench:** `flush=False` (compute-bound; matches hipBLASLt comparison style)
+
+**Canonical flags for the tables below:** `--warmup 5 --iters 50`
+
+**Run full sweeps** (stdout has every shape; tables report **largest per dtype** only):
+
+```bash
+# Norms — built-in shape lists in each script (f32 / f16 / bf16)
+python3 -m benchmarks.bench_softmax   --warmup 5 --iters 50
+python3 -m benchmarks.bench_layernorm --warmup 5 --iters 50
+python3 -m benchmarks.bench_rmsnorm   --warmup 5 --iters 50
+
+# Dense FP8 GEMM — M=16..5120 vs jnp.matmul (XLA→hipBLASLt)
+python3 -m benchmarks.bench_preshuffle_gemm --warmup 5 --iters 50
+
+# MoE — Mixtral E=8 topk=2, tokens 1/8/32/256/1024/2048/4096 (FP8, 2-stage fly)
+python3 -m benchmarks.bench_moe           --all --warmup 5 --iters 50
+python3 -m benchmarks.bench_moe_baseline  --all --warmup 5 --iters 50
+
+# aiter-CK (torch subprocess; FlyDSL checkout on PYTHONPATH)
+PYTHONPATH=/workspace/FlyDSL/python:/workspace/FlyDSL python3 benchmarks/aiter/bench_aiter_moe.py \
+    --tokens 64 --experts 8 --topk 2 --model_dim 4096 --inter_dim 14336 \
+    --warmup 5 --iters 50
+# repeat --tokens for 256 1024 2048 4096, or use --all with Mixtral presets
+```
+
+**How tables are curated from sweep output:**
+
+- **Do not** average over all shapes — small M/N hit ~45–55 µs JAX dispatch floor and drag averages down.
+- **Norm tables:** largest shapes per dtype (kernel-bound regime). f32/f16: top ~3 rows from each dtype block; bf16: top ~6 rows where FlyDSL wins are visible.
+- **GEMM table:** subset of M (16, 64, 128, 1024, 2048, 4096, 5120) from full sweep.
+- **MoE table:** tokens 64, 256, 1024, 2048, 4096 — merge fly + baseline + aiter runs.
+- **speedup** column = `pure_JAX_us / jax_flydsl_us` (same formula in every script).
+
+### 4.1 Norm kernels — jax-flydsl vs `jax.nn.*` (XLA Triton emitter)
+
+#### Softmax — all dtypes, largest shapes per dtype
+
+| dtype | shape | jax-flydsl (µs) | pure JAX (µs) | speedup |
+|---|---|---|---|---|
+| f32 | (1024, 4096) | 66.7 | 71.7 | 1.08× |
+| f32 | (2048, 2048) | 66.0 | 69.7 | 1.05× |
+| f32 | (4096, 8192) | 114.2 | 113.1 | 1.00× |
+| f16 | (8192, 2048) | 75.0 | 82.6 | 1.10× |
+| f16 | (16384, 2048) | 89.5 | 95.6 | 1.07× |
+| f16 | (32768, 8192) | 241.0 | 245.6 | 1.02× |
+| bf16 | (16384, 2048) | 77.8 | 88.2 | 1.13× |
+| bf16 | (16384, 8192) | 144.2 | 184.9 | 1.28× |
+| bf16 | (32768, 8192) | 241.6 | 310.0 | 1.28× |
+| bf16 | (65536, 8192) | 429.9 | 561.7 | 1.31× |
+| bf16 | (32768, 16384) | 449.0 | 551.2 | 1.23× |
+| bf16 | (131072, 2048) | 239.9 | 314.8 | 1.31× |
+
+#### LayerNorm — all dtypes, largest shapes per dtype
+
+| dtype | shape | jax-flydsl (µs) | pure JAX (µs) | speedup |
+|---|---|---|---|---|
+| f32 | (2048, 4096) | 61.5 | 87.4 | 1.42× |
+| f32 | (4096, 8192) | 190.3 | 187.2 | 0.98× |
+| f32 | (32768, 8192) | 547.6 | 557.7 | 1.02× |
+| f16 | (8192, 2048) | 138.0 | 113.9 | 0.83× |
+| f16 | (16384, 2048) | 134.2 | 136.9 | 1.02× |
+| f16 | (32768, 8192) | 309.8 | 282.8 | 0.91× |
+| bf16 | (4096, 2048) | 136.7 | 166.3 | 1.22× |
+| bf16 | (8192, 2048) | 104.3 | 160.5 | 1.54× |
+| bf16 | (32768, 8192) | 299.6 | 307.8 | 1.03× |
+| bf16 | (65536, 8192) | 518.0 | 498.5 | 0.96× |
+| bf16 | (32768, 16384) | 509.1 | 518.8 | 1.02× |
+| bf16 | (131072, 2048) | 330.3 | 324.3 | 0.98× |
+
+#### RMSNorm — all dtypes, largest shapes per dtype
+
+| dtype | shape | jax-flydsl (µs) | pure JAX (µs) | speedup |
+|---|---|---|---|---|
+| f32 | (2048, 2048) | 53.9 | 74.8 | 1.39× |
+| f32 | (16384, 8192) | 270.4 | 279.9 | 1.04× |
+| f32 | (32768, 8192) | 470.0 | 487.6 | 1.04× |
+| f16 | (4096, 2048) | 92.0 | 103.1 | 1.12× |
+| f16 | (16384, 2048) | 109.0 | 107.3 | 0.98× |
+| f16 | (32768, 8192) | 263.8 | 272.0 | 1.03× |
+| bf16 | (4096, 2048) | 88.2 | 116.7 | 1.32× |
+| bf16 | (8192, 2048) | 84.1 | 97.4 | 1.16× |
+| bf16 | (16384, 8192) | 159.4 | 178.3 | 1.12× |
+| bf16 | (32768, 8192) | 275.3 | 295.7 | 1.07× |
+| bf16 | (65536, 8192) | 452.4 | 501.1 | 1.11× |
+| bf16 | (32768, 16384) | 454.2 | 486.0 | 1.07× |
+| bf16 | (131072, 2048) | 257.5 | 294.7 | 1.14× |
+
+**Norm cross-dtype takeaway:**
+
+- **f32 / f16:** essentially tied
+- **bf16 softmax + RMSNorm:** 1.07–1.31× wins at large shapes. XLA's bf16 Triton emitter
+  inserts redundant bf16↔f32 conversions in the inner loop (4 for softmax, 2 for RMSNorm).
+- **bf16 LayerNorm:** ties at large shapes because the standard JAX LayerNorm reference
+  has 0 redundant bf16↔f32 casts
+
+The number of redundant bf16↔f32 conversions in the JAX reference linearly predicts
+FlyDSL's advantage: **0 → tied** (LayerNorm), **2 → 1.07–1.14×** (RMSNorm),
+**4 → 1.22–1.31×** (Softmax).
+
+### 4.2 GEMM — jax-flydsl preshuffle FP8 vs `jnp.matmul` (XLA → hipBLASLt FP8)
+
+| M | jax-flydsl (µs / TFLOPS) | pure JAX (µs / TFLOPS) | speedup |
+|---|---|---|---|
+| 16 | 69.0 / 19.4 | 68.9 / 19.5 | 1.00× |
+| 64 | 65.6 / 81.8 | 63.8 / 84.1 | 0.97× |
+| 128 | 67.2 / 159.9 | 65.2 / 164.6 | 0.97× |
+| 1024 | 109.3 / 785.8 | 93.8 / 915.7 | 0.86× |
+| 2048 | 135.5 / 1267.9 | 110.6 / 1552.6 | 0.82× |
+| 4096 | 201.8 / 1702.4 | 181.4 / 1893.8 | 0.90× |
+| 5120 | 257.4 / 1694.5 | 223.6 / 1950.9 | 0.87× |
+
+**GEMM takeaway:** hipBLASLt wins on plain A·B at large M. Small/decode shapes are tied.
+FlyDSL supports fused epilogues (bias/residual/activation).
+
+### 4.3 MoE GEMM — jax-flydsl vs pure JAX vs aiter-CK torch
+
+E=8, topk=2, model=4096, inter=14336. FlyDSL 2-stage (stage2=atomic).
+
+| tokens | pure JAX (µs) | jax-flydsl (µs) | speedup vs pure JAX | aiter-CK (µs) | aiter / FlyDSL |
+|---|---|---|---|---|---|
+| 64 | 170.0 | 152.7 | 1.11× | 63.1 | aiter 2.42× |
+| 256 | 593.9 | 451.4 | 1.32× | 369.3 | aiter 1.22× |
+| 1024 | 1556.9 | 882.0 | 1.77× | 836.6 | tied (1.05×) |
+| 2048 | 3121.1 | 1427.3 | 2.19× | 1480.8 | FlyDSL 1.04× |
+| 4096 | 5927.1 | 2578.4 | 2.30× | 2800.8 | FlyDSL 1.09× |
+
+**MoE takeaway:** torch+aiter wins at small token counts (aiter 1.2–2.4× faster, single
+fused kernel). jax-flydsl wins at ≥2048 tokens (FlyDSL 1.04–1.09× faster than aiter).
+
+### 4.4 Comparison caveats
+
+- MoE/GEMM benches are **fp8**; end-to-end model numbers are **bf16**.
+- Norm wins are **bf16-specific** (XLA cast artifact); f32/f16 ≈ tied.
+- aiter fused single-kernel path is faster at tiny token counts; 2-stage table is apples-to-apples.
+- **dense** MoE drops tokens at capacity — not equivalent to ragged/fly.
+- **ragged** baseline on our stack (JAX 0.8.2 / bf16 / MI355) is **not** grouped GEMM (§11).
+
+---
+
+## 5. MaxText integration
+
+Non-invasive overlay — no MaxText source edits:
+
+```python
+from maxtext_moe.backend import fly_moe_backend, load_params_flydsl
+
+with fly_moe_backend("gemma"):
+    engine = maxengine.MaxEngine(config)
+    params = load_params_flydsl(engine, rng, model="gemma")
+    # prefill / decode ...
+```
+
+1. **`fly_moe_backend(model)`** — swaps `RoutedMoE` → `FlyRoutedMoE` for model build.
+2. **`load_params_flydsl`** — stock load + one-time preshuffle conversion
+   (`fly_w1/w2_shuffled`, drop `wi_0/wi_1/wo`).
+
+> **[ INSERT DIAGRAM 2 — `docs/flydsl_diagram_2_integration.png` ]**
+> Layer swap → weight conversion → runtime `_fly_call`.
+
+---
+
+## 6. FlyDSL MoE forward path
+
+1. Router (`_route`) — mirrors MaxText `get_topk` (Gemma: softmax-all→gather; Mixtral: top-k→softmax).
+2. `moe_sort_jax` — replicate k×, sort by expert.
+3. **Stage 1** — `moe_gemm1` grouped GEMM + fused activation.
+4. **Stage 2** — `moe_gemm2` (atomic | reduce) down-proj + weighted combine.
+
+> **[ INSERT DIAGRAM 3 — `docs/flydsl_diagram_3_twostage.png` ]**
+> Sort → stage-1 → stage-2 over exactly routed tokens.
+
+Preshuffle: fuse gate+up, pad inter_dim to 128, shuffle to MFMA layout (`common/preshuffle.py`).
+
+---
+
+## 7. Models
+
+| | Mixtral-8x7B | Gemma4-26B |
+|---|---|---|
+| experts / topk | 8 / 2 | 128 / 8 |
+| moe_mlp_dim | 14336 | 704 (→ 768 padded) |
+| emb_dim | 4096 | 2816 |
+| activation | silu | gelu |
+| router | top-k then softmax | softmax-all then gather |
+| shared expert | — | yes |
+
+---
+
+## 8. Configs (MaxText baseline vs fly)
+
+```yaml
+sparse_matmul=True          # ragged_dot path (baseline)
+megablox=False
+use_tokamax_gmm=False
+dtype=bfloat16
+attention=dot_product         # gfx950: not TPU RPA
+scan_layers=false
+```
+
+Fly is selected by **`fly_moe_backend()`**, not a yaml flag. `FLY_STAGE2=atomic|reduce`
+picks stage-2 reduction.
+
+For hipBLASLt grouped-GEMM lowering (not available on our stack): JAX ≥ 0.9.2,
+`xla_gpu_experimental_use_ragged_dot_grouped_gemm=true`, `shardy=true`, fp16 on MI355.
+
+---
+
+## 9. End-to-end performance (bf16 prefill, MI355X)
+
+Baseline = stock MaxText `ragged_dot`. Single device, batch=1.
+
+**Mixtral**
+
+| length | ragged (ms) | fly (ms) | speedup |
+|---|---|---|---|
+| 256 | 72.6 | 29.1 | 2.50× |
+| 1024 | 174.9 | 61.3 | 2.85× |
+| 2048 | 288.3 | 115.8 | 2.49× |
+
+Decode 1 token: 69.8 → 19.7 ms = **3.54×**.
+
+**Gemma (pretrained)**
+
+| length | ragged (ms) | fly (ms) | speedup |
+|---|---|---|---|
+| 256 | 261.2 | 32.6 | 8.0× |
+| 1024 | 645.2 | 29.6 | 21.8× |
+| 2048 | 1013.5 | 45.8 | 22.1× |
+
+Per-layer at Mixtral seq=1024: MoE GEMMs 151.7 ms (ragged) → 42.6 ms (fly) ≈ 3.6× on MoE alone.
+
+---
+
+## 10. What `ragged_dot` actually calls (gfx950 / JAX 0.8.2 / bf16)
+
+> **[ INSERT DIAGRAM 4 — `docs/flydsl_diagram_4_lowering.png` ]**
+
+**Algorithmically:** dropless, exact — only routed token–expert pairs count.
+
+**On our stack (kernel level):** NOT grouped GEMM. Lowers to:
+
+```
+broadcast x[T,K] → [E,T,K]; mask by group_sizes
+Triton batched dot [E,T,K] × [E,K,N] → [E,T,N]   (__triton_nested_gemm_fusion)
+reduce over E → [T,N]
+```
+
+Every token computed against every expert slot, then masked — **E× FLOPs**.
+
+MaxText prefill HLO example (Mixtral, bf16):
+
+```
+gemm_fusion_dot: bf16[1024,4,28672] × bf16[4,28672,4096] → f32[4,1024,4096]
+                 kind=__triton_nested_gemm_fusion
+```
+
+Zero hipBLASLt grouped-GEMM MoE calls in the module. Attention QKVO uses rocBLAS GEMM.
+
+**True grouped GEMM** (hipBLASLt, JAX ≥ 0.9.2): fp16-only on MI355; bf16 on MI300.
+FlyDSL implements grouped GEMM directly via XLA custom call → HSACO.
+
+---
+
+## 11. Correctness
+
+See [flydsl_moe_validation.md](flydsl_moe_validation.md) for full methodology. Three
+regimes matter:
+
+1. **Prefill** — last-position logits on real weights (primary MoE kernel check)
+2. **Decode-step-1** — first `generate()` logits with identical KV state (isolates
+   single-token MoE from free-running degeneration)
+3. **Free-running greedy** — `gen_steps=8` via real KV-cache `generate()` path
+
+### 11.1 Prefill (primary)
+
+`compare_backends.py` — 10 prompts, real weights, last-position logits.
+
+| model | top-1 fly vs ragged | cosine |
+|---|---|---|
+| Mixtral | **10/10** | ≥ 0.99998 |
+| Gemma | **10/10** | ≥ 0.99988 |
+
+Reports: `results/compare_{mixtral,gemma}_real/report.md`
+
+### 11.2 Decode — methodology
+
+`compare_decode.py`: `seq=512`, `gen_steps=8`, greedy, bf16, single device, real weights.
+Uses MaxEngine `prefill` → `insert` → `generate()` (actual KV-cache path).
+
+**Two metrics (do not conflate):**
+
+| metric | meaning |
+|---|---|
+| **full sequences exact** | entire 8-token greedy output identical fly vs ragged? |
+| **decode-step-1 top-1** | after prefill, same argmax on first `generate()` logit vector? |
+
+Mixtral passing **both** proves fly MoE is exact on the decode-path kernel. Gemma failing
+on both backends while sometimes agreeing step-1 proves a MaxText decode bug, not fly.
+
+### 11.3 Mixtral decode — 10/10 exact (ragged == fly)
+
+Report: `results/decode_mixtral/report.md`
+
+- Decode-step-1: **10/10** top-1, cosine ≥ 0.99989, top-5 overlap 100%
+- Free-running greedy: **10/10** sequences exact (8/8 tokens each prompt)
+
+Example outputs (fly == ragged on all 10):
+
+| prompt | generated continuation |
+|---|---|
+| "The capital of France is" | "a city that is known for its beauty" |
+| "The first president of the United States was" | "George Washington. He was born on February" |
+| "Water boils at a temperature of" | "100 degrees Celsius" |
+| "import numpy as np" | "\nimport matplotlib.pyplot" |
+
+**End-to-end decode latency** (1 token): ragged 69.8 ms → fly 19.7 ms = **3.54×**.
+
+### 11.4 Gemma decode — not a fly defect
+
+| ckpt | full sequences exact | decode-step-1 top-1 | report |
+|---|---|---|---|
+| base | 0/10 (both backends) | 5/10 | `results/decode_gemma/report.md` |
+| -it | 6/10 fly vs ragged match | 6/10 | `results/decode_gemma_it/report.md` |
+
+Ragged (stock MaxText) and fly fail **identically**. First token from prefill is often
+sensible; degeneration starts at the first KV-cache `generate()` step. On `-it`, both
+backends produce the same gibberish on matched prompts (e.g. `" own's's's'"`).
+
+### 11.5 Re-prefill diagnostic
+
+Compare re-prefill(`prompt + token₁`) vs KV-cache `generate()` for token₂ logits:
+
+| prompt (base Gemma, ragged) | token₁ | re-prefill token₂ | decode token₂ | cosine |
+|---|---|---|---|---|
+| capital of France is | ` a` | **` city`** ✓ | garbage ✗ | ~−0.10 |
+| largest planet … is | ` Jupiter` | **`.`** ✓ | garbage ✗ | 0.34 |
+| first president … was | ` George` | **` Washington`** ✓ | garbage ✗ | ~−0.13 |
+
+Re-prefill is coherent → weights and prefill MoE path are correct. Decode logits are
+uncorrelated → KV-cache propagation broken in MaxText Gemma-4 scanned blocks on this
+stack (upstream [PR #4066](https://github.com/AI-Hypercomputer/maxtext/pull/4066) fixes
+scanned-layer KV for TPU vLLM-RPA; our ROCm `dot_product` decode path is unaffected).
+Mixtral: re-prefill and decode agree (10/10 sequences).
+
+### 11.6 What we claim vs do not claim
+
+- **Claim:** fly MoE kernel exact vs ragged on prefill (both models) and Mixtral decode
+- **Claim:** fly decode perf 3.54× on Mixtral single-token step
+- **Do not claim:** Gemma end-to-end decode works on MaxText ROCm today
+- **Do not attribute** Gemma decode gibberish to fly — ragged matches fly on degenerate runs
+
+---
+
+## 12. Commands
+
+```bash
+source /workspace/.flydsl_env
+
+# Prefill correctness
+python3 -m maxtext_moe.compare_backends --model gemma --backends ragged,fly \
+  --load_parameters_path results/gemma4_ckpt/0/items
+
+# Decode correctness
+python3 -m maxtext_moe.compare_decode --model mixtral --backends ragged,fly \
+  --load_parameters_path results/mixtral_ckpt/0/items --gen_steps 8
+
+# End-to-end perf
+BACKEND=fly bash scripts/run_gemma_maxtext.sh
+```
+
+---
+
+## 13. Future work
+
+- Golden-logits check vs HF reference (`forward_pass_logit_checker`)
+- Multi-device sharding
+- fp8 end-to-end in MaxText
+- Fix or upstream Gemma KV-cache decode on ROCm maxengine path
+
+---
+
+## Appendix — building confidence
+
+1. Golden-logits vs HF (fp32, `max_kl_div=0.03`)
+2. More prompts + seeds in `compare_backends`
+3. fp32 reference (`--dtype float32`) — cosine 1.0 at precision floor
+4. Layer-level unit tests (`tests/test_*_correctness.py`)
+5. Per-stage intermediate agreement (stage-1 / stage-2)
+6. Roofline cross-check vs MoE microbench TFLOPs
