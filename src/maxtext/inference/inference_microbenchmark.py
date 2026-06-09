@@ -304,6 +304,13 @@ def run_benchmarks(config):
   rng = jax.random.PRNGKey(1234)
   rng, rng_load_params = jax.random.split(rng)
   params = engine.load_params(rng_load_params)
+  # FlyDSL backend: fill the MFMA-preshuffled MoE weights ONCE here, between
+  # load_params and the timed loop, so the shuffle is not recomputed every
+  # forward. No-op for moe_backend=default. See maxtext/integration/flydsl/.
+  if getattr(config, "moe_backend", "default") == "flydsl":
+    from maxtext.kernels.flydsl_moe import inject_preshuffled_weights
+
+    params = inject_preshuffled_weights(params)
   prefill_lengths = [int(l) for l in config.inference_microbenchmark_prefill_lengths.split(",")]
   stages_to_benchmark = config.inference_microbenchmark_stages.split(",")
   benchmark_loop_iters = config.inference_microbenchmark_loop_iters

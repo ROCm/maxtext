@@ -731,6 +731,14 @@ class MoEKernels(BaseModel):
 
   megablox: bool = Field(True, description="Whether to use Megablox kernels for MoE.")
   sparse_matmul: bool = Field(True, description="Whether to use sparse matmul kernels for MoE.")
+  moe_backend: str = Field(
+      "default",
+      description=(
+          "Routed-MoE compute backend. 'default' uses the stock "
+          "sparse/dense/megablox path; 'flydsl' routes through the FlyDSL "
+          "2-stage grouped-GEMM kernels (GPU/ROCm only, requires the jax-flydsl package)."
+      ),
+  )
   wi_tile_fwd_batch_seq: int = Field(
       512,
       description="forward pass tiling dimension for batch/sequence in GMM for wi.",
@@ -2809,6 +2817,13 @@ class MaxTextConfig(
       )
     if self.hardware == "gpu" and self.packing and self.attention == "cudnn_flash_te" and self.max_segments_per_seq <= 0:
       raise ValueError("max_segments_per_seq must be set when using TransformerEngine attention and packing")
+    if self.moe_backend not in ("default", "flydsl"):
+      raise ValueError(f"moe_backend must be 'default' or 'flydsl', got {self.moe_backend!r}.")
+    if self.moe_backend == "flydsl" and "gpu" not in self.hardware:
+      raise ValueError(
+          "moe_backend='flydsl' requires a GPU/ROCm build (the FlyDSL kernels are AMD-GPU only). "
+          f"Got hardware={self.hardware!r}."
+      )
     dcn_product = (
         self.dcn_data_parallelism
         * self.dcn_pipeline_parallelism

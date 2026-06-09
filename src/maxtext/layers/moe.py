@@ -509,6 +509,22 @@ class RoutedMoE(nnx.Module):
           out_sharding=self.wo_kernel_axes,
       )
 
+    # FlyDSL backend: allocate MFMA-preshuffled weight placeholders so they live
+    # in the param pytree. They are filled ONCE at load time by
+    # maxtext.kernels.flydsl_moe.inject_preshuffled_weights (no per-forward
+    # shuffle); RoutedMoE.__call__ reads them directly. Stock wi_0/wi_1/wo stay
+    # in the checkpoint untouched.
+    if getattr(self.config, "moe_backend", "default") == "flydsl":
+      from flydsl_moe.preshuffle import pad_inter_dim as _fly_pad
+
+      _fly_m_pad = _fly_pad(moe_intermediate_dim)
+      self.fly_w1_shuffled = nnx.Param(
+          jnp.zeros((num_experts * 2 * _fly_m_pad, self.moe_expert_input_dim), weight_dtype)
+      )
+      self.fly_w2_shuffled = nnx.Param(
+          jnp.zeros((num_experts * self.moe_expert_input_dim, _fly_m_pad), weight_dtype)
+      )
+
     if self.config.mlp_bias:
       wi_bias_axes = ("exp", "activation_mlp")
       wo_bias_axes = ("exp", "activation_embed")
@@ -2260,6 +2276,12 @@ class RoutedMoE(nnx.Module):
     if cfg.attention == "vllm_rpa":
       output, lb_loss, bias_updates = self.fused_moe_matmul(
           inputs, gate_logits, wo_kernel, w0_kernel=w0_kernel, w1_kernel=w1_kernel, fused_kernel=fused_kernel
+      )
+    elif getattr(cfg, "moe_backend", "default") == "flydsl":
+      from maxtext.kernels.flydsl_moe import flydsl_matmul
+
+      output, lb_loss, bias_updates = flydsl_matmul(
+          self, inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel
       )
     elif cfg.sparse_matmul:
       if quantizations.in_serve_mode(self.quant):
