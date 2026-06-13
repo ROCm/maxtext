@@ -1419,15 +1419,25 @@ def setup_decode_state(config, mesh, checkpoint_manager, init_state_fn):
   else:
     # Load params from checkpoint
     max_logging.log(f"Loading decode params from {config.load_parameters_path}")
-    unboxed_abstract_state, state_mesh_annotations, _ = get_abstract_state(config, mesh, init_state_fn, False)
+    unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
+        config, mesh, init_state_fn, False
+    )
+    abstract_params = unboxed_abstract_state.params
+    if getattr(config, "use_flydsl_moe", False):
+      # FlyDSL preshuffled weights are derived: drop before restore, refill after.
+      from maxtext.integration.flydsl import moe_bridge
+
+      abstract_params = moe_bridge.strip_preshuffle_params(abstract_params)
     with nn_partitioning.axis_rules(config.logical_axis_rules):
       params = checkpointing.load_params_from_path(
           config.load_parameters_path,
-          unboxed_abstract_state.params,
+          abstract_params,
           config.checkpoint_storage_concurrent_gb,
           config.checkpoint_storage_use_ocdbt,
           config.checkpoint_storage_use_zarr3,
       )
+    if getattr(config, "use_flydsl_moe", False):
+      params = moe_bridge.fill_preshuffle_params(params, state_mesh_shardings.params)
     state = init_decode_state(None, params)
 
   state = max_utils.unbox_logicallypartioned(state)

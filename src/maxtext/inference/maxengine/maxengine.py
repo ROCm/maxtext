@@ -248,25 +248,55 @@ class MaxEngine(_BaseEngine):
   def _compile_generate_and_get_layouts(
       self, params: Any, decode_state: Any, rng_shape: Any, xla_flags: dict[str, Any] | None = None
   ) -> tuple[Any, Any, Any, Any]:
-    """Optimal memory layout for params and decode_state."""
+    """Compile generate and return layouts with a self-consistent decode_state layout.
 
-    param_layout = Format(DLL.AUTO)
-    decode_state_layout = Format(DLL.AUTO)
+    The autoregressive loop feeds generate's output decode_state back as its next
+    input, while the initial decode_state is produced separately by
+    ``init_decode_state``. For this to be valid a single decode_state layout must
+    hold across (init output) == (generate input) == (generate output). XLA's AUTO
+    layout selection does not guarantee generate's input and output decode_state
+    layouts agree (donation does not force it), so when they differ we recompile
+    with the decode_state layout pinned on both sides. The returned decode_state
+    layout is generate's input layout, which ``init_decode_state`` is then compiled
+    to produce.
+    """
+    auto = Format(DLL.AUTO)
     # Keyword arguments are not yet supported in JAX for specifying shardings. Therefore, all AOT
     # compiled functions use arguments instead.
     compiled_generate = (
         jax.jit(
             self.generate_aot,
-            in_shardings=(param_layout, decode_state_layout, None),
-            out_shardings=(Format(DLL.AUTO), Format(DLL.AUTO)),
+            in_shardings=(auto, auto, None),
+            out_shardings=(auto, auto),
             donate_argnames=("decode_state",),
         ).lower(params, decode_state, rng_shape)
     ).compile(compiler_options=xla_flags)
 
+    # input_formats -> (positional_formats, kwargs_formats); output is (decode_state, tokens)
+    # so output_formats unpacks directly into the decode_state and tokens layouts.
     arg_layouts, _ = compiled_generate.input_formats
-    generate_out_layouts, _ = compiled_generate.output_formats
+    decode_state_out_layout, _ = compiled_generate.output_formats
+    param_layout = arg_layouts[0]
+    decode_state_in_layout = arg_layouts[1]
 
-    return compiled_generate, arg_layouts[0], arg_layouts[1], generate_out_layouts
+    layouts_consistent = all(
+        jax.tree_util.tree_leaves(
+            jax.tree_util.tree_map(lambda a, b: a == b, decode_state_in_layout, decode_state_out_layout)
+        )
+    )
+    if not layouts_consistent:
+      # Pin the decode_state layout on both sides so the AR feedback loop and the
+      # separately-initialized decode_state all agree.
+      compiled_generate = (
+          jax.jit(
+              self.generate_aot,
+              in_shardings=(param_layout, decode_state_in_layout, None),
+              out_shardings=(decode_state_in_layout, auto),
+              donate_argnames=("decode_state",),
+          ).lower(params, decode_state, rng_shape)
+      ).compile(compiler_options=xla_flags)
+
+    return compiled_generate, param_layout, decode_state_in_layout, decode_state_in_layout
 
   def _identity(self, x: Any) -> Any:
     """Avoids lambda that breaks JAX caching."""

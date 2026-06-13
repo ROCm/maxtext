@@ -859,6 +859,13 @@ class MoEKernels(BaseModel):
 
   megablox: bool = Field(True, description="Whether to use Megablox kernels for MoE.")
   sparse_matmul: bool = Field(True, description="Whether to use sparse matmul kernels for MoE.")
+  use_flydsl_moe: bool = Field(
+      False,
+      description=(
+          "Use the FlyDSL ROCm 2-stage grouped-GEMM kernel for routed MoE (Mixtral bf16, inference). "
+          "Requires jax_flydsl + flydsl_moe + the pinned FlyDSL kernels checkout on PYTHONPATH."
+      ),
+  )
   wi_tile_fwd_batch_seq: int = Field(
       512,
       description="forward pass tiling dimension for batch/sequence in GMM for wi.",
