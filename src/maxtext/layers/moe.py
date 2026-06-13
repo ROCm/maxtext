@@ -548,6 +548,26 @@ class RoutedMoE(nnx.Module):
     ):
       self.wo.value = self.wo.value * self.per_expert_scale.value[:, None, None]
 
+    # Derived bf16 preshuffled weights for the FlyDSL backend, consumed by
+    # flydsl_matmul to skip the per-step repack. When restoring a checkpoint these
+    # are excluded from the restore and recomputed (see fill_preshuffle_params),
+    # so the value here is only a placeholder in that case.
+    if (
+        getattr(self.config, "use_flydsl_moe", False)
+        and not quantizations.in_serve_mode(self.quant)
+        and not (self.config.prefuse_moe_weights and self.config.attention == "vllm_rpa")
+    ):
+      from maxtext.integration.flydsl import moe_bridge  # local import: optional dep
+
+      w1_shuffled, w2_shuffled = moe_bridge.preshuffle_expert_weights(
+          self.wi_0.value, self.wi_1.value, self.wo.value
+      )
+      self.wi_fly_w1 = nnx.Param(w1_shuffled)
+      self.wi_fly_w2 = nnx.Param(w2_shuffled)
+    else:
+      self.wi_fly_w1 = None
+      self.wi_fly_w2 = None
+
   def _maybe_shard_with_logical(self, inputs, logical_name):
     return maybe_shard_with_logical(
         inputs,
@@ -1900,6 +1920,39 @@ class RoutedMoE(nnx.Module):
       kernel = self._maybe_shard_with_logical(kernel, kernel_axes)
     return kernel
 
+  def flydsl_matmul(
+      self,
+      inputs,
+      gate_logits,
+      pre_bias_logits,
+      w0_kernel,
+      w1_kernel,
+      wo_kernel,
+  ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
+    """Inference-only bf16 routed-MoE via the FlyDSL ROCm 2-stage grouped GEMM."""
+    from maxtext.integration.flydsl import moe_bridge
+
+    # Offline-preshuffled weights when available, else None (bridge shuffles inline).
+    w1_shuffled = self.wi_fly_w1[...] if self.wi_fly_w1 is not None else None
+    w2_shuffled = self.wi_fly_w2[...] if self.wi_fly_w2 is not None else None
+
+    top_k_weights, top_k_indices = self.get_topk(gate_logits, pre_bias_logits, self.rngs)
+    output = moe_bridge.flydsl_routed_moe(
+        inputs,
+        top_k_weights,
+        top_k_indices,
+        w0_kernel,
+        w1_kernel,
+        wo_kernel,
+        num_experts=self.num_experts,
+        num_experts_per_tok=self.num_experts_per_tok,
+        out_dtype=self.dtype,
+        w1_shuffled=w1_shuffled,
+        w2_shuffled=w2_shuffled,
+        inter_dim=self.intermediate_dim,
+    )
+    return output, None, None
+
   def dense_matmul(
       self,
       inputs,
@@ -2348,6 +2401,10 @@ class RoutedMoE(nnx.Module):
     if cfg.attention == "vllm_rpa":
       output, lb_loss, bias_updates = self.fused_moe_matmul(
           inputs, gate_logits, wo_kernel, w0_kernel=w0_kernel, w1_kernel=w1_kernel, fused_kernel=fused_kernel
+      )
+    elif cfg.use_flydsl_moe:
+      output, lb_loss, bias_updates = self.flydsl_matmul(
+          inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel
       )
     elif cfg.sparse_matmul:
       if quantizations.in_serve_mode(self.quant):
