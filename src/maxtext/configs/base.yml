@@ -219,6 +219,9 @@ expert_balance: False
 use_random_routing: false # whether to use random routing for debug/test purpose
 use_custom_sort_vjp: true # whether to use a custom VJP sort for efficient backward pass processing in sparse matmul
 use_ring_of_experts: false # whether to use ring of experts for sparse matmul expert parallelism
+# If true, shard the MoE dispatch/MLP batch dim without 'expert' (activation_batch_no_exp) so the
+# expert GEMM stays expert-parallel (AllToAll); false keeps 'expert' on it (activation_batch_moe).
+moe_dispatch_no_expert_sharding: false
 use_ragged_sort: false # whether to use the Pallas ragged-sort kernels in the MoE permute path; valid both with and
                        # without `use_ring_of_experts` (with EP > 1). When `use_ring_of_experts=True` the kernels run
                        # inside `permute`/`unpermute`; otherwise they run inside `local_permute`/local-unpermute.
@@ -527,6 +530,8 @@ logical_axis_rules: [
                       # ==========================================
                       # MoE Activations
                       ['activation_batch_moe', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
+                      # Batch axis WITHOUT 'expert' so MoE dispatch/mlp GEMM stays expert-parallel (AllToAll), not FSDP.
+                      ['activation_batch_no_exp', ['data', 'fsdp', 'fsdp_transpose']],
                       ['activation_length_moe', ['context']],
                       ['activation_norm_length_moe', ['tensor_sequence', 'context']],
                       ['activation_embed_moe', ['tensor', 'tensor_transpose']],

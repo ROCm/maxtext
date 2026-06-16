@@ -2197,15 +2197,20 @@ class RoutedMoE(nnx.Module):
             top_k_indices, weights  # pylint: disable=undefined-variable,possibly-used-before-assignment
         )
         mask_axes = ("activation_batch_moe", "activation_norm_length_moe", None, None)
+        # Dispatch/MLP are already expert-sharded via "activation_exp"; with no_expert_sharding the
+        # batch dim drops 'expert' so the GEMM stays expert-parallel (AllToAll) instead of FSDP.
+        moe_dispatch_batch_axis = (
+            "activation_batch_no_exp" if self.config.moe_dispatch_no_expert_sharding else "activation_batch_moe"
+        )
         dispatch_axis = (
             "activation_exp",
-            "activation_batch_moe",
+            moe_dispatch_batch_axis,
             None,
             "activation_embed_moe",
         )
         mlp_axis = (
             "activation_exp",
-            "activation_batch_moe",
+            moe_dispatch_batch_axis,
             None,
             "activation_mlp",
         )
