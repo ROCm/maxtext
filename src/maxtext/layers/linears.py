@@ -33,7 +33,13 @@ from maxtext.common.common_types import DecoderBlockType, ShardMode, DType, Arra
 from maxtext.common.common_types import MODEL_MODE_PREFILL
 from maxtext.layers import nnx_wrappers, quantizations
 from maxtext.layers import normalizations
-from maxtext.layers.initializers import NdInitializer, nd_dense_init, default_bias_init, variable_to_logically_partitioned
+from maxtext.layers.initializers import (
+    NdInitializer,
+    nd_dense_init,
+    default_bias_init,
+    variable_to_logically_partitioned,
+    megatron_normal_nd_init,
+)
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
@@ -393,6 +399,15 @@ class MlpBlock(nnx.Module):
     self.intermediate_dim = intermediate_dim
     self.activations = activations
     self.kernel_init = kernel_init
+    # Megatron-style fixed-std init (default off). wi (gate/up) use normal(0, std); the residual
+    # down projection (wo) uses std/sqrt(2*num_decoder_layers). See initializers.py.
+    _mt_std = getattr(config, "megatron_init_std", 0.0)
+    if _mt_std and _mt_std > 0:
+      self.kernel_init = megatron_normal_nd_init(_mt_std)
+      _scale = (2.0 * config.num_decoder_layers) ** 0.5 if getattr(config, "megatron_residual_scale", True) else 1.0
+      self._wo_kernel_init = megatron_normal_nd_init(_mt_std / _scale)
+    else:
+      self._wo_kernel_init = self.kernel_init
     self.intermediate_dropout_rate = intermediate_dropout_rate
     self.dtype = dtype
     self.weight_dtype = weight_dtype
@@ -459,7 +474,7 @@ class MlpBlock(nnx.Module):
         out_features_shape=in_features,
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,
-        kernel_init=self.kernel_init,
+        kernel_init=self._wo_kernel_init,
         kernel_axes=("mlp", "embed"),
         quant=self.quant,
         use_bias=self.use_bias,

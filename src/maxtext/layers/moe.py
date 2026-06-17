@@ -2565,6 +2565,16 @@ class RoutedMoE(nnx.Module):
       output, lb_loss, bias_updates = self.fused_moe_matmul(
           inputs, gate_logits, wo_kernel, w0_kernel=w0_kernel, w1_kernel=w1_kernel, fused_kernel=fused_kernel
       )
+    elif cfg.use_jax_aiter and getattr(cfg, "aiter_moe", False):
+      # Forward-only AITER MXFP4 fused-MoE path. Bypasses MaxText's
+      # default ragged_dot/gmm sparse_matmul scheme and routes the expert
+      # GEMMs through jax-aiter's MoeFwdJA FFI handler. See
+      # `docs/perf/moe_bring_up/H1_fix_report_20260519.md` for the
+      # binding's correctness + perf evidence.
+      output = self._aiter_moe_forward(
+          inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel
+      )
+      lb_loss, bias_updates = None, None
     elif cfg.sparse_matmul:
       if quantizations.in_serve_mode(self.quant):
         w0_kernel, w1_kernel, wo_kernel = self.retrieve_quantized_weight(
@@ -2586,6 +2596,71 @@ class RoutedMoE(nnx.Module):
           inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias, input_ids
       )
     return output, lb_loss, bias_updates
+
+  def _aiter_moe_forward(self, inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel):
+    """AITER MXFP4 fused-MoE forward (use_jax_aiter + aiter_moe).
+
+    Forward only. Layout adapter between MaxText's (separate w0/w1/wo,
+    [E, hidden, inter] gate+up + [E, inter, hidden] down) and AITER's
+    (fused W1 [E, 2*inter, hidden] + W2 [E, hidden, inter]; MXFP4-packed
+    with per-32-element E8M0 scales). Routing weights taken from
+    softmax(gate_logits) top-k -- mirrors MaxText's permute() top-k
+    semantics without going through the permute/unpermute scatter.
+    """
+    from jax_aiter.moe import aiter_moe_fwd, cast_mxfp4_moe_weight
+
+    batch, seq, hidden = inputs.shape
+    num_experts = self.num_experts
+    top_k = self.num_experts_per_tok
+
+    # 1) Top-k routing from gate_logits. MaxText computes pre-bias logits
+    #    and a separate routing function; for the AITER smoke we use a
+    #    plain softmax + top_k which matches the per-token semantics of
+    #    Mixtral's standard router.
+    probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
+    topk_w_raw, topk_ids = jax.lax.top_k(probs, top_k)
+    topk_w = (topk_w_raw / jnp.sum(topk_w_raw, axis=-1, keepdims=True)
+              ).astype(jnp.float32)
+    topk_ids = topk_ids.astype(jnp.int32)
+
+    # Flatten the (batch, seq) axes -- AITER MoE works on [M, hidden].
+    M = batch * seq
+    hs = inputs.reshape(M, hidden).astype(jnp.bfloat16)
+    topk_w = topk_w.reshape(M, top_k)
+    topk_ids = topk_ids.reshape(M, top_k)
+
+    # 2) Weight layout adapter. MaxText: wi_0/wi_1 are [E, hidden, inter]
+    #    (separate gate + up), wo is [E, inter, hidden]. AITER: w1 is
+    #    fused gate+up [E, 2*inter, hidden], w2 is down [E, hidden,
+    #    inter]. Transpose the (hidden, inter) axes and concat g/u on N.
+    w0_t = jnp.transpose(w0_kernel.astype(jnp.bfloat16), (0, 2, 1))
+    w1_t = jnp.transpose(w1_kernel.astype(jnp.bfloat16), (0, 2, 1))
+    w1_fused = jnp.concatenate([w0_t, w1_t], axis=1)             # [E, 2*inter, hidden]
+    w2_aiter = jnp.transpose(wo_kernel.astype(jnp.bfloat16), (0, 2, 1))  # [E, hidden, inter]
+
+    # 3) MXFP4 cast (per-expert; preserves the e8m0_shuffle 32-row
+    #    granularity that the ASM kernel reads at ptr_GUQ + e*eGUQs).
+    w1_packed_p, w1_scale_p = cast_mxfp4_moe_weight(
+        w1_fused, shuffle_fp4=True, shuffle_scales=True, use_hadamard=False)
+    w2_packed_p, w2_scale_p = cast_mxfp4_moe_weight(
+        w2_aiter, shuffle_fp4=True, shuffle_scales=True, use_hadamard=False)
+    two_inter = 2 * self.intermediate_dim
+    sn_g = hidden // 32
+    sn_d = self.intermediate_dim // 32
+    w1_packed = w1_packed_p[:, :two_inter, :]
+    w1_scale  = w1_scale_p[:, :two_inter, :sn_g]
+    w2_packed = w2_packed_p[:, :hidden, :]
+    w2_scale  = w2_scale_p[:, :hidden, :sn_d]
+
+    # 4) FFI call. MoeFwdJA does activation cast + MoE-sort + fused
+    #    GEMM-1 + SiLU*up + GEMM-2 + per-(token,top-k) atomic-add into
+    #    the output buffer.
+    out_flat = aiter_moe_fwd(
+        hs, w1_packed, w2_packed, w1_scale, w2_scale,
+        topk_w, topk_ids,
+        top_k=top_k, num_experts=num_experts, block_m=32,
+    )
+    return out_flat.reshape(batch, seq, hidden).astype(self.dtype)
 
 
 class RoutedAndSharedMoE(nnx.Module):

@@ -127,6 +127,11 @@ class Embed(nnx.Module):
     self.dtype = dtype
     self.attend_dtype = attend_dtype
 
+    # Megatron-style fixed-std embedding init (default off): normal(0, megatron_init_std).
+    _mt_std = getattr(config, "megatron_init_std", 0.0)
+    if _mt_std and _mt_std > 0:
+      embedding_init = jax.nn.initializers.normal(stddev=_mt_std)
+
     self.embedding = nnx.Param(
         embedding_init(
             rngs.params(),

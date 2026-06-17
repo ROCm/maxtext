@@ -386,6 +386,12 @@ num_kv_shared_layers: 0
 # for the lost K/V parameters.
 use_double_wide_mlp: False
 
+# Megatron-style weight init (default OFF / byte-identical). When >0, q/k/v/wi/embedding use
+# fixed normal(0, megatron_init_std) and the residual output projections (attention out, MLP wo)
+# are shrunk by 1/sqrt(2*num_decoder_layers) (if megatron_residual_scale) for high-LR stability.
+megatron_init_std: 0.0
+megatron_residual_scale: True
+
 
 # Adding Mixture of Block Attention Support (MoBA): https://github.com/MoonshotAI/MoBA/blob/master/MoBA_Tech_Report.pdf
 moba: false

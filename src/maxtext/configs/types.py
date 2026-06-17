@@ -187,6 +187,7 @@ class DatasetType(str, Enum):
   TFDS = "tfds"
   C4MLPERF = "c4_mlperf"
   OLMO_GRAIN = "olmo_grain"
+  MEGATRON = "megatron"
 
 
 class SamplingStrategy(str, Enum):
@@ -494,6 +495,13 @@ class Aiter(BaseModel):
       "Set attention=aiter_flash or enable this flag (requires use_jax_aiter=True). "
       "Note: TE attention (cudnn_flash_te) already uses the same CK kernels on ROCm.",
   )
+  aiter_moe: bool = Field(
+      False,
+      description="AITER MXFP4 fused-MoE forward via jax-aiter MoeFwdJA FFI. "
+      "Bypasses MaxText's default ragged_dot/gmm sparse_matmul path; routes "
+      "MoE expert GEMMs through AITER's fmoe_bf16_pertokenMXfp4_g1u1_silu "
+      "ASM kernel. Inference-only (forward pass). Requires use_jax_aiter=True.",
+  )
 
 
 class ModelArchitecture(BaseModel):
@@ -571,6 +579,18 @@ class Logits(BaseModel):
       description="Soft-cap value for the final logits. None or 0.0 means no cap.",
   )
   z_loss_multiplier: float = Field(0.0, description="The multiplier for the z-loss (e.g., 1e-4). 0.0 to disable.")
+  megatron_init_std: float = Field(
+      0.0,
+      description=(
+          "If >0, use Megatron-style fixed normal(0, std) weight init for q/k/v/wi/embedding, "
+          "with residual output projections (attention out, MLP wo) scaled by 1/sqrt(2*num_decoder_layers) "
+          "when megatron_residual_scale is True. 0.0 = MaxText default fan-in variance-scaling init (off, byte-identical)."
+      ),
+  )
+  megatron_residual_scale: bool = Field(
+      True,
+      description="When megatron_init_std>0, shrink residual output projections (attn out, MLP wo) by 1/sqrt(2*num_decoder_layers).",
+  )
 
 
 class Attention(BaseModel):

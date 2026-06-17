@@ -78,8 +78,13 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
     dataset_type_to_train_eval_iterator["tfds"] = (make_tfds_train_iterator, make_tfds_eval_iterator)
     dataset_type_to_train_eval_iterator["c4_mlperf"] = (make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator)
 
+  if config.dataset_type == "megatron":
+    from maxtext.input_pipeline.megatron_data_processing import make_megatron_train_iterator, make_megatron_eval_iterator  # pylint: disable=import-outside-toplevel
+
+    dataset_type_to_train_eval_iterator["megatron"] = (make_megatron_train_iterator, make_megatron_eval_iterator)
+
   # Collect train and eval iterators
-  if config.dataset_type in ["tfds", "grain", "hf", "c4_mlperf", "olmo_grain"]:
+  if config.dataset_type in ["tfds", "grain", "hf", "c4_mlperf", "olmo_grain", "megatron"]:
     if config.dataset_type == "c4_mlperf":
       assert config.packing, "c4_mlperf dataloader only works with packing. For padded version, use tfds dataloader"
     train_iterator, eval_iterator = dataset_type_to_train_eval_iterator[config.dataset_type]

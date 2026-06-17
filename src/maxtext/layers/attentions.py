@@ -61,7 +61,13 @@ from maxtext.layers.embeddings import (
     PartialRotaryEmbedding,
     Gemma4PartialRotaryEmbedding,
 )
-from maxtext.layers.initializers import nd_dense_init, NdInitializer, variable_to_logically_partitioned, default_bias_init
+from maxtext.layers.initializers import (
+    nd_dense_init,
+    NdInitializer,
+    variable_to_logically_partitioned,
+    default_bias_init,
+    megatron_normal_nd_init,
+)
 from maxtext.layers.linears import DenseGeneral, canonicalize_tuple, normalize_axes
 from maxtext.layers.normalizations import RMSNorm, Qwen3NextRMSNorm, GlobalRMSNorm
 from maxtext.layers.quantizations import AqtQuantization as Quant
@@ -383,6 +389,11 @@ class Attention(nnx.Module):
     self.max_prefill_predict_length = max_prefill_predict_length
     self.dropout_rate = dropout_rate
     self.kernel_init = kernel_init
+    # Megatron-style fixed-std init (default off). q/k/v use normal(0, std); the residual
+    # output projection (init_out_w) uses std/sqrt(2*num_decoder_layers). See initializers.py.
+    _mt_std = getattr(config, "megatron_init_std", 0.0)
+    if _mt_std and _mt_std > 0:
+      self.kernel_init = megatron_normal_nd_init(_mt_std)
     self.float32_qk_product = float32_qk_product
     self.float32_logits = float32_logits
     self.quant = quant
@@ -713,11 +724,16 @@ class Attention(nnx.Module):
       out_kernel_axis = ("mlp", "embed")
       axis = (-1,)
 
+    out_kernel_init = self.kernel_init
+    _mt_std = getattr(self.config, "megatron_init_std", 0.0)
+    if _mt_std and _mt_std > 0:
+      _scale = (2.0 * self.config.num_decoder_layers) ** 0.5 if getattr(self.config, "megatron_residual_scale", True) else 1.0
+      out_kernel_init = megatron_normal_nd_init(_mt_std / _scale)
     return DenseGeneral(
         in_features_shape=in_features,
         out_features_shape=out_features,
         axis=axis,
-        kernel_init=self.kernel_init,
+        kernel_init=out_kernel_init,
         kernel_axes=out_kernel_axis,  # trade speed with memory
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,

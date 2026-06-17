@@ -963,6 +963,18 @@ class AttentionOp(nnx.Module):
           qk_product_einsum=qk_product_einsum,
           wv_product_einsum=wv_product_einsum,
       )
+    elif self.attention_kernel == "aiter_flash":
+      # Direct jax-aiter AITER flash (varlen/THD for packed real data). Same
+      # aiter::mha_fwd/bwd kernels TE's CK backend calls, but invoked leanly
+      # (no TE pad-remove/re-pad / SequenceDescriptor overhead).
+      if model_mode == MODEL_MODE_AUTOREGRESSIVE:
+        return self.apply_attention_dot(
+            query, key, value, decoder_segment_ids, model_mode, previous_chunk,
+            bidirectional_mask=bidirectional_mask, sinks=sinks, index_mask=index_mask,
+            record_max_logits=record_max_logits,
+            qk_product_einsum=qk_product_einsum, wv_product_einsum=wv_product_einsum,
+        )
+      return self.aiter_flash_attention(query, key, value, decoder_segment_ids), None, None
     elif self.attention_kernel in ("flash", "autoselected"):
       if target_hardware == "tpu":
         if isinstance(key, KVTensor):
@@ -1673,6 +1685,75 @@ class AttentionOp(nnx.Module):
         sequence_descriptor=dummy_attn_mask,
     )
     return dpa_layer(query, key, value, sequence_descriptor=attn_mask)
+
+  def aiter_flash_attention(
+      self,
+      query: Array,
+      key: Array | KVTensor,
+      value: Array | KVTensor,
+      decoder_segment_ids: Array | None,
+  ) -> Array:
+    """Direct jax-aiter AITER flash attention.
+
+    Packed real data (decoder_segment_ids present) -> flash_attn_varlen over the
+    flattened [b*s, h, d] tokens with cu_seqlens built from segment_ids (true
+    block-diagonal per-segment causal attention). Non-packed -> batch flash_attn_func.
+    MaxText pre-scales the query via the projection kernel (depth_scaling), so the
+    attention softmax scale is 1.0 (matching the cudnn_flash_te path).
+    """
+    # pylint: disable=import-outside-toplevel
+    from jax_aiter.mha import flash_attn_func, flash_attn_varlen_raw  # pytype: disable=import-error
+    from jax.experimental.shard_map import shard_map  # pytype: disable=import-error
+    from jax.sharding import PartitionSpec as P
+
+    if isinstance(key, KVTensor):
+      key = key.dequant()
+    if isinstance(value, KVTensor):
+      value = value.dequant()
+
+    if decoder_segment_ids is None:
+      return flash_attn_func(query, key, value, causal=True, softmax_scale=1.0)[0]
+
+    max_seg = self.config.max_segments_per_seq
+    mesh = self.mesh
+    # The activation batch dim is sharded over these mesh axes (base.yml
+    # logical_axis_rules: activation_batch -> data/fsdp/fsdp_transpose/expert).
+    # shard_map makes each device hold a fully-LOCAL [b_local, s, h, d] shard so
+    # we can build device-local cu_seqlens and call the raw varlen FFI per-shard
+    # (the global-offset cu_seqlens cannot be used on a token-sharded q).
+    batch_axes = tuple(
+        ax for ax in ("data", "fsdp", "fsdp_transpose", "expert")
+        if ax in mesh.axis_names and mesh.shape[ax] > 1
+    )
+    in_specs = (
+        P(batch_axes, None, None, None),
+        P(batch_axes, None, None, None),
+        P(batch_axes, None, None, None),
+        P(batch_axes, None),
+    )
+    out_specs = P(batch_axes, None, None, None)
+
+    def _local_varlen(q_l, k_l, v_l, sid_l):
+      bl, sl, hq_l, d_l = q_l.shape
+      n = bl * sl
+      sid = sid_l.astype(jnp.int32).reshape(-1)
+      idx = jnp.arange(n, dtype=jnp.int32)
+      row = idx // sl
+      prev_sid = jnp.concatenate([jnp.full((1,), -1, jnp.int32), sid[:-1]])
+      prev_row = jnp.concatenate([jnp.full((1,), -1, jnp.int32), row[:-1]])
+      is_start = (sid != prev_sid) | (row != prev_row)
+      start_off = jnp.where(is_start, idx, jnp.int32(n))
+      max_slots = bl * (max_seg + 2)
+      cu = jnp.concatenate([jnp.sort(start_off)[:max_slots], jnp.full((1,), n, jnp.int32)])
+      qf = q_l.reshape(n, hq_l, d_l)
+      kf = k_l.reshape(n, k_l.shape[2], d_l)
+      vf = v_l.reshape(n, v_l.shape[2], v_l.shape[3])
+      out = flash_attn_varlen_raw(qf, kf, vf, cu, cu, sl, sl, 0.0, 1.0, True, (-1, -1))
+      return out.reshape(bl, sl, hq_l, vf.shape[-1])
+
+    return shard_map(
+        _local_varlen, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+    )(query, key, value, decoder_segment_ids)
 
   def cudnn_jax_flash_attention(
       self,

@@ -60,6 +60,22 @@ def nd_dense_init(scale, mode, distribution):
   return init_fn
 
 
+def megatron_normal_nd_init(std):
+  """NdInitializer that draws from a fixed normal(0, std), ignoring fan-in/out axes.
+
+  Matches Megatron-LM's `init_method_normal` (fixed std, e.g. 0.02). Used (behind the
+  `megatron_init_std` config flag) to replace MaxText's fan-in variance-scaling init so the
+  high-LR (8e-4) MLPerf recipe trains stably. Residual output projections pass std/sqrt(2*L)
+  to mirror Megatron's `scaled_init_method_normal`.
+  """
+
+  def init_fn(key, shape, dtype, in_axis, out_axis):  # NdInitializer signature
+    del in_axis, out_axis
+    return jax.random.normal(key, shape, dtype) * std
+
+  return init_fn
+
+
 def variable_to_logically_partitioned(variable: nnx.Variable):
   """Wraps an NNX variable's value in `nn.LogicallyPartitioned`.
 

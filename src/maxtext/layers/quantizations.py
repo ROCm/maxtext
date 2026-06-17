@@ -1183,6 +1183,50 @@ class AiterFp8QdqQuantization(Quantization):
     return AiterFp8QdqDotGeneralOp
 
 
+def _fp4_module_context_layer_idx(module_context):
+  """Parse the optional ``#<idx>`` depth tag appended to module_context.
+
+  Returns the integer decoder-layer index threaded in by the per-layer
+  attention/MLP construction, or None when no tag is present (e.g. scanned
+  layers or models that do not thread it) — callers treat None as "no
+  op-level depth gating".
+  """
+  if not module_context:
+    return None
+  m = re.search(r"#(\d+)$", module_context)
+  return int(m.group(1)) if m else None
+
+
+def _fp4_depth_forces_bf16(module_context, is_mlp):
+  """Return True if depth-tail high-precision should force this projection bf16.
+
+  Op-level "attn-only" path: keeps MLP in FP4 but drops attention projections
+  to bf16 in the kept (tail/head) layers. Requires the layer index threaded
+  via the module_context ``#<idx>`` tag. Default-OFF / reversible. Env knobs:
+    AITER_FP4_BF16_TAIL_LAYERS  int, last N decoder layers high-precision (0/unset=off)
+    AITER_FP4_BF16_HEAD_LAYERS  int, first M decoder layers high-precision (0/unset=off)
+    AITER_FP4_NUM_LAYERS        int, total decoder layers (default 32, for tail math)
+    AITER_FP4_BF16_TAIL_SCOPE   'attn' (only attention projections bf16; MLP stays FP4)
+  Note: the 'all' scope (MLP+attn bf16 in the kept layers) is handled more
+  robustly by a per-layer quant swap in decoders.py, not here.
+  """
+  import os
+  scope = os.environ.get("AITER_FP4_BF16_TAIL_SCOPE", "all").lower()
+  if scope != "attn":
+    return False
+  tail = int(os.environ.get("AITER_FP4_BF16_TAIL_LAYERS", "") or 0)
+  head = int(os.environ.get("AITER_FP4_BF16_HEAD_LAYERS", "") or 0)
+  if tail <= 0 and head <= 0:
+    return False
+  layer_idx = _fp4_module_context_layer_idx(module_context)
+  if layer_idx is None or is_mlp:
+    return False
+  nlayers = int(os.environ.get("AITER_FP4_NUM_LAYERS", "32"))
+  in_tail = tail > 0 and layer_idx >= (nlayers - tail)
+  in_head = head > 0 and layer_idx < head
+  return bool(in_tail or in_head)
+
+
 class AiterFp4DotGeneralOp(nn.Module):
   """Drop-in dot_general using AITER FP4 (MXFP4) ASM GEMM.
 
@@ -1247,11 +1291,32 @@ class AiterFp4DotGeneralOp(nn.Module):
     b_bf16 = b_nk.astype(jnp.bfloat16)
 
     fp4_attn = os.environ.get("AITER_FP4_ATTN", "0") == "1"
-    use_fp4 = K % 64 == 0 and ("mlp" in self.module_context or fp4_attn)
+    is_mlp = "mlp" in self.module_context
+    # Depth-tail high-precision (NVFP4 2509.25149): keep the last/first few
+    # decoder layers' ATTENTION projections in bf16 (default-OFF via
+    # AITER_FP4_BF16_TAIL_SCOPE=attn). The 'all' scope is handled by the
+    # per-layer quant swap in decoders.py.
+    force_bf16_depth = _fp4_depth_forces_bf16(self.module_context, is_mlp)
+    use_fp4 = (K % 64 == 0) and (is_mlp or fp4_attn) and not force_bf16_depth
+
+    if os.environ.get("AITER_FP4_LOG_DEPTH", "0") == "1":
+      print(
+          f"FP4_DEPTH: ctx={self.module_context} "
+          f"layer={_fp4_module_context_layer_idx(self.module_context)} "
+          f"is_mlp={is_mlp} force_bf16_depth={force_bf16_depth} use_fp4={use_fp4} "
+          f"M={M} N={N} K={K}"
+      )
 
     if use_fp4:
       from jax_aiter.gemm_fp4 import gemm_fp4_bf16 as aiter_fp4_gemm
       out_2d = aiter_fp4_gemm(a_bf16, b_bf16)
+    elif os.environ.get("AITER_BF16_HIPBLASLT", "0") == "1":
+      # Default-OFF A/B knob (20260616): route the non-FP4 (bf16) attention
+      # projections + logits through XLA lax.dot_general (hipBLASLt) for
+      # fwd+dA+dB, instead of the AITER bf16 ASM custom_vjp. Lets XLA fuse the
+      # transposes and pipeline the GEMMs across the scanned decoder layers.
+      # a_2d[M,K] @ b_nk[N,K]^T -> [M,N] (contract K = axis 1 of both).
+      out_2d = jax.lax.dot_general(a_bf16, b_bf16, (((1,), (1,)), ((), ())))
     else:
       from jax_aiter.gemm import gemm as aiter_gemm
       out_2d = aiter_gemm(a_bf16, b_bf16)
