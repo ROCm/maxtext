@@ -1534,5 +1534,38 @@ class FusedMoeTPUTest(unittest.TestCase):
     self.assertIsNone(bias_updates)
 
 
+@pytest.mark.parametrize("model_name", ["mixtral-8x7b", "mixtral-8x22b", "deepseek3-671b"])
+def test_moe_dispatch_keeps_expert_on_expert_dim(model_name):
+  """Regression guard for the MoE dispatch/MLP expert-parallel sharding.
+
+  The expert (E) dim must always be sharded by the 'expert' mesh axis. When
+  moe_dispatch_no_expert_sharding is set, the batch (B) dim must NOT also take
+  'expert' (which would double-map two tensor dims onto one mesh axis and force an
+  FSDP-style fallback instead of expert-parallel AllToAll). Mirrors dense_matmul's
+  axis selection.
+  """
+  cfg = pyconfig.initialize(
+      [None, get_test_config_path()],
+      run_name=f"moe_shard_{model_name}",
+      enable_checkpointing=False,
+      model_name=model_name,
+  )
+  rules = cfg.logical_axis_rules
+  batch_axis = "activation_batch_no_exp" if cfg.moe_dispatch_no_expert_sharding else "activation_batch_moe"
+  spec = nn_partitioning.logical_to_mesh_axes(("activation_exp", batch_axis, None, "activation_embed_moe"), rules=rules)
+
+  def _as_set(entry):
+    if entry is None:
+      return set()
+    return {entry} if isinstance(entry, str) else set(entry)
+
+  e_axes, b_axes = _as_set(spec[0]), _as_set(spec[1])
+  if cfg.moe_dispatch_no_expert_sharding:
+    # EP enabled: the expert dim must be sharded by 'expert' and the batch dim must not steal it.
+    assert "expert" in e_axes, "expert dim must be sharded by the 'expert' mesh axis"
+    assert "expert" not in b_axes, "with moe_dispatch_no_expert_sharding the batch dim must not take 'expert'"
+  # else: model keeps the default activation_batch_moe; don't assert the (intentional) collision.
+
+
 if __name__ == "__main__":
   unittest.main()
