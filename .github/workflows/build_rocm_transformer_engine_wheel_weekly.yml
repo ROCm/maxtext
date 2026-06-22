@@ -117,16 +117,28 @@ jobs:
           export USE_ROCM=1
           export HIP_PATH=/opt/rocm
           export NVTE_FRAMEWORK=jax
-          export CMAKE_BUILD_PARALLEL_LEVEL=64
           export NVTE_USE_ROCM=1
           export NVTE_FUSED_ATTN_AOTRITON=0
-          export NVTE_BUILD_MAX_JOBS=180
+          # Bound build parallelism
+          NCPU="$(nproc)"
+          if [ "${NCPU}" -gt 200 ]; then
+            BUILD_JOBS=180
+          else
+            BUILD_JOBS=$((NCPU - 10))
+            [ "${BUILD_JOBS}" -lt 1 ] && BUILD_JOBS=1
+          fi
+          echo "Detected ${NCPU} CPUs -> using ${BUILD_JOBS} build jobs"
+          export CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_JOBS}"
+          export NVTE_BUILD_MAX_JOBS="${BUILD_JOBS}"
+
+          # CK-JIT sets CXX to the cxx_interceptor wrapper; aiter's unguarded ABI
+          # probe (`check_compiler_ok_for_platform` -> `[CXX, "-v"]`) then aborts the
+          # build when the wrapper's `-v` exits non-zero. Skip that check.
+          export TORCH_DONT_CHECK_COMPILER_ABI=1
 
           echo "=== Building TE wheel for ${SELECTOR} (gfx=${GFX_ARCH}) ==="
           pushd TransformerEngine >/dev/null
           rm -rf build dist
-          export PYTHONPATH="$(pwd)/3rdparty/hipify_torch${PYTHONPATH:+:${PYTHONPATH}}"
-          export PYTORCH_ROCM_ARCH="${GFX_ARCH}"
           export NVTE_ROCM_ARCH="${GFX_ARCH}"
           python3 setup.py bdist_wheel
           wheel_path="$(
