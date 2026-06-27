@@ -5,7 +5,7 @@ datasets
 flax
 grain[parquet]
 huggingface_hub
-jax==0.9.1
+jax==0.10.0
 jaxtyping
 jsonlines
 ml-collections

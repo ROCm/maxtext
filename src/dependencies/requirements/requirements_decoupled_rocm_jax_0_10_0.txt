@@ -6,10 +6,7 @@ flax
 grain[parquet]
 huggingface_hub
 
-jax==0.9.1
-
-# ROCm JAX wheels
-jax-rocm7-plugin==0.9.1.*
+jax==0.10.0
 
 math-verify
 
