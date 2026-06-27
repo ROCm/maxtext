@@ -14,7 +14,7 @@ jobs:
     # AMD GPU runner (GitHub-hosted large runner label).
     runs-on: linux-x86-64-4gpu-amd
     container:
-      image: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
+      image: ghcr.io/rocm/jax-dev-ubu24.therock-latest:latest
       options: >-
         --device=/dev/kfd --device=/dev/dri --group-add video
         --ipc=host --shm-size 64g
@@ -23,6 +23,9 @@ jobs:
       env:
         XLA_PYTHON_CLIENT_MEM_FRACTION: "0.9"
         NVTE_FUSED_ATTN_AOTRITON: "0"
+        # TheRock perf workarounds: avoid HW queue-mapping + rocprof slowdowns.
+        DEBUG_HIP_DYNAMIC_QUEUES: "0"
+        ROCPROFILER_QUEUE_INTERPOSITION: "0"
     env:
       TE_WHEELS_KEEP_DAYS: "21"
 
@@ -35,25 +38,50 @@ jobs:
         run: |
           set -euo pipefail
           apt-get update
-          apt-get install -y --no-install-recommends git build-essential python3-dev
+          apt-get install -y --no-install-recommends git build-essential python3-dev unzip
           python3 -m pip install -U uv
-          python3 -m uv venv --seed
+          # --system-site-packages so the venv inherits the image's TheRock ROCm SDK (rocm-sdk);
+          # we do NOT install ROCm ourselves.
+          python3 -m uv venv --seed --system-site-packages
           source .venv/bin/activate
           uv pip install -U pip setuptools wheel pybind11 cmake
 
-      - name: Install ROCm JAX/JAXlib wheels (build against CI stack)
+      - name: Install ROCm JAX/JAXlib + plugin wheels (build against CI stack)
         shell: bash
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          uv pip install -r src/dependencies/requirements/requirements_decoupled_rocm_jax_0_9_1.txt
+          # jax/jaxlib (PyPI, pinned in the requirements file).
+          uv pip install -r src/dependencies/requirements/requirements_decoupled_rocm_jax_0_10_0.txt
+          # jax-rocm pjrt/plugin (not pinned in requirements): install from the rocm-jax release zip
+          # (py3 pjrt + cp312 plugin).
+          RJ_URL="https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.10.0/wheelhouse_post1_theRock7.14.zip"
+          curl -fsSL "${RJ_URL}" -o wheelhouse.zip
+          unzip -o -q wheelhouse.zip -d wheelhouse
+          shopt -s globstar nullglob
+          uv pip install --no-deps --force-reinstall \
+            wheelhouse/**/jax_rocm7_pjrt-0.10.0.post1-py3-none-*.whl \
+            wheelhouse/**/jax_rocm7_plugin-0.10.0.post1-cp312-cp312-*.whl
 
       - name: Install PyTorch ROCm (build-time dep for aiter JIT)
         shell: bash
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          uv pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+          # TheRock: install the torch wheel whose +rocm local version matches THIS container's
+          # ROCm SDK build (from `rocm-sdk version`, e.g. 7.14.0a20260624) — no hardcoded torch
+          # version. Discover the matching cp312 wheel on the AMD nightly multi-arch index.
+          ROCM_SDK_VER="$(rocm-sdk version)"
+          INDEX="https://rocm.nightlies.amd.com/whl-multi-arch"
+          # Pick the latest *stable* torch for this ROCm build (PEP440 ordering; skip pre-releases
+          # like aN/rcN since alpha torch can break aiter's cpp_extension JIT). Fall back to absolute
+          # max only if no stable wheel exists. Override by presetting TORCH_VER to pin a known-good one.
+          TORCH_VER="${TORCH_VER:-$(python3 -c 'import re,sys,urllib.request as u,importlib; V=importlib.import_module("pip._vendor.packaging.version").Version; idx,ver=sys.argv[1],sys.argv[2]; html=u.urlopen(idx+"/torch/").read().decode(); vers={V(x) for x in re.findall(r"torch-([0-9][0-9a-z.]*\+rocm"+re.escape(ver)+r")-cp312-cp312-linux_x86_64\.whl", html)}; s=[x for x in vers if not x.is_prerelease]; print((max(s) if s else max(vers)) if vers else "")' "$INDEX" "$ROCM_SDK_VER")}"
+          if [ -z "${TORCH_VER}" ]; then
+            echo "No cp312 torch wheel for rocm ${ROCM_SDK_VER} at ${INDEX}/torch/"; exit 1
+          fi
+          echo "ROCm SDK build ${ROCM_SDK_VER}; installing torch==${TORCH_VER}"
+          uv pip install "torch==${TORCH_VER}" --index-url "${INDEX}/"
 
       - name: Detect ROCm version and Python tag
         shell: bash
@@ -61,9 +89,10 @@ jobs:
           set -euo pipefail
           source .venv/bin/activate
 
-          # Detect ROCm version number from JAX backend string when available (e.g. 'rocm 70200').
-          ROCM_NUM="$([ -f /opt/rocm/.info/version ] && head -n1 /opt/rocm/.info/version | tr -d ' \t\r' || echo unknown)"
-          echo "Detected ROCm version: ${ROCM_NUM}"
+          # TheRock containers don't ship /opt/rocm; the ROCm SDK build is reported by the
+          # rocm-sdk CLI (e.g. 7.14.0a20260624).
+          ROCM_NUM="$(rocm-sdk version 2>/dev/null || echo unknown)"
+          echo "Detected ROCm SDK version: ${ROCM_NUM}"
           echo "ROCM_NUM=${ROCM_NUM}" >> "${GITHUB_ENV}"
 
           PYTAG="cp$(python3 -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
@@ -85,26 +114,13 @@ jobs:
           TE_SHA="$(git rev-parse --short=12 HEAD)"
           echo "TE_SHA=${TE_SHA}" >> "${GITHUB_ENV}"
 
-      - name: Select TE wheel arch for runner (mi300/mi355)
+      - name: Set ROCm arch (mi355)
         shell: bash
         run: |
           set -euo pipefail
-          source .venv/bin/activate
-
-          TE_WHEEL_ARCH="$(python3 .github/workflows/utils/install_te_rocm_wheel.py --print-arch)"
-          echo "Resolved TE wheel arch for runner: ${TE_WHEEL_ARCH}"
-          echo "TE_WHEEL_ARCH=${TE_WHEEL_ARCH}" >> "${GITHUB_ENV}"
-
-          # Build ONLY for the ROCm arch present on this CI runner (mi300 or mi355).
-          if [ "${TE_WHEEL_ARCH}" = "mi355" ]; then
-            SELECTOR="mi355"
-            GFX_ARCH="gfx950"
-          else
-            SELECTOR="mi300"
-            GFX_ARCH="gfx942;gfx941"
-          fi
-          echo "SELECTOR=${SELECTOR}" >> "${GITHUB_ENV}"
-          echo "GFX_ARCH=${GFX_ARCH}" >> "${GITHUB_ENV}"
+          # CI runners are MI355 only (gfx950); no detection needed.
+          echo "SELECTOR=mi355" >> "${GITHUB_ENV}"
+          echo "GFX_ARCH=gfx950" >> "${GITHUB_ENV}"
 
       - name: Build TE wheel
         shell: bash
@@ -115,7 +131,13 @@ jobs:
           chmod +x "${REL_SCRIPT}" || true
 
           export USE_ROCM=1
-          export HIP_PATH=/opt/rocm
+          # TheRock ships ROCm via the rocm-sdk pip package (no /opt/rocm); resolve paths from its CLI.
+          ROCM_PATH="$(rocm-sdk path --root)"
+          export ROCM_PATH
+          export HIP_PATH="${ROCM_PATH}"
+          export HIP_DEVICE_LIB_PATH="${ROCM_PATH}/llvm/amdgcn/bitcode"
+          export CMAKE_PREFIX_PATH="$(rocm-sdk path --cmake)${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
+          export PATH="$(rocm-sdk path --bin):${PATH}"
           export NVTE_FRAMEWORK=jax
           export NVTE_USE_ROCM=1
           export NVTE_FUSED_ATTN_AOTRITON=0

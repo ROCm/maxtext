@@ -187,8 +187,8 @@ jobs:
       decoupled_mode: ${{ contains(inputs.flavor, 'decoupled') }}
       requirements_file: >-
         ${{ fromJSON('{
-            "rocm-unit": "src/dependencies/requirements/requirements_rocm_jax_0_9_1.txt",
-            "rocm-decoupled": "src/dependencies/requirements/requirements_decoupled_rocm_jax_0_9_1.txt"
+            "rocm-unit": "src/dependencies/requirements/requirements_rocm_jax_0_10_0.txt",
+            "rocm-decoupled": "src/dependencies/requirements/requirements_decoupled_rocm_jax_0_10_0.txt"
           }')[inputs.flavor] || '' }}
 
       # Metadata

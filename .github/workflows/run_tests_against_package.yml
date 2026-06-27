@@ -92,11 +92,14 @@ jobs:
     runs-on: ${{ inputs.cloud_runner != '' && inputs.cloud_runner || (inputs.device_type == 'rocm' && fromJson('["self-hosted","linux-x86-64-4gpu-amd"]')) || fromJson(format('["self-hosted", "{0}", "{1}"]', inputs.device_type, inputs.device_name)) }}
     timeout-minutes: ${{ inputs.device_type == 'rocm' && 90 || 360 }}
     container:
-      image: ${{ inputs.device_type == 'rocm' && 'ghcr.io/rocm/jax-base-ubu24.rocm720:latest' || format('gcr.io/{0}/{1}', vars.PROJECT_NAME || 'tpu-prod-env-multipod', inputs.base_image) }}
+      image: ${{ inputs.device_type == 'rocm' && 'ghcr.io/rocm/jax-dev-ubu24.therock-latest:latest' || format('gcr.io/{0}/{1}', vars.PROJECT_NAME || 'tpu-prod-env-multipod', inputs.base_image) }}
       env:
         XLA_PYTHON_CLIENT_MEM_FRACTION: ${{ inputs.xla_python_client_mem_fraction }}
         TF_FORCE_GPU_ALLOW_GROWTH: ${{ inputs.tf_force_gpu_allow_growth }}
         TPU_SKIP_MDS_QUERY: ${{ inputs.device_type == 'cpu' && '1' || '' }}
+        # TheRock perf workarounds (ROCm only): avoid HW queue-mapping + rocprof slowdowns.
+        DEBUG_HIP_DYNAMIC_QUEUES: ${{ inputs.device_type == 'rocm' && '0' || '' }}
+        ROCPROFILER_QUEUE_INTERPOSITION: ${{ inputs.device_type == 'rocm' && '0' || '' }}
         VLLM_TARGET_DEVICE: "tpu"
         UV_TORCH_BACKEND: "cpu"
         # ROCm installs the wheel with --no-deps plus a pinned requirements file; never use TPU wheel extras.
@@ -128,7 +131,12 @@ jobs:
           if [ "${{ inputs.device_type }}" = "rocm" ]; then
             python3 -m pip install -U uv
           fi
-          python3 -m uv venv --seed
+          # ROCm: inherit the image's TheRock ROCm SDK (rocm-sdk) into the venv; never install ROCm.
+          if [ "${{ inputs.device_type }}" = "rocm" ]; then
+            python3 -m uv venv --seed --system-site-packages
+          else
+            python3 -m uv venv --seed
+          fi
           source .venv/bin/activate
           maxtext_wheel=$(ls maxtext-*-py3-none-any.whl 2>/dev/null)
           echo "Installing ${maxtext_wheel} for ${MAXTEXT_PACKAGE_EXTRA}..."
@@ -166,22 +174,22 @@ jobs:
           source .venv/bin/activate
           uv pip install -r ${{ inputs.extra_pip_deps_file }}
 
-      - name: Select ROCm arch (mi300/mi355)
+      - name: Install ROCm JAX plugin + pjrt
         if: ${{ inputs.device_type == 'rocm' }}
         shell: bash
         run: |
+          source .venv/bin/activate
           set -euo pipefail
-          echo "=== ROCm arch selection (from install_te_rocm_wheel.py) ==="
-          if [ -x .venv/bin/python3 ]; then
-            te_arch="$(
-              .venv/bin/python3 .github/workflows/utils/install_te_rocm_wheel.py --print-arch
-            )"
-            echo "[te detect_arch] ${te_arch}"
-            echo "TE_WHEEL_ARCH=${te_arch}" >> "${GITHUB_ENV}"
-          else
-            echo "No .venv python found; skipping arch selection."
-          fi
-          echo "========================================================="
+          # jax-rocm pjrt/plugin are not pinned in requirements (TheRock); fetch them from the
+          # rocm-jax release zip and install the py3 pjrt + cp312 plugin wheels.
+          RJ_URL="https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.10.0/wheelhouse_post1_theRock7.14.zip"
+          command -v unzip >/dev/null || (apt-get update && apt-get install -y --no-install-recommends unzip)
+          curl -fsSL "${RJ_URL}" -o wheelhouse.zip
+          unzip -o -q wheelhouse.zip -d wheelhouse
+          shopt -s globstar nullglob
+          uv pip install --no-deps --force-reinstall \
+            wheelhouse/**/jax_rocm7_pjrt-0.10.0.post1-py3-none-*.whl \
+            wheelhouse/**/jax_rocm7_plugin-0.10.0.post1-cp312-cp312-*.whl
 
       - name: Install Transformer Engine wheel (ROCm)
         if: ${{ inputs.device_type == 'rocm' }}
