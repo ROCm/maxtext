@@ -188,6 +188,7 @@ class DatasetType(str, Enum):
   C4MLPERF = "c4_mlperf"
   OLMO_GRAIN = "olmo_grain"
   MEGATRON = "megatron"
+  MEGATRON_REPLAY = "megatron_replay"
 
 
 class SamplingStrategy(str, Enum):
@@ -649,6 +650,17 @@ class Attention(BaseModel):
   chunk_attn_window_size: NonNegativeInt = Field(0, description="The window size for chunked attention.")
   attn_logits_soft_cap: None | NonNegativeFloat = Field(
       None, description="Soft-cap value for attention logits. None means no cap."
+  )
+  query_pre_attn_scalar: NonNegativeFloat = Field(
+      0.0,
+      description=(
+          "Optional runtime query-pre-attention scalar for the llama-style decoder block. "
+          "0.0 (default) = disabled: keep MaxText's default behavior of folding 1/sqrt(head_dim) "
+          "into the query projection KERNEL at init (depth_scaling). Setting a positive value "
+          "(e.g. head_dim**-0.5 = 1/sqrt(head_dim)) moves that scaling from the WEIGHT to RUNTIME "
+          "(query *= scalar), which is FORWARD-EQUIVALENT but un-inflates the query-weight gradient "
+          "(matches Megatron's runtime query scaling). Default-off; only the llama2 decoder reads it."
+      ),
   )
   use_post_attn_norm: bool = Field(False, description="Apply LayerNorm after the attention block.")
   use_post_ffw_norm: bool = Field(False, description="Apply LayerNorm after the feed-forward block.")
@@ -1293,6 +1305,23 @@ class OlmoGrainDataset(BaseModel):
   olmo_apply_ngram_filter: bool = Field(True, description="Mask repetitive instances per OLMo-core's repetition filter.")
 
 
+class MegatronReplayDataset(BaseModel):
+  """Configuration for the exact-batch replay pipeline (dataset_type=megatron_replay).
+
+  Replays a directory of pre-dumped Megatron/Primus per-step global batches
+  verbatim (input_ids/labels/loss_mask/position_ids stored as .npy with shape
+  (N, GBS, S)), bypassing every data-pipeline difference. Used to separate a
+  MaxText data-pipeline mismatch from an optimizer/update-path mismatch by
+  feeding MaxText the IDENTICAL batches Megatron trained on, in order.
+  """
+
+  megatron_replay_path: PathStr = Field(
+      "",
+      description="Directory containing input_ids.npy/labels.npy/loss_mask.npy/meta.json "
+      "produced by mega_analysis/code/dump_megatron_batches.py.",
+  )
+
+
 class DPO(BaseModel):
   """Configuration for DPO and ORPO preference optimization algorithms."""
 
@@ -1457,6 +1486,23 @@ class TrainingLoop(BaseModel):
   enable_data_shuffling: bool = Field(True, description="Enables shuffling of the training data.")
   data_shuffle_seed: int = Field(0, description="Seed for data shuffling.")
   init_weights_seed: int = Field(0, description="Seed for model weight initialization.")
+  enable_mlperf_logging: bool = Field(
+      False,
+      description="Emit the MLPerf training MLLOG key set (mllog) for compliance checking. No-op if disabled.",
+  )
+  mlperf_log_path: str = Field(
+      "",
+      description="Explicit MLLOG output path; empty => <base_output_directory>/<run_name>/mlperf.log.",
+  )
+  mlperf_submission_org: str = Field("", description="MLPerf submission_org (must be non-empty for a compliant log).")
+  mlperf_submission_platform: str = Field(
+      "", description="MLPerf submission_platform (must be non-empty for a compliant log)."
+  )
+  mlperf_submission_division: str = Field("closed", description="MLPerf submission_division: 'closed' or 'open'.")
+  mlperf_submission_benchmark: str = Field("llama31_8b", description="MLPerf submission_benchmark name.")
+  mlperf_lowest_precision_linear: str = Field(
+      "", description="Optional MLPerf lowest_numerical_precision_in_linear value (empty => not emitted)."
+  )
 
 
 class ManifoldConstrainedHyperConnections(BaseModel):
@@ -2391,6 +2437,7 @@ class MaxTextConfig(
     HfDataset,
     GrainDataset,
     OlmoGrainDataset,
+    MegatronReplayDataset,
     Tokenizer,
     # Inference
     InferenceGeneral,

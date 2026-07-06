@@ -30,6 +30,7 @@ from maxtext.utils.globals import EPS
 from maxtext.common.gcloud_stub import mldiagnostics_modules
 from maxtext.common.gcloud_stub import workload_monitor
 from maxtext.common.managed_mldiagnostics import ManagedMLDiagnostics
+from maxtext.common.mlperf_logger import MLPerfLogger
 from maxtext.utils import exceptions
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
@@ -107,6 +108,10 @@ class MetricLogger:
     # Number of eval steps accumulated since the last reset_eval_metrics(). Used by
     # buffer_and_write_metrics to detect the eval→train transition and trigger finalization.
     self._pending_eval_step_count = 0
+    # Optional MLPerf-compliance MLLOG emitter (default-off; no-op unless enabled).
+    self._last_train_step = 0
+    self.mlperf = MLPerfLogger(config)
+    self.mlperf.log_init()
     if self.config.managed_mldiagnostics:
       ManagedMLDiagnostics(config)  # Initialize the MLRun instance.
 
@@ -203,6 +208,18 @@ class MetricLogger:
       mtp_loss = scalars.get("learning/mtp_loss", 0.0)
       log_parts.append(f"main_model_loss: {loss - mtp_loss:.3f}")
       log_parts.append(f"mtp_loss: {mtp_loss:.3f}")
+
+    # Per-step optimizer diagnostics on the console (grad-norm/clip/param-norm A/B
+    # vs Megatron). Normally TB-only; surfaced here so runs without tfevents can be
+    # parsed from train.log. Keys set in trainers/pre_train/train.py:522-528.
+    for _k, _lbl in (
+        ("learning/raw_grad_norm", "raw_grad_norm"),
+        ("learning/grad_norm", "grad_norm"),
+        ("learning/param_norm", "param_norm"),
+        ("learning/current_learning_rate", "lr"),
+    ):
+      if _k in scalars:
+        log_parts.append(f"{_lbl}: {float(scalars[_k]):.6f}")
 
     max_logging.log(", ".join(log_parts))
 
@@ -424,6 +441,8 @@ class MetricLogger:
 
   def record_train_metrics(self, metrics, step, step_time):
     """Records training metrics for the current step."""
+    self._last_train_step = step
+    self.mlperf.maybe_start_run()
     metrics["scalar"].update({"perf/step_time_seconds": step_time})
     metrics["scalar"].update({"learning/current_learning_rate": self.learning_rate_schedule(step)})
     if step >= self.config.rampup_end_step:
@@ -453,7 +472,9 @@ class MetricLogger:
 
     self.write_metrics(self.cumulative_eval_metrics, train_step, metric_type="eval")
     self._pending_eval_step_count = 0
+    self.mlperf.log_eval(train_step, eval_loss)
     if self.config.target_eval_loss and eval_loss <= self.config.target_eval_loss:
+      self.mlperf.log_run_stop(success=True, train_step=train_step)
       raise exceptions.StopTraining(f"Target loss {self.config.target_eval_loss=} is achieved.")
 
   def flush_metrics_and_cleanup(self):
@@ -466,5 +487,9 @@ class MetricLogger:
     for entry in self.buffered_metrics:
       self._flush_one_buffered_entry(entry)
     self.buffered_metrics = []
+
+    # Fallback run_stop (ABORTED) for runs that end without hitting target_eval_loss;
+    # no-op if a SUCCESS run_stop was already emitted at target.
+    self.mlperf.log_run_stop(success=False, train_step=self._last_train_step)
 
     max_utils.close_summary_writer(self.writer)
