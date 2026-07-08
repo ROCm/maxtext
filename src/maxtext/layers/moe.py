@@ -621,8 +621,9 @@ class RoutedMoE(nnx.Module):
     ):
       from maxtext.integration.flydsl import moe_bridge  # local import: optional dep
 
+      _, fly_jnp = moe_bridge.fly_compute_dtype(self.dtype)
       w1_shuffled, w2_shuffled = moe_bridge.preshuffle_expert_weights(
-          self.wi_0.value, self.wi_1.value, self.wo.value
+          self.wi_0.value, self.wi_1.value, self.wo.value, dtype=fly_jnp
       )
       self.wi_fly_w1 = nnx.Param(w1_shuffled)
       self.wi_fly_w2 = nnx.Param(w2_shuffled)
@@ -2197,7 +2198,11 @@ class RoutedMoE(nnx.Module):
       w1_kernel,
       wo_kernel,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
-    """Inference-only bf16 routed-MoE via the FlyDSL ROCm 2-stage grouped GEMM."""
+    """Inference-only routed-MoE via the FlyDSL ROCm 2-stage grouped GEMM.
+
+    Compute dtype follows self.dtype: float16 -> fp16 MFMA path (comparable to the
+    hipBLASLt grouped-gemm baseline), otherwise bf16.
+    """
     from maxtext.integration.flydsl import moe_bridge
 
     # Offline-preshuffled weights when available, else None (bridge shuffles inline).

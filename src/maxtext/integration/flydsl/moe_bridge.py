@@ -14,18 +14,29 @@ import jax
 import jax.numpy as jnp
 
 
+def fly_compute_dtype(out_dtype) -> tuple[str, Any]:
+  """Map a MaxText dtype to the FlyDSL MoE compute dtype: ('fp16'|'bf16', jnp dtype).
+
+  fp16 uses the hipBLASLt-comparable f16 MFMA path; anything else -> bf16.
+  """
+  if jnp.dtype(out_dtype) == jnp.float16:
+    return "fp16", jnp.float16
+  return "bf16", jnp.bfloat16
+
+
 def preshuffle_expert_weights(
     wi_0: jax.Array,
     wi_1: jax.Array,
     wo: jax.Array,
+    dtype=jnp.bfloat16,
 ) -> tuple[jax.Array, jax.Array]:
-  """MaxText expert weights -> FlyDSL (w1_shuffled, w2_shuffled), bf16."""
+  """MaxText expert weights -> FlyDSL (w1_shuffled, w2_shuffled) in `dtype`."""
   from flydsl_moe.preshuffle import make_w1_shuffled, make_w2_shuffled
-  wi_0 = wi_0.astype(jnp.bfloat16)
-  wi_1 = wi_1.astype(jnp.bfloat16)
-  wo = wo.astype(jnp.bfloat16)
-  w1_shuffled = make_w1_shuffled(wi_0, wi_1).astype(jnp.bfloat16)
-  w2_shuffled = make_w2_shuffled(wo).astype(jnp.bfloat16)
+  wi_0 = wi_0.astype(dtype)
+  wi_1 = wi_1.astype(dtype)
+  wo = wo.astype(dtype)
+  w1_shuffled = make_w1_shuffled(wi_0, wi_1).astype(dtype)
+  w2_shuffled = make_w2_shuffled(wo).astype(dtype)
   return w1_shuffled, w2_shuffled
 
 
@@ -92,12 +103,14 @@ def flydsl_routed_moe(
   """
   from flydsl_moe.block import moe_block_fly_bf16_atomic, moe_sort_jax, pick_tile_m
 
+  compute_dtype, compute_jnp = fly_compute_dtype(out_dtype)
+
   *lead_shape, model_dim = inputs.shape
   tokens = int(math.prod(lead_shape))
   if inter_dim is None:
     inter_dim = int(w0_kernel.shape[-1])
 
-  x = inputs.reshape(tokens, model_dim).astype(jnp.bfloat16)
+  x = inputs.reshape(tokens, model_dim).astype(compute_jnp)
   topk_ids = top_k_indices.reshape(tokens, num_experts_per_tok).astype(jnp.int32)
   topk_weights = top_k_weights.reshape(tokens, num_experts_per_tok).astype(jnp.float32)
 
@@ -110,7 +123,9 @@ def flydsl_routed_moe(
   )
 
   if w1_shuffled is None or w2_shuffled is None:
-    w1_shuffled, w2_shuffled = preshuffle_expert_weights(w0_kernel, w1_kernel, wo_kernel)
+    w1_shuffled, w2_shuffled = preshuffle_expert_weights(
+        w0_kernel, w1_kernel, wo_kernel, dtype=compute_jnp
+    )
 
   out = moe_block_fly_bf16_atomic(
       x,
@@ -125,5 +140,6 @@ def flydsl_routed_moe(
       num_experts=num_experts,
       topk=num_experts_per_tok,
       tile_m=tile_m,
+      compute_dtype=compute_dtype,
   )
   return out.reshape(*lead_shape, model_dim).astype(out_dtype)
