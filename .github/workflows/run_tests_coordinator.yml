@@ -30,7 +30,9 @@ on:
             gpu-unit, gpu-integration,
             cpu-unit,
             cpu-post-training-unit,
-            cpu-torch-reference
+            cpu-torch-reference,
+            rocm-unit,
+            rocm-decoupled
           )
         required: true
         type: string
@@ -124,7 +126,9 @@ jobs:
           "gpu-integration": "cuda12",
           "cpu-unit": "cpu",
           "cpu-post-training-unit": "cpu",
-          "cpu-torch-reference": "cpu"
+          "cpu-torch-reference": "cpu",
+          "rocm-unit": "rocm",
+          "rocm-decoupled": "rocm"
         }')[inputs.flavor] }}
 
       device_name: >-
@@ -141,7 +145,9 @@ jobs:
           "gpu-integration": "a100-40gb-4",
           "cpu-unit": "X64",
           "cpu-post-training-unit": "X64",
-          "cpu-torch-reference": "X64"
+          "cpu-torch-reference": "X64",
+          "rocm-unit": "mi355",
+          "rocm-decoupled": "mi355"
         }')[inputs.flavor] }}
 
       cloud_runner: >-
@@ -158,7 +164,9 @@ jobs:
           "gpu-integration": "linux-x86-a2-48-a100-4gpu",
           "cpu-unit": "linux-x86-n2-32",
           "cpu-post-training-unit": "linux-x86-n2-32",
-          "cpu-torch-reference": "linux-x86-n2-32"
+          "cpu-torch-reference": "linux-x86-n2-32",
+          "rocm-unit": "amd-do-linux.jax.gpu.gfx950.4",
+          "rocm-decoupled": "amd-do-linux.jax.gpu.gfx950.4"
         }')[inputs.flavor] }}
       # Pytest Marker Mapping
       pytest_marker: >-
@@ -175,7 +183,9 @@ jobs:
             "gpu-integration": "not cpu_only and not tpu_only and integration_test and not post_training",
             "cpu-unit": "cpu_only and not post_training",
             "cpu-post-training-unit": "cpu_only and post_training",
-            "cpu-torch-reference": "not post_training"
+            "cpu-torch-reference": "not post_training",
+            "rocm-unit": "not cpu_only and not tpu_only and not post_training and not decoupled",
+            "rocm-decoupled": "not cpu_only and not tpu_only and not post_training and decoupled"
           }')[inputs.flavor] }}
 
       pytest_addopts: >-
@@ -192,7 +202,9 @@ jobs:
             "gpu-integration": "",
             "cpu-unit": "",
             "cpu-post-training-unit": "tests/post_training/unit tests/unit",
-            "cpu-torch-reference": ""
+            "cpu-torch-reference": "",
+            "rocm-unit": "",
+            "rocm-decoupled": ""
           }')[inputs.flavor] }}
 
       pytest_extra_args: >-
@@ -209,18 +221,44 @@ jobs:
             "gpu-integration": "--ignore=tests/post_training",
             "cpu-unit": "--ignore=tests/post_training",
             "cpu-post-training-unit": "",
-            "cpu-torch-reference": "-o addopts= -rf --import-mode=importlib --strict-markers tests/unit/gemma4_layers_test.py tests/unit/gemma4_small_layers_test.py tests/unit/qwen3_next_vs_reference_test.py tests/unit/qwen3_5_layers_test.py tests/unit/qwen3_omni_layers_test.py"
+            "cpu-torch-reference": "-o addopts= -rf --import-mode=importlib --strict-markers tests/unit/gemma4_layers_test.py tests/unit/gemma4_small_layers_test.py tests/unit/qwen3_next_vs_reference_test.py tests/unit/qwen3_5_layers_test.py tests/unit/qwen3_omni_layers_test.py",
+            "rocm-unit": "--ignore=tests/post_training",
+            "rocm-decoupled": "--ignore=tests/post_training"
           }')[inputs.flavor] }}
         ${{ inputs.additional_pytest_args }}
 
       # Resource Scaling
-      xla_python_client_mem_fraction: "${{ contains(inputs.flavor, 'gpu') && '0.65' || '0.75' }}"
-      tf_force_gpu_allow_growth: "${{ contains(inputs.flavor, 'gpu') && 'true' || 'false' }}"
+      xla_python_client_mem_fraction: >-
+        ${{ fromJSON('{
+            "gpu-unit": "0.65",
+            "gpu-integration": "0.65",
+            "rocm-unit": "0.9",
+            "rocm-decoupled": "0.9"
+          }')[inputs.flavor] || '0.75' }}
+
+      tf_force_gpu_allow_growth: >-
+        ${{ fromJSON('{
+            "gpu-unit": "true",
+            "gpu-integration": "true",
+            "rocm-unit": "true",
+            "rocm-decoupled": "true"
+          }')[inputs.flavor] || 'false' }}
 
       container_resource_option: >-
-        ${{ contains(inputs.flavor, 'gpu')
-            && '--shm-size 2g --runtime=nvidia --gpus all --privileged'
-            || '--privileged' }}
+        ${{ fromJSON('{
+            "gpu-unit": "--shm-size 2g --runtime=nvidia --gpus all --privileged",
+            "gpu-integration": "--shm-size 2g --runtime=nvidia --gpus all --privileged",
+            "rocm-unit": "--device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --shm-size 64G --env-file /etc/podinfo/gha-gpu-isolation-settings",
+            "rocm-decoupled": "--device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --shm-size 64G --env-file /etc/podinfo/gha-gpu-isolation-settings"
+          }')[inputs.flavor] || '--privileged' }}
+
+      # ROCm-specific parameters
+      decoupled_mode: ${{ contains(inputs.flavor, 'decoupled') }}
+      requirements_file: >-
+        ${{ fromJSON('{
+            "rocm-unit": "src/dependencies/requirements/requirements_rocm_jax_0_10_0.txt",
+            "rocm-decoupled": "src/dependencies/requirements/requirements_decoupled_rocm_jax_0_10_0.txt"
+          }')[inputs.flavor] || '' }}
 
       # Metadata
       base_image: ${{ inputs.base_image }}
