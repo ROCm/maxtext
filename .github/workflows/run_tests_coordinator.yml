@@ -29,7 +29,9 @@ on:
             tpu7x-post-training-unit, tpu7x-post-training-integration,
             gpu-unit, gpu-integration,
             cpu-unit,
-            cpu-post-training-unit
+            cpu-post-training-unit,
+            rocm-unit,
+            rocm-decoupled
           )
         required: true
         type: string
@@ -123,7 +125,9 @@ jobs:
           "gpu-unit": "cuda12",
           "gpu-integration": "cuda12",
           "cpu-unit": "cpu",
-          "cpu-post-training-unit": "cpu"
+          "cpu-post-training-unit": "cpu",
+          "rocm-unit": "rocm",
+          "rocm-decoupled": "rocm"
         }')[inputs.flavor] }}
 
       device_name: >-
@@ -139,7 +143,9 @@ jobs:
           "gpu-unit": "a100-40gb-4",
           "gpu-integration": "a100-40gb-4",
           "cpu-unit": "X64",
-          "cpu-post-training-unit": "X64"
+          "cpu-post-training-unit": "X64",
+          "rocm-unit": "mi355",
+          "rocm-decoupled": "mi355"
         }')[inputs.flavor] }}
 
       cloud_runner: >-
@@ -155,9 +161,17 @@ jobs:
           "gpu-unit": "linux-x86-a2-48-a100-4gpu",
           "gpu-integration": "linux-x86-a2-48-a100-4gpu",
           "cpu-unit": "linux-x86-n2-32",
-          "cpu-post-training-unit": "linux-x86-n2-32"
+          "cpu-post-training-unit": "linux-x86-n2-32",
+          "rocm-unit": "amd-do-linux.jax.gpu.gfx950.4",
+          "rocm-decoupled": "amd-do-linux.jax.gpu.gfx950.4"
         }')[inputs.flavor] }}
       # Pytest Marker Mapping
+      # The rocm flavors omit `not cpu_only` on purpose. conftest auto-marks every test without an
+      # explicit hardware marker as cpu_only, which leaves that bulk to the cpu-unit job — and
+      # ROCM_ONLY disables cpu-unit, so excluding it here would cut the fork's only test job down to
+      # the handful of explicitly gpu_only tests. Collecting them is only half of it: conftest's
+      # handle_cpu_only fixture skips cpu_only tests on an accelerator and exempts ROCm for the same
+      # reason. Do not "align" these with the siblings.
       pytest_marker: >-
         ${{ fromJSON('{
             "tpu-unit": "not cpu_only and not gpu_only and not integration_test and not post_training",
@@ -171,7 +185,9 @@ jobs:
             "gpu-unit": "not cpu_only and not tpu_only and not integration_test and not post_training",
             "gpu-integration": "not cpu_only and not tpu_only and integration_test and not post_training",
             "cpu-unit": "cpu_only and not post_training",
-            "cpu-post-training-unit": "cpu_only and post_training"
+            "cpu-post-training-unit": "cpu_only and post_training",
+            "rocm-unit": "not tpu_only and not post_training and not decoupled",
+            "rocm-decoupled": "not tpu_only and not post_training and decoupled"
           }')[inputs.flavor] }}
 
       pytest_addopts: >-
@@ -187,9 +203,18 @@ jobs:
             "gpu-unit": "",
             "gpu-integration": "",
             "cpu-unit": "",
-            "cpu-post-training-unit": "tests/post_training/unit tests/unit"
+            "cpu-post-training-unit": "tests/post_training/unit tests/unit",
+            "rocm-unit": "",
+            "rocm-decoupled": ""
           }')[inputs.flavor] }}
 
+      # The rocm --deselect covers a test that cannot pass here for a reason unrelated to ROCm, and
+      # should go once the test itself is fixed: compile_cache asserts JAX wrote a persistent cache
+      # entry, but JAX skips compilations faster than jax_persistent_cache_min_compile_time_secs
+      # (1s) and this host compiles that deliberately tiny model in ~0.7s. Setting the threshold
+      # job-wide is not an option, since base.yml enables a cache dir by default and every test
+      # would start writing entries. It runs its subprocess under JAX_PLATFORMS=cpu, so it covers no
+      # ROCm code and deselecting it costs nothing.
       pytest_extra_args: >-
         ${{ fromJSON('{
             "tpu-unit": "--ignore=tests/post_training",
@@ -203,18 +228,45 @@ jobs:
             "gpu-unit": "--ignore=tests/post_training",
             "gpu-integration": "--ignore=tests/post_training",
             "cpu-unit": "--ignore=tests/post_training",
-            "cpu-post-training-unit": ""
+            "cpu-post-training-unit": "",
+            "rocm-unit": "--ignore=tests/post_training --deselect tests/unit/compile_cache_test.py::test_train_step_cache_hit",
+            "rocm-decoupled": "--ignore=tests/post_training --deselect tests/unit/compile_cache_test.py::test_train_step_cache_hit"
           }')[inputs.flavor] }}
         ${{ inputs.additional_pytest_args }}
 
       # Resource Scaling
-      xla_python_client_mem_fraction: "${{ contains(inputs.flavor, 'gpu') && '0.65' || '0.75' }}"
-      tf_force_gpu_allow_growth: "${{ contains(inputs.flavor, 'gpu') && 'true' || 'false' }}"
+      xla_python_client_mem_fraction: >-
+        ${{ fromJSON('{
+            "gpu-unit": "0.65",
+            "gpu-integration": "0.65",
+            "rocm-unit": "0.9",
+            "rocm-decoupled": "0.9"
+          }')[inputs.flavor] || '0.75' }}
 
+      tf_force_gpu_allow_growth: >-
+        ${{ fromJSON('{
+            "gpu-unit": "true",
+            "gpu-integration": "true",
+            "rocm-unit": "true",
+            "rocm-decoupled": "true"
+          }')[inputs.flavor] || 'false' }}
+
+      # The ROCm options mirror jax-ml/jax's pytest_rocm.yml and deliberately omit --privileged:
+      # the env-file gives each job its own GPU isolation, which --privileged would defeat.
       container_resource_option: >-
-        ${{ contains(inputs.flavor, 'gpu')
+        ${{ contains(inputs.flavor, 'rocm')
+            && '--init --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --shm-size 64G --env-file /etc/podinfo/gha-gpu-isolation-settings'
+            || contains(inputs.flavor, 'gpu')
             && '--init --shm-size 2g --runtime=nvidia --gpus all --privileged'
             || '--init --privileged' }}
+
+      # ROCm-specific parameters
+      decoupled_mode: ${{ contains(inputs.flavor, 'decoupled') }}
+      requirements_file: >-
+        ${{ fromJSON('{
+            "rocm-unit": "src/dependencies/requirements/base_requirements/rocm-requirements.txt",
+            "rocm-decoupled": "src/dependencies/requirements/generated_requirements/decoupled-requirements.txt"
+          }')[inputs.flavor] || '' }}
 
       # Metadata
       base_image: ${{ inputs.base_image }}
