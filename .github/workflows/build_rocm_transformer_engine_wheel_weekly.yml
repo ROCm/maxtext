@@ -1,0 +1,234 @@
+name: Build ROCm TransformerEngine wheel (weekly)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly at night (02:00 UTC every Monday), 2 hours ahead of scheduled tests.
+    - cron: "0 2 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  build_upload_prune:
+    # AMD GPU runner (GitHub-hosted large runner label).
+    runs-on: amd-do-linux.jax.gpu.gfx950.4
+    container:
+      image: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+      # Per-job GPU isolation on the shared gfx950 runners is via the podinfo env-file (mirrors
+      # jax-ml/jax's pytest_rocm.yml); do NOT use --privileged, which would defeat that isolation.
+      options: >-
+        --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined
+        --group-add video --shm-size 64G
+        --env-file /etc/podinfo/gha-gpu-isolation-settings
+      env:
+        XLA_PYTHON_CLIENT_MEM_FRACTION: "0.9"
+        NVTE_FUSED_ATTN_AOTRITON: "0"
+        # TheRock perf workarounds: avoid HW queue-mapping + rocprof slowdowns.
+        DEBUG_HIP_DYNAMIC_QUEUES: "0"
+        ROCPROFILER_QUEUE_INTERPOSITION: "0"
+    env:
+      TE_WHEELS_KEEP_DAYS: "21"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup build environment (deps + venv)
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git build-essential python3-dev unzip
+          python3 -m pip install -U uv
+          # --system-site-packages so the venv inherits the image's TheRock ROCm SDK (rocm-sdk);
+          # we do NOT install ROCm ourselves.
+          python3 -m uv venv --seed --system-site-packages
+          source .venv/bin/activate
+          uv pip install -U pip setuptools wheel pybind11 cmake
+
+      - name: Install ROCm JAX/JAXlib + plugin wheels (build against CI stack)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          # jax/jaxlib (PyPI, pinned in the requirements file).
+          uv pip install -r src/dependencies/requirements/requirements_decoupled_rocm_jax_0_10_0.txt
+          # jax-rocm pjrt/plugin (TheRock 7.14.0 GA; resolved from the GA
+          # multi-arch index; must match the container's ROCm SDK build).
+          uv pip install --no-deps --force-reinstall \
+            --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "jax-rocm7-pjrt==0.10.0+rocm7.14.0" "jax-rocm7-plugin==0.10.0+rocm7.14.0"
+
+      - name: Install PyTorch ROCm (build-time dep for aiter JIT)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          # TheRock: install the torch wheel whose +rocm local version matches THIS container's
+          # ROCm SDK build (from `rocm-sdk version`, e.g. 7.14.0) — no hardcoded torch version.
+          # Discover the matching cp312 wheel on the AMD GA multi-arch index (same index as
+          # the jax-rocm pjrt/plugin, so torch and the ROCm SDK stay on the same rc build).
+          ROCM_SDK_VER="$(rocm-sdk version)"
+          INDEX="https://repo.amd.com/rocm/whl-multi-arch"
+          # Pick the latest *stable* torch for this ROCm build (PEP440 ordering; skip pre-releases
+          # like aN/rcN since alpha torch can break aiter's cpp_extension JIT). Fall back to absolute
+          # max only if no stable wheel exists. Override by presetting TORCH_VER to pin a known-good one.
+          TORCH_VER="${TORCH_VER:-$(python3 -c 'import re,sys,urllib.request as u,importlib; V=importlib.import_module("pip._vendor.packaging.version").Version; idx,ver=sys.argv[1],sys.argv[2]; html=u.urlopen(idx+"/torch/").read().decode(); vers={V(x) for x in re.findall(r"torch-([0-9][0-9a-z.]*\+rocm"+re.escape(ver)+r")-cp312-cp312-linux_x86_64\.whl", html)}; s=[x for x in vers if not x.is_prerelease]; print((max(s) if s else max(vers)) if vers else "")' "$INDEX" "$ROCM_SDK_VER")}"
+          if [ -z "${TORCH_VER}" ]; then
+            echo "No cp312 torch wheel for rocm ${ROCM_SDK_VER} at ${INDEX}/torch/"; exit 1
+          fi
+          echo "ROCm SDK build ${ROCM_SDK_VER}; installing torch==${TORCH_VER}"
+          uv pip install "torch==${TORCH_VER}" --index-url "${INDEX}/"
+
+      - name: Detect ROCm version and Python tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+
+          # TheRock containers don't ship /opt/rocm; the ROCm SDK build is reported by the
+          # rocm-sdk CLI (e.g. 7.14.0a20260624).
+          ROCM_NUM="$(rocm-sdk version 2>/dev/null || echo unknown)"
+          echo "Detected ROCm SDK version: ${ROCM_NUM}"
+          echo "ROCM_NUM=${ROCM_NUM}" >> "${GITHUB_ENV}"
+
+          PYTAG="cp$(python3 -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
+          if [ "${PYTAG}" != "cp312" ]; then
+            echo "Expected Python 3.12 (cp312) for ROCm CI wheels, got ${PYTAG}."
+            exit 1
+          fi
+          echo "PYTAG=${PYTAG}" >> "${GITHUB_ENV}"
+          echo "REL_SCRIPT=.github/workflows/utils/te_wheels_release.py" >> "${GITHUB_ENV}"
+
+      - name: Clone ROCm/TransformerEngine (dev)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf TransformerEngine
+          git clone --recursive --branch dev https://github.com/ROCm/TransformerEngine.git
+          cd TransformerEngine
+          git submodule update --init --recursive
+          TE_SHA="$(git rev-parse --short=12 HEAD)"
+          echo "TE_SHA=${TE_SHA}" >> "${GITHUB_ENV}"
+
+      - name: Set ROCm arch (mi355)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # CI runners are MI355 only (gfx950); no detection needed.
+          echo "SELECTOR=mi355" >> "${GITHUB_ENV}"
+          echo "GFX_ARCH=gfx950" >> "${GITHUB_ENV}"
+
+      - name: Build TE wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+
+          chmod +x "${REL_SCRIPT}" || true
+
+          export USE_ROCM=1
+          # TheRock ships ROCm via the rocm-sdk pip package (no /opt/rocm); resolve paths from its CLI.
+          ROCM_PATH="$(rocm-sdk path --root)"
+          export ROCM_PATH
+          export HIP_PATH="${ROCM_PATH}"
+          export HIP_DEVICE_LIB_PATH="${ROCM_PATH}/llvm/amdgcn/bitcode"
+          export CMAKE_PREFIX_PATH="$(rocm-sdk path --cmake)${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
+          export PATH="$(rocm-sdk path --bin):${PATH}"
+          export NVTE_FRAMEWORK=jax
+          export NVTE_USE_ROCM=1
+          export NVTE_FUSED_ATTN_AOTRITON=0
+          # Bound build parallelism
+          NCPU="$(nproc)"
+          if [ "${NCPU}" -gt 200 ]; then
+            BUILD_JOBS=180
+          else
+            BUILD_JOBS=$((NCPU - 10))
+            [ "${BUILD_JOBS}" -lt 1 ] && BUILD_JOBS=1
+          fi
+          echo "Detected ${NCPU} CPUs -> using ${BUILD_JOBS} build jobs"
+          export CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_JOBS}"
+          export NVTE_BUILD_MAX_JOBS="${BUILD_JOBS}"
+
+          # CK-JIT sets CXX to the cxx_interceptor wrapper; aiter's unguarded ABI
+          # probe (`check_compiler_ok_for_platform` -> `[CXX, "-v"]`) then aborts the
+          # build when the wrapper's `-v` exits non-zero. Skip that check.
+          export TORCH_DONT_CHECK_COMPILER_ABI=1
+
+          echo "=== Building TE wheel for ${SELECTOR} (gfx=${GFX_ARCH}) ==="
+          pushd TransformerEngine >/dev/null
+          rm -rf build dist
+          export NVTE_ROCM_ARCH="${GFX_ARCH}"
+          python3 setup.py bdist_wheel
+          wheel_path="$(
+            python3 -c 'import glob; m=sorted(glob.glob("dist/transformer_engine-*.whl")); print(m[0] if m else "")'
+          )"
+          if [ -z "${wheel_path}" ]; then
+            echo "No wheel produced in dist/ (selector=${SELECTOR})."
+            exit 1
+          fi
+          wheel_base="$(basename "${wheel_path}")"
+          if [[ "${wheel_base}" == *"-1.${SELECTOR}-${PYTAG}-${PYTAG}-linux_x86_64.whl" ]]; then
+            asset_name="${wheel_base}"
+          else
+            asset_name="${wheel_base/-${PYTAG}-${PYTAG}-linux_x86_64.whl/-1.${SELECTOR}-${PYTAG}-${PYTAG}-linux_x86_64.whl}"
+            if [ "${asset_name}" = "${wheel_base}" ]; then
+              echo "Failed to rename wheel for selector=${SELECTOR}: ${wheel_base}"
+              exit 1
+            fi
+          fi
+          cp -f "${wheel_path}" "../${asset_name}"
+          popd >/dev/null
+
+          ls -lh "${asset_name}"
+          echo "TE_WHEEL_FILE=${asset_name}" >> "${GITHUB_ENV}"
+
+      - name: Upload wheel to rolling release tag (te-rocm-wheels)
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python3 "${REL_SCRIPT}" upload --no-prerelease --tag "te-rocm-wheels" --title "ROCm TransformerEngine wheels (latest)" --body "Rolling release for latest weekly-built ROCm TransformerEngine wheels used by CI." --file "${TE_WHEEL_FILE}"
+
+      - name: Prune old assets from rolling tag
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          echo "Pruning rolling-tag assets older than ${TE_WHEELS_KEEP_DAYS} days"
+          python3 "${REL_SCRIPT}" prune-assets --tag "te-rocm-wheels" --keep-days "${TE_WHEELS_KEEP_DAYS}"
+
+      - name: Publish wheel to dated weekly release tag
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+
+          DATE_UTC="$(date -u +%Y-%m-%d)"
+          WEEKLY_TAG="te-rocm-wheels-${DATE_UTC}-${TE_SHA}"
+          WEEKLY_TITLE="ROCm TransformerEngine wheels ${DATE_UTC} (TE ${TE_SHA})"
+          # Keep this YAML-safe (no unindented heredocs inside `run: |`).
+          WEEKLY_BODY="$(
+            printf '%s\n\nROCm: %s\nPython: %s\nArch: %s (gfx=%s)\n' \
+              "Built from ROCm/TransformerEngine dev @ ${TE_SHA} on ${DATE_UTC}." \
+              "${ROCM_NUM}" "${PYTAG}" "${SELECTOR}" "${GFX_ARCH}"
+          )"
+
+          python3 "${REL_SCRIPT}" upload --no-prerelease --tag "${WEEKLY_TAG}" --title "${WEEKLY_TITLE}" --body "${WEEKLY_BODY}" --file "${TE_WHEEL_FILE}"
+
+      - name: Prune old weekly releases
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          echo "Pruning weekly release pages older than ${TE_WHEELS_KEEP_DAYS} days"
+          python3 "${REL_SCRIPT}" prune-releases --prefix "te-rocm-wheels-" --keep-days "${TE_WHEELS_KEEP_DAYS}"
