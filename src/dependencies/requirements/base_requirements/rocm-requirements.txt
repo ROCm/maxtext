@@ -1,0 +1,12 @@
+-r requirements.txt
+# jax is pinned here rather than resolved from a generated lock because seed-env has no ROCm
+# hardware target. It must equal the jax-rocm7-pjrt/plugin version built against the ROCm SDK the
+# container ships, so bump it and those wheels together.
+jax==0.10.0
+# TensorFlow 2.20 and the ROCm JAX stack cannot share a process: it aborts the interpreter when
+# imported first and breaks RCCL when imported second, so no collective survives. tensorflow-text
+# follows TensorFlow, and tensorflow-metadata is held back because 2.19 requires protobuf < 6
+# while newer metadata ships protos that only load on protobuf 6.
+tensorflow<2.20
+tensorflow-text<2.20
+tensorflow-metadata<1.17
