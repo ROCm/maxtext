@@ -14,7 +14,7 @@ jobs:
     # AMD GPU runner (GitHub-hosted large runner label).
     runs-on: amd-do-linux.jax.gpu.gfx950.4
     container:
-      image: ghcr.io/rocm/jax-dev-ubu24.therock-7.14.0rc3:latest
+      image: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
       # Per-job GPU isolation on the shared gfx950 runners is via the podinfo env-file (mirrors
       # jax-ml/jax's pytest_rocm.yml); do NOT use --privileged, which would defeat that isolation.
       options: >-
@@ -54,11 +54,11 @@ jobs:
           source .venv/bin/activate
           # jax/jaxlib (PyPI, pinned in the requirements file).
           uv pip install -r src/dependencies/requirements/requirements_decoupled_rocm_jax_0_10_0.txt
-          # jax-rocm pjrt/plugin (TheRock 7.14.0rc3 prerelease; resolved from the prerelease
+          # jax-rocm pjrt/plugin (TheRock 7.14.0 GA; resolved from the GA
           # multi-arch index; must match the container's ROCm SDK build).
           uv pip install --no-deps --force-reinstall \
-            --index-url https://rocm.prereleases.amd.com/whl-multi-arch/ \
-            "jax-rocm7-pjrt==0.10.0+rocm7.14.0rc3" "jax-rocm7-plugin==0.10.0+rocm7.14.0rc3"
+            --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "jax-rocm7-pjrt==0.10.0+rocm7.14.0" "jax-rocm7-plugin==0.10.0+rocm7.14.0"
 
       - name: Install PyTorch ROCm (build-time dep for aiter JIT)
         shell: bash
@@ -66,11 +66,11 @@ jobs:
           set -euo pipefail
           source .venv/bin/activate
           # TheRock: install the torch wheel whose +rocm local version matches THIS container's
-          # ROCm SDK build (from `rocm-sdk version`, e.g. 7.14.0rc3) — no hardcoded torch version.
-          # Discover the matching cp312 wheel on the AMD prerelease multi-arch index (same index as
+          # ROCm SDK build (from `rocm-sdk version`, e.g. 7.14.0) — no hardcoded torch version.
+          # Discover the matching cp312 wheel on the AMD GA multi-arch index (same index as
           # the jax-rocm pjrt/plugin, so torch and the ROCm SDK stay on the same rc build).
           ROCM_SDK_VER="$(rocm-sdk version)"
-          INDEX="https://rocm.prereleases.amd.com/whl-multi-arch"
+          INDEX="https://repo.amd.com/rocm/whl-multi-arch"
           # Pick the latest *stable* torch for this ROCm build (PEP440 ordering; skip pre-releases
           # like aN/rcN since alpha torch can break aiter's cpp_extension JIT). Fall back to absolute
           # max only if no stable wheel exists. Override by presetting TORCH_VER to pin a known-good one.

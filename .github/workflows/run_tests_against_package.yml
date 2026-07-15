@@ -97,7 +97,7 @@ jobs:
     runs-on: ${{ inputs.cloud_runner != '' && inputs.cloud_runner || (inputs.device_type == 'rocm' && 'amd-do-linux.jax.gpu.gfx950.4') || fromJson(format('["self-hosted", "{0}", "{1}"]', inputs.device_type, inputs.device_name)) }}
     timeout-minutes: ${{ inputs.device_type == 'rocm' && 90 || 360 }}
     container:
-      image: ${{ inputs.device_type == 'rocm' && 'ghcr.io/rocm/jax-dev-ubu24.therock-7.14.0rc3:latest' || format('gcr.io/{0}/{1}', vars.PROJECT_NAME || 'tpu-prod-env-multipod', inputs.base_image) }}
+      image: ${{ inputs.device_type == 'rocm' && 'ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14' || format('gcr.io/{0}/{1}', vars.PROJECT_NAME || 'tpu-prod-env-multipod', inputs.base_image) }}
       env:
         XLA_PYTHON_CLIENT_MEM_FRACTION: ${{ inputs.xla_python_client_mem_fraction }}
         TF_FORCE_GPU_ALLOW_GROWTH: ${{ inputs.tf_force_gpu_allow_growth }}
@@ -193,12 +193,12 @@ jobs:
         run: |
           source .venv/bin/activate
           set -euo pipefail
-          # jax-rocm pjrt/plugin (TheRock 7.14.0rc3 prerelease; not pinned in requirements). Resolved
-          # from the prerelease multi-arch index (picks the cp312 plugin); must match the container's
-          # ROCm SDK build (rc3).
+          # jax-rocm pjrt/plugin (TheRock 7.14.0 GA; not pinned in requirements). Resolved
+          # from the GA multi-arch index (picks the cp312 plugin); must match the container's
+          # ROCm SDK build (7.14.0 GA).
           uv pip install --no-deps --force-reinstall \
-            --index-url https://rocm.prereleases.amd.com/whl-multi-arch/ \
-            "jax-rocm7-pjrt==0.10.0+rocm7.14.0rc3" "jax-rocm7-plugin==0.10.0+rocm7.14.0rc3"
+            --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+            "jax-rocm7-pjrt==0.10.0+rocm7.14.0" "jax-rocm7-plugin==0.10.0+rocm7.14.0"
 
       - name: Install Transformer Engine wheel (ROCm)
         if: ${{ inputs.device_type == 'rocm' }}
