@@ -96,11 +96,19 @@ def moe_block_fly_bf16_atomic(
     topk: int,
     tile_m: int | None = None,
     stage2_mode: str | None = None,
+    compute_dtype: str = "bf16",
 ) -> jax.Array:
-    """FlyDSL MoE block, bf16 in -> bf16 out, stage-2 atomic-add reduction."""
+    """FlyDSL MoE block, {bf16,fp16} in -> same out, stage-2 atomic-add reduction.
+
+    compute_dtype selects the MFMA input path: "bf16" (default) or "fp16".
+    """
     tile_m = tile_m if tile_m is not None else pick_tile_m(tokens)
     if stage2_mode is None:
         stage2_mode = os.environ.get("FLY_STAGE2", "atomic")
+    if compute_dtype not in ("bf16", "fp16"):
+        raise ValueError(f"compute_dtype must be 'bf16' or 'fp16', got {compute_dtype!r}")
+    in_dtype = "fp16" if compute_dtype == "fp16" else "bf16"
+    mid_jnp = jnp.float16 if compute_dtype == "fp16" else jnp.bfloat16
 
     out1_f16 = moe_gemm1_jax(
         x,
@@ -119,14 +127,14 @@ def moe_block_fly_bf16_atomic(
         tile_m=tile_m,
         tile_n=128,
         tile_k=128,
-        in_dtype="bf16",
+        in_dtype=in_dtype,
         out_dtype="f16",
         # FlyDSL 0.2.0's stage-1 bf16 CShuffle epilogue fails MLIR verification;
         # the "direct" epilogue is numerically equivalent. Stage 2 keeps CShuffle
         # (required for f16 output). Drop this once the wheel pin fixes it.
         use_cshuffle_epilog=False,
     )
-    out1_bf16 = out1_f16.astype(jnp.bfloat16)
+    out1_mid = out1_f16.astype(mid_jnp)
 
     stage2_kw = dict(
         tokens=tokens,
@@ -137,11 +145,11 @@ def moe_block_fly_bf16_atomic(
         tile_m=tile_m,
         tile_n=256,
         tile_k=128,
-        in_dtype="bf16",
+        in_dtype=in_dtype,
         out_dtype="f16",
     )
     stage2_in = (
-        out1_bf16.reshape(tokens * topk, inter_dim),
+        out1_mid.reshape(tokens * topk, inter_dim),
         fly_params["w2_shuffled"],
         jnp.ones((tokens * topk,), jnp.float32),
         fly_params["scale_w2"],
@@ -154,4 +162,4 @@ def moe_block_fly_bf16_atomic(
         out2_f16 = moe_gemm2_reduce_jax(*stage2_in, **stage2_kw)
     else:
         out2_f16 = moe_gemm2_jax(*stage2_in, **stage2_kw)
-    return out2_f16.astype(jnp.bfloat16)
+    return out2_f16.astype(mid_jnp)

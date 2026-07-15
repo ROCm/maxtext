@@ -621,11 +621,17 @@ class RoutedMoE(nnx.Module):
     ):
       from maxtext.integration.flydsl import moe_bridge  # local import: optional dep
 
+      _, fly_jnp = moe_bridge.fly_compute_dtype(self.dtype)
       w1_shuffled, w2_shuffled = moe_bridge.preshuffle_expert_weights(
-          self.wi_0.value, self.wi_1.value, self.wo.value
+          self.wi_0.value, self.wi_1.value, self.wo.value, dtype=fly_jnp
       )
-      self.wi_fly_w1 = nnx.Param(w1_shuffled)
-      self.wi_fly_w2 = nnx.Param(w2_shuffled)
+      # Fly weights are 2D with the expert dim folded into axis 0
+      # (w1: [E*2*M_pad, D], w2: [E*D, M_pad]). The layout is expert-major, so
+      # sharding axis 0 on the "exp" logical axis lands each expert's contiguous
+      # row block on its expert-parallel shard (requires num_experts % ep == 0).
+      # No-op at ep=1; needed for expert-parallel FlyDSL MoE (halves-per-shard mem).
+      self.wi_fly_w1 = nnx.Param(w1_shuffled, out_sharding=("exp", None))
+      self.wi_fly_w2 = nnx.Param(w2_shuffled, out_sharding=("exp", None))
     else:
       self.wi_fly_w1 = None
       self.wi_fly_w2 = None
@@ -2197,28 +2203,88 @@ class RoutedMoE(nnx.Module):
       w1_kernel,
       wo_kernel,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
-    """Inference-only bf16 routed-MoE via the FlyDSL ROCm 2-stage grouped GEMM."""
+    """Inference-only routed-MoE via the FlyDSL ROCm 2-stage grouped GEMM.
+
+    Compute dtype follows self.dtype: float16 -> fp16 MFMA path (comparable to the
+    hipBLASLt grouped-gemm baseline), otherwise bf16.
+    """
     from maxtext.integration.flydsl import moe_bridge
 
     # Offline-preshuffled weights when available, else None (bridge shuffles inline).
     w1_shuffled = self.wi_fly_w1[...] if self.wi_fly_w1 is not None else None
     w2_shuffled = self.wi_fly_w2[...] if self.wi_fly_w2 is not None else None
 
+    # Routing (gate dot + top-k) is batch-parallel plain-JAX -> fine under normal SPMD.
     top_k_weights, top_k_indices = self.get_topk(gate_logits, pre_bias_logits, self.rngs)
-    output = moe_bridge.flydsl_routed_moe(
-        inputs,
-        top_k_weights,
-        top_k_indices,
-        w0_kernel,
-        w1_kernel,
-        wo_kernel,
-        num_experts=self.num_experts,
-        num_experts_per_tok=self.num_experts_per_tok,
-        out_dtype=self.dtype,
-        w1_shuffled=w1_shuffled,
-        w2_shuffled=w2_shuffled,
-        inter_dim=self.intermediate_dim,
-    )
+
+
+    batch_axis = "activation_batch" if inputs.shape[0] > 1 else "decode_batch_moe"
+    act_pspec = self._logical_to_mesh_axes((batch_axis, "activation_norm_length", None))
+    out_pspec = self._logical_to_mesh_axes((batch_axis, "activation_norm_length", "activation_embed"))
+    # Expert parallelism: peel the `expert` mesh axis off the activation batch dim
+    # so the batch is replicated (not sharded on `expert`) while the expert weights
+    # stay sharded on `expert`. No-op at ep=1 (expert axis size 1).
+    if self.get_expert_parallelism_size() > 1:
+      act_pspec = remove_expert_from_partition_spec(act_pspec, dims_to_peel=(0,))
+      out_pspec = remove_expert_from_partition_spec(out_pspec, dims_to_peel=(0,))
+    w0_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
+    wo_pspec = self._logical_to_mesh_axes(self.wo_kernel_axes)
+    fly_pspec = self._logical_to_mesh_axes(("exp", None))
+
+    ep_size = self.get_expert_parallelism_size()
+
+    def _flydsl_local(inp, tkw, tki, w0, w1, wo, *fly):
+      w1s = fly[0] if len(fly) == 2 else None
+      w2s = fly[1] if len(fly) == 2 else None
+      local_num_experts = self.num_experts
+      if ep_size > 1:
+        # Expert parallelism (replicate-batch style): this shard holds ALL tokens
+        # but only its local slice of experts. Remap each token's global top-k
+        # expert ids to local ids, and zero the router weight for experts that
+        # are not on this shard, so the kernel's in-kernel combine sums only this
+        # shard's experts. num_experts -> local count so moe_sort_jax / the kernel
+        # match the local (1/ep) weight shard.
+        local_num_experts = self.num_experts // ep_size
+        shard_id = jax.lax.axis_index(self._expert_parallelism_name)
+        offset = shard_id * local_num_experts
+        is_local = (tki // local_num_experts) == shard_id
+        tki = jnp.where(is_local, tki - offset, 0)
+        tkw = jnp.where(is_local, tkw, 0.0)
+      out = moe_bridge.flydsl_routed_moe(
+          inp,
+          tkw,
+          tki,
+          w0,
+          w1,
+          wo,
+          num_experts=local_num_experts,
+          num_experts_per_tok=self.num_experts_per_tok,
+          out_dtype=self.dtype,
+          w1_shuffled=w1s,
+          w2_shuffled=w2s,
+          inter_dim=self.intermediate_dim,
+      )
+      # `out` is this shard's PARTIAL contribution (sum over each token's LOCAL
+      # top-k experts; zero where none are local). Sum the partials across the
+      # `expert` axis to complete each token's top-k combine. all-reduce -> result
+      # identical on every expert shard, matching the replicated out_pspec.
+      if ep_size > 1:
+        out = jax.lax.psum(out, axis_name=self._expert_parallelism_name)
+      return out
+
+    in_specs = [act_pspec, act_pspec, act_pspec, w0_pspec, w0_pspec, wo_pspec]
+    args = [inputs, top_k_weights, top_k_indices, w0_kernel, w1_kernel, wo_kernel]
+    if w1_shuffled is not None and w2_shuffled is not None:
+      in_specs += [fly_pspec, fly_pspec]
+      args += [w1_shuffled, w2_shuffled]
+
+    output = jax.shard_map(
+        _flydsl_local,
+        mesh=self.mesh,
+        in_specs=tuple(in_specs),
+        out_specs=out_pspec,
+        check_vma=self.config.check_vma,
+    )(*args)
     return output, None, None
 
   def dense_matmul(
