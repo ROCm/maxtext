@@ -4,7 +4,7 @@
 
 # Usage:
 # export RUN_ID=$(date +%Y-%m-%d-%H-%M-%S)
-# bash test_gemma4_to_hf.sh $RUN_ID $CHECKPOINT_PATH $USE_MULTIMODAL $SCAN_LAYERS
+# bash test_llama3.1_70b_to_hf.sh $RUN_ID $CHECKPOINT_PATH $USE_MULTIMODAL $SCAN_LAYERS
 
 set -ex
 
@@ -13,7 +13,7 @@ CKPT_PATH=$2
 USE_MULTIMODAL=${3:-false}
 SCAN_LAYERS=${4:-false}
 
-MODEL_NAME='gemma4-26b'
+MODEL_NAME='llama3.1-70b'
 BASE_OUTPUT_DIRECTORY="gs://runner-maxtext-logs/${MODEL_NAME}"
 
 if [ "${SCAN_LAYERS,,}" = "true" ]; then
