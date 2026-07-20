@@ -1788,31 +1788,8 @@ class RoutedMoE(nnx.Module):
           axis_name=self._expert_parallelism_name,
       )
 
-    @functools.partial(
-        jax.shard_map,
-        mesh=self.mesh,
-        in_specs=(
-            input_partition_pspec,
-            gate_logits_pspec,
-            pre_bias_logits_pspec,
-            w0_pspec,
-            w1_pspec,
-            wo_pspec,
-            w0_bias_pspec,
-            w1_bias_pspec,
-            wo_bias_pspec,
-            decoder_tokens_pspec,
-            P(),  # Replicate the input key
-        ),
-        out_specs=(
-            self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", "activation_embed")),
-            P(),  # Handle None or replicate the output
-            P(),  # Handle None or replicate the output
-        ),
-        check_vma=self.config.check_vma,
-    )
     def sparse_matmul_route_and_compute(
-        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs
+        x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, sharded_input_ids, rngs, *fly_weights
     ):
       batch_size, sequence_length, _ = x.shape
       x, routing, route_metadata = route(x, logits, pre_bias_logits, rngs, input_ids=sharded_input_ids)
@@ -1820,16 +1797,50 @@ class RoutedMoE(nnx.Module):
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
 
-      gmm_fn = get_gmm_for_local_experts(x, routing, route_metadata)
-      intermediate_layer = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather)
+      if self.config.use_flydsl_moe:
+        # FlyDSL all-to-all EP: reuse the validated route/dispatch/unpermute of
+        # this pipeline and only swap the local expert compute. After `route`, `x`
+        # is already grouped by LOCAL expert and each row is a single (token,expert)
+        # copy, so running the FlyDSL 2-stage grouped GEMM with topk=1 makes the
+        # kernel's in-kernel combine a no-op: it returns per-copy results in the
+        # same sorted order. Router weights are applied later in `unpermute` (SUM),
+        # exactly as the ragged_dot path does.
+        from maxtext.integration.flydsl import moe_bridge
 
-      wo_gather_axes, wo_tile_size = get_wo_gmm_params()
-      intermediate_output = gmm_fn(
-          intermediate_layer,
-          wo,
-          tiling=wo_tile_size,
-          weight_gather_axes=wo_gather_axes,
-      )
+        num_ep = self.get_expert_parallelism_size()
+        local_num_experts = self.config.num_experts // num_ep
+        per_copy_ids = routing.selected_experts.reshape(-1, 1).astype(jnp.int32)
+        per_copy_weights = jnp.ones_like(per_copy_ids, dtype=jnp.float32)
+        # Use offline-preshuffled expert weights (this shard's local slice) when
+        # available so the kernel skips the per-step MFMA repack; fall back to
+        # inline shuffle only if they were not materialized.
+        w1s = fly_weights[0] if len(fly_weights) == 2 else None
+        w2s = fly_weights[1] if len(fly_weights) == 2 else None
+        intermediate_output = moe_bridge.flydsl_routed_moe(
+            x,
+            per_copy_weights,
+            per_copy_ids,
+            w0,
+            w1,
+            wo,
+            num_experts=local_num_experts,
+            num_experts_per_tok=1,
+            out_dtype=self.dtype,
+            w1_shuffled=w1s,
+            w2_shuffled=w2s,
+            inter_dim=self.intermediate_dim,
+        )
+      else:
+        gmm_fn = get_gmm_for_local_experts(x, routing, route_metadata)
+        intermediate_layer = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather)
+
+        wo_gather_axes, wo_tile_size = get_wo_gmm_params()
+        intermediate_output = gmm_fn(
+            intermediate_layer,
+            wo,
+            tiling=wo_tile_size,
+            weight_gather_axes=wo_gather_axes,
+        )
       if self.get_tensor_parallelism_size() > 1:
         intermediate_output = jax.lax.psum_scatter(
             intermediate_output, self._tensor_parallelism_name, scatter_dimension=1, tiled=True
@@ -1934,7 +1945,20 @@ class RoutedMoE(nnx.Module):
     if wo_bias is not None:
       wo_bias = self._maybe_shard_with_pspec(wo_bias, wo_bias_pspec)
 
-    return sparse_matmul_route_and_compute(
+    in_specs = [
+        input_partition_pspec,
+        gate_logits_pspec,
+        pre_bias_logits_pspec,
+        w0_pspec,
+        w1_pspec,
+        wo_pspec,
+        w0_bias_pspec,
+        w1_bias_pspec,
+        wo_bias_pspec,
+        decoder_tokens_pspec,
+        P(),  # Replicate the input key
+    ]
+    call_args = [
         inputs,
         gate_logits,
         pre_bias_logits,
@@ -1946,7 +1970,29 @@ class RoutedMoE(nnx.Module):
         wo_bias,
         input_ids,
         self.rngs,
+    ]
+    # FlyDSL all-to-all EP: pass the offline-preshuffled expert weights (sharded on
+    # the expert axis) as extra shard_map inputs so the kernel skips the per-step
+    # MFMA repack. Closing over them instead would replicate the full unsharded
+    # tensor on every shard, so they must be threaded as expert-sharded inputs.
+    if self.config.use_flydsl_moe and self.wi_fly_w1 is not None and self.wi_fly_w2 is not None:
+      fly_pspec = self._logical_to_mesh_axes(("exp", None))
+      in_specs += [fly_pspec, fly_pspec]
+      call_args += [self.wi_fly_w1[...], self.wi_fly_w2[...]]
+
+    out_specs = (
+        self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", "activation_embed")),
+        P(),  # Handle None or replicate the output
+        P(),  # Handle None or replicate the output
     )
+    sharded_route_and_compute = jax.shard_map(
+        sparse_matmul_route_and_compute,
+        mesh=self.mesh,
+        in_specs=tuple(in_specs),
+        out_specs=out_specs,
+        check_vma=self.config.check_vma,
+    )
+    return sharded_route_and_compute(*call_args)
 
   def reshape_and_update_weights(self, weights, indices):
     """reshape and update weights."""
@@ -2217,60 +2263,34 @@ class RoutedMoE(nnx.Module):
     # Routing (gate dot + top-k) is batch-parallel plain-JAX -> fine under normal SPMD.
     top_k_weights, top_k_indices = self.get_topk(gate_logits, pre_bias_logits, self.rngs)
 
-
+    # ep=1 only. Expert parallelism (ep>1) is handled by the efficient all-to-all
+    # path in sparse_matmul (see __call__ dispatch and sparse_matmul_route_and_compute).
+    # This method is the plain single-device / data-parallel FlyDSL kernel: the whole
+    # per-data-shard batch runs through all experts, with no dispatch/combine.
     batch_axis = "activation_batch" if inputs.shape[0] > 1 else "decode_batch_moe"
     act_pspec = self._logical_to_mesh_axes((batch_axis, "activation_norm_length", None))
     out_pspec = self._logical_to_mesh_axes((batch_axis, "activation_norm_length", "activation_embed"))
-    # Expert parallelism: peel the `expert` mesh axis off the activation batch dim
-    # so the batch is replicated (not sharded on `expert`) while the expert weights
-    # stay sharded on `expert`. No-op at ep=1 (expert axis size 1).
-    if self.get_expert_parallelism_size() > 1:
-      act_pspec = remove_expert_from_partition_spec(act_pspec, dims_to_peel=(0,))
-      out_pspec = remove_expert_from_partition_spec(out_pspec, dims_to_peel=(0,))
     w0_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
     wo_pspec = self._logical_to_mesh_axes(self.wo_kernel_axes)
     fly_pspec = self._logical_to_mesh_axes(("exp", None))
 
-    ep_size = self.get_expert_parallelism_size()
-
     def _flydsl_local(inp, tkw, tki, w0, w1, wo, *fly):
       w1s = fly[0] if len(fly) == 2 else None
       w2s = fly[1] if len(fly) == 2 else None
-      local_num_experts = self.num_experts
-      if ep_size > 1:
-        # Expert parallelism (replicate-batch style): this shard holds ALL tokens
-        # but only its local slice of experts. Remap each token's global top-k
-        # expert ids to local ids, and zero the router weight for experts that
-        # are not on this shard, so the kernel's in-kernel combine sums only this
-        # shard's experts. num_experts -> local count so moe_sort_jax / the kernel
-        # match the local (1/ep) weight shard.
-        local_num_experts = self.num_experts // ep_size
-        shard_id = jax.lax.axis_index(self._expert_parallelism_name)
-        offset = shard_id * local_num_experts
-        is_local = (tki // local_num_experts) == shard_id
-        tki = jnp.where(is_local, tki - offset, 0)
-        tkw = jnp.where(is_local, tkw, 0.0)
-      out = moe_bridge.flydsl_routed_moe(
+      return moe_bridge.flydsl_routed_moe(
           inp,
           tkw,
           tki,
           w0,
           w1,
           wo,
-          num_experts=local_num_experts,
+          num_experts=self.num_experts,
           num_experts_per_tok=self.num_experts_per_tok,
           out_dtype=self.dtype,
           w1_shuffled=w1s,
           w2_shuffled=w2s,
           inter_dim=self.intermediate_dim,
       )
-      # `out` is this shard's PARTIAL contribution (sum over each token's LOCAL
-      # top-k experts; zero where none are local). Sum the partials across the
-      # `expert` axis to complete each token's top-k combine. all-reduce -> result
-      # identical on every expert shard, matching the replicated out_pspec.
-      if ep_size > 1:
-        out = jax.lax.psum(out, axis_name=self._expert_parallelism_name)
-      return out
 
     in_specs = [act_pspec, act_pspec, act_pspec, w0_pspec, w0_pspec, wo_pspec]
     args = [inputs, top_k_weights, top_k_indices, w0_kernel, w1_kernel, wo_kernel]
@@ -2738,7 +2758,21 @@ class RoutedMoE(nnx.Module):
       output, lb_loss, bias_updates = self.fused_moe_matmul(
           inputs, gate_logits, wo_kernel, w0_kernel=w0_kernel, w1_kernel=w1_kernel, fused_kernel=fused_kernel
       )
+    elif cfg.use_flydsl_moe and self.get_expert_parallelism_size() > 1:
+      # Expert parallelism -> efficient all-to-all path: reuse the sparse_matmul
+      # route/all-to-all/unpermute pipeline with the FlyDSL local expert compute
+      # swapped in (see sparse_matmul_route_and_compute).
+      ep_size = self.get_expert_parallelism_size()
+      if cfg.num_experts % ep_size != 0:
+        raise ValueError(
+            f"FlyDSL expert parallelism requires num_experts ({cfg.num_experts}) divisible by "
+            f"expert parallelism ({ep_size})."
+        )
+      output, lb_loss, bias_updates = self.sparse_matmul(
+          inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias, input_ids
+      )
     elif cfg.use_flydsl_moe:
+      # No expert parallelism (ep=1): plain single-device / data-parallel FlyDSL kernel.
       output, lb_loss, bias_updates = self.flydsl_matmul(
           inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel
       )
