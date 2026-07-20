@@ -74,6 +74,12 @@ class LlamaDecoderLayer(nnx.Module):
         rngs=rngs,
     )
 
+    # Default-off (0.0 -> None): keeps MaxText's folded depth_scaling init. A positive
+    # value moves 1/sqrt(head_dim) from the query kernel to a runtime multiply
+    # (forward-equivalent), un-inflating the query-weight gradient (Megatron-like).
+    _qpas = getattr(config, "query_pre_attn_scalar", 0.0)
+    _query_pre_attn_scalar = _qpas if _qpas and _qpas > 0.0 else None
+
     self.self_attention = Attention(
         config=config,
         num_query_heads=config.num_query_heads,
@@ -100,6 +106,7 @@ class LlamaDecoderLayer(nnx.Module):
         ragged_block_size=config.ragged_block_size,
         model_mode=model_mode,
         attn_logits_soft_cap=config.attn_logits_soft_cap,
+        query_pre_attn_scalar=_query_pre_attn_scalar,
         rngs=rngs,
     )
 

@@ -43,9 +43,39 @@ def _get_path_mask_fn(patterns, match_returns_true=True):
   return mask_fn
 
 
+_ADAMW_MASK_DUMPED = [False]
+
+
 def get_adamw_mask(config):
   """Create a mask function for AdamW optimizer to exclude certain parameters from weight decay."""
-  return _get_path_mask_fn(getattr(config, "adamw_mask", None), match_returns_true=False)
+  base_fn = _get_path_mask_fn(getattr(config, "adamw_mask", None), match_returns_true=False)
+  if base_fn is None:
+    return None
+
+  def _verifying_mask(params):
+    tree = base_fn(params)
+    # One-time eager dump (path strings + shapes are static at trace time) to VERIFY
+    # the adamw_mask regex excludes only the intended (1-D norm scale) params from
+    # weight decay. mask=False => EXCLUDED from wd. AIMA-164 adamw_mask A/B.
+    if not _ADAMW_MASK_DUMPED[0]:
+      _ADAMW_MASK_DUMPED[0] = True
+      try:
+        import jax as _jax  # local import to avoid top-level cycle concerns
+        excl = []
+        def _rec(path, leaf, m):
+          ps = _jax.tree_util.keystr(path, simple=True, separator="/")
+          shp = getattr(leaf, "shape", None)
+          if m is False:
+            excl.append((ps, tuple(shp) if shp is not None else None))
+        _jax.tree_util.tree_map_with_path(_rec, params, tree)
+        print(f"[adamw_mask] patterns={getattr(config,'adamw_mask',None)} -> {len(excl)} params EXCLUDED from weight decay:", flush=True)
+        for ps, shp in excl:
+          print(f"[adamw_mask]   EXCL ndim={len(shp) if shp else '?'} shape={shp} {ps}", flush=True)
+      except Exception as _e:  # never break training on a logging helper
+        print(f"[adamw_mask] dump skipped: {_e}", flush=True)
+    return tree
+
+  return _verifying_mask
 
 
 def _compute_rolling_stats(arr: jax.Array, count: jax.Array, interval: int):

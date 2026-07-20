@@ -119,6 +119,7 @@ dtype: "bfloat16"
 # 'intmp' for mixed precision quantization for inference as described here: src/maxtext/configs/quantization/readme.md
 # 'fp8' for 8-bit floating-point gemms on nvidia gpus.
 # 'nanoo_fp8' for 8-bit floating-point gemms on amd mi300/mi325 gpus.
+# 'aiter_bf16' for AITER ASM BF16 GEMM on AMD MI350 (gfx950). ~1.7x faster than hipBLASLt.
 # 'fp8_full' for fp8 quantization with static scaling.
 quantization: ""
 # used to configure constant_bound_config in aqt lib for static scaling, e.g. constant_bound_config='0.5, 0.5, 0.5, 0.5, 0.5, 0.5'
@@ -192,6 +193,11 @@ logits_dot_in_fp32: false  # whether to use fp32 in logits_dense or shared_embed
 cast_logits_to_fp32: true # whether to cast the logits to fp32. the higher precision is generally beneficial, but it can vary slightly.
 float32_qk_product: false # in dot_product attention, whether to cast to fp32 the inputs to qk product
 float32_logits: false # in dot_product attention, whether to cast to fp32 the inputs to softmax
+# Runtime query-pre-attention scalar (llama2 decoder only). 0.0 = disabled (default):
+# 1/sqrt(head_dim) stays FOLDED into the query kernel at init (depth_scaling). A positive value
+# (e.g. head_dim**-0.5) moves that scaling to RUNTIME (forward-equivalent) so the query-weight
+# gradient is not inflated by sqrt(head_dim) -- matching Megatron's runtime query scaling.
+query_pre_attn_scalar: 0.0
 float32_weight_sum: true # whether to use full fp32 precision to sum expert weights for numerical stability
 float32_gate_logits: false # whether to cast inputs to fp32 to compute MoE gate logits for numerical stability
 
@@ -407,6 +413,12 @@ num_kv_shared_layers: 0
 # When True, KV-shared layers double their MLP intermediate size to compensate
 # for the lost K/V parameters.
 use_double_wide_mlp: False
+
+# Megatron-style weight init (default OFF / byte-identical). When >0, q/k/v/wi/embedding use
+# fixed normal(0, megatron_init_std) and the residual output projections (attention out, MLP wo)
+# are shrunk by 1/sqrt(2*num_decoder_layers) (if megatron_residual_scale) for high-LR stability.
+megatron_init_std: 0.0
+megatron_residual_scale: True
 
 
 # Adding Mixture of Block Attention Support (MoBA): https://github.com/MoonshotAI/MoBA/blob/master/MoBA_Tech_Report.pdf
@@ -784,6 +796,11 @@ olmo_path_remap_from: '' # rewrite index paths starting with this prefix...
 olmo_path_remap_to: ''   # ...to this one (e.g. gs://bucket/ -> /mnt/.../ for gcsfuse).
 olmo_apply_ngram_filter: true # mask instances with repetitive n-grams (OLMo-core filter)
 
+# Exact-batch replay pipeline (dataset_type=megatron_replay): directory of pre-dumped
+# Megatron/Primus per-step global batches (input_ids/labels/loss_mask .npy, shape (N,GBS,S))
+# produced by mega_analysis/code/dump_megatron_batches.py. Replays them verbatim, in order.
+megatron_replay_path: ''
+
 # Training loop
 steps: 150_001 # If set to -1 then will inherit value from learning_rate_schedule_steps
 log_period: 100 # The frequency of Tensorboard flush, gcs metrics writing, and managed profiler metrics updating.
@@ -986,6 +1003,17 @@ eval_steps: -1  # run this number of steps for eval, recommend setting this to p
 target_eval_loss: 0.  # early stop once reaching target eval_loss
 abort_on_nan_loss: true # Check for NaN and abort if found in training loss
 abort_on_inf_loss: true # Check for Inf and abort if found in training loss
+
+# MLPerf-compliance MLLOG emitter (default OFF). When enabled, emits the MLPerf
+# training MLLOG key set (mllog) alongside normal metrics so a run can be validated
+# with mlperf_logging.compliance_checker. No-op unless mlperf_logging is importable.
+enable_mlperf_logging: false
+mlperf_log_path: ""  # explicit MLLOG output path; empty => <base_output_directory>/<run_name>/mlperf.log
+mlperf_submission_org: ""        # required non-empty for a compliant log
+mlperf_submission_platform: ""   # required non-empty for a compliant log
+mlperf_submission_division: "closed"  # closed | open
+mlperf_submission_benchmark: "llama31_8b"
+mlperf_lowest_precision_linear: ""  # optional key, e.g. mxfp4 | fp8 | bfloat16 (empty => not emitted)
 
 # Goodput parameters
 enable_goodput_recording: false

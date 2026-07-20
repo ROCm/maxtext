@@ -33,7 +33,13 @@ from maxtext.common.common_types import DecoderBlockType, ShardMode, DType, Arra
 from maxtext.common.common_types import MODEL_MODE_PREFILL
 from maxtext.layers import nnx_wrappers, quantizations
 from maxtext.layers import normalizations
-from maxtext.layers.initializers import NdInitializer, nd_dense_init, default_bias_init, variable_to_logically_partitioned
+from maxtext.layers.initializers import (
+    NdInitializer,
+    nd_dense_init,
+    default_bias_init,
+    variable_to_logically_partitioned,
+    megatron_normal_nd_init,
+)
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
@@ -121,6 +127,7 @@ class DenseGeneral(nnx.Module):
       shard_mode: ShardMode = ShardMode.AUTO,
       matmul_precision: str = "default",
       parameter_memory_host_offload: bool = False,
+      module_context: str = "",
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -140,6 +147,7 @@ class DenseGeneral(nnx.Module):
       shard_mode: auto or explicit shard mode.
       matmul_precision: Precision for matrix multiplication.
       parameter_memory_host_offload: Determines whether to offload params to host
+      module_context: context string passed to quantization ops (e.g., "mlp" for MLP layers).
       rngs: RNG state for initialization in nnx.
     """
     self.in_features_shape = canonicalize_tuple(in_features_shape)
@@ -184,7 +192,12 @@ class DenseGeneral(nnx.Module):
 
     if quant:
       dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes)
-      dot_general_linen = dot_general_cls()
+      # Pass module_context to quant ops that support it (e.g., FP8 MLP-only).
+      # Falls back to no-arg construction for ops that don't accept it.
+      try:
+        dot_general_linen = dot_general_cls(module_context=module_context)
+      except TypeError:
+        dot_general_linen = dot_general_cls()
       quant_dot_general = nnx_wrappers.ToNNX(dot_general_linen, rngs=rngs)
       self._quant_dot_general_name = f"{type(dot_general_linen).__name__}_0"
       setattr(self, self._quant_dot_general_name, quant_dot_general)
@@ -386,6 +399,15 @@ class MlpBlock(nnx.Module):
     self.intermediate_dim = intermediate_dim
     self.activations = activations
     self.kernel_init = kernel_init
+    # Megatron-style fixed-std init (default off). wi (gate/up) use normal(0, std); the residual
+    # down projection (wo) uses std/sqrt(2*num_decoder_layers). See initializers.py.
+    _mt_std = getattr(config, "megatron_init_std", 0.0)
+    if _mt_std and _mt_std > 0:
+      self.kernel_init = megatron_normal_nd_init(_mt_std)
+      _scale = (2.0 * config.num_decoder_layers) ** 0.5 if getattr(config, "megatron_residual_scale", True) else 1.0
+      self._wo_kernel_init = megatron_normal_nd_init(_mt_std / _scale)
+    else:
+      self._wo_kernel_init = self.kernel_init
     self.intermediate_dropout_rate = intermediate_dropout_rate
     self.dtype = dtype
     self.weight_dtype = weight_dtype
@@ -422,11 +444,15 @@ class MlpBlock(nnx.Module):
           use_bias=self.use_bias,
           shard_mode=self.config.shard_mode,
           matmul_precision=self.config.matmul_precision,
+          module_context="mlp_fused",
           rngs=rngs,
       )
     else:
+      # Llama-style gated MLP: wi_0=gate_proj (SiLU), wi_1=up_proj (linear)
+      _mlp_proj_names = ["mlp_gate", "mlp_up", "mlp_wi"]  # gate, up, fallback
       for idx in range(len(self.activations)):
         dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
+        proj_context = _mlp_proj_names[idx] if idx < len(_mlp_proj_names) else f"mlp_wi_{idx}"
         module = DenseGeneral(
             in_features_shape=in_features,
             out_features_shape=self.intermediate_dim,
@@ -438,6 +464,7 @@ class MlpBlock(nnx.Module):
             use_bias=self.use_bias,
             shard_mode=self.config.shard_mode,
             matmul_precision=self.config.matmul_precision,
+            module_context=proj_context,
             rngs=rngs,
         )
         setattr(self, dense_name, module)
@@ -447,12 +474,13 @@ class MlpBlock(nnx.Module):
         out_features_shape=in_features,
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,
-        kernel_init=self.kernel_init,
+        kernel_init=self._wo_kernel_init,
         kernel_axes=("mlp", "embed"),
         quant=self.quant,
         use_bias=self.use_bias,
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
+        module_context="mlp_down",
         rngs=rngs,
     )
 
@@ -503,31 +531,75 @@ class MlpBlock(nnx.Module):
 
     # Iterate over specified MLP input activation functions.
     # e.g. ('relu',) or ('gelu', 'linear') for gated-gelu.
-    activations = []
-    if cfg.fused_mlp:
-      x = self.wi(inputs, out_sharding=intermediate_sharding)
+    # Check if AITER fused silu_and_mul can be used:
+    # - use_jax_aiter and aiter_silu_and_mul must be enabled
+    # - activations must be ("silu", "linear") (gated SiLU MLP, e.g. Llama)
+    # - must not be fused_mlp mode
+    # - must not use activations_in_float32
+    _use_aiter_silu = (
+        not cfg.fused_mlp
+        and getattr(cfg, "use_jax_aiter", False)
+        and getattr(cfg, "aiter_silu_and_mul", False)
+        and list(self.activations) == ["silu", "linear"]
+        and not cfg.activations_in_float32
+    )
 
-      # Enforce fused activations don't shard on num_activations axis
-      fused_intermediate_logical = self.intermediate_logical[:2] + (None,) + self.intermediate_logical[2:]
-      x = self._maybe_shard_with_logical(x, fused_intermediate_logical)
-
-      x = checkpoint_name(x, "mlpwi")
-      for idx, act_fn in enumerate(self.activations):
-        y = _convert_to_activation_function(act_fn)(x[:, :, idx, ...])
-        activations.append(y)
+    if _use_aiter_silu:
+      # AITER fused path: compute gate and up projections, then fuse silu(gate)*up.
+      from jax_aiter.activation import silu_and_mul as aiter_silu_and_mul
+      gate = self.wi_0(inputs, out_sharding=intermediate_sharding)
+      gate = checkpoint_name(gate, "mlpwi_0")
+      up = self.wi_1(inputs, out_sharding=intermediate_sharding)
+      up = checkpoint_name(up, "mlpwi_1")
+      x = aiter_silu_and_mul(gate, up).astype(self.dtype)
     else:
-      for idx, act_fn in enumerate(self.activations):
-        dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
-        module = getattr(self, dense_name)
-        x = module(inputs, out_sharding=intermediate_sharding)
-        x = checkpoint_name(x, "mlp" + dense_name)
-        if cfg.activations_in_float32:
-          x = x.astype(jnp.float32)
-        x = _convert_to_activation_function(act_fn)(x)
-        activations.append(x)
+      activations = []
+      if cfg.fused_mlp:
+        x = self.wi(inputs, out_sharding=intermediate_sharding)
 
-    # Take elementwise product of above intermediate activations.
-    x = functools.reduce(operator.mul, activations).astype(self.dtype)
+        # Enforce fused activations don't shard on num_activations axis
+        fused_intermediate_logical = self.intermediate_logical[:2] + (None,) + self.intermediate_logical[2:]
+        x = self._maybe_shard_with_logical(x, fused_intermediate_logical)
+
+        x = checkpoint_name(x, "mlpwi")
+        for idx, act_fn in enumerate(self.activations):
+          y = _convert_to_activation_function(act_fn)(x[:, :, idx, ...])
+          activations.append(y)
+      else:
+        for idx, act_fn in enumerate(self.activations):
+          dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
+          module = getattr(self, dense_name)
+          x = module(inputs, out_sharding=intermediate_sharding)
+          x = checkpoint_name(x, "mlp" + dense_name)
+          if cfg.activations_in_float32:
+            x = x.astype(jnp.float32)
+          x = _convert_to_activation_function(act_fn)(x)
+          activations.append(x)
+
+      # Take elementwise product of above intermediate activations.
+      x = functools.reduce(operator.mul, activations).astype(self.dtype)
+    # --- MLP hidden trace (AITER_FP8_TRACE_MLP=1) ---
+    import os as _os
+    if _os.environ.get("AITER_FP8_TRACE_MLP", "0") == "1":
+      _x_f32 = x.astype(jnp.float32)
+      _abs = jnp.abs(_x_f32)
+      jax.debug.print(
+          "MLP_HIDDEN: max_abs={mx:.4f} p99_abs={p99:.4f} nonfinite={nf} shape={sh}",
+          mx=jnp.max(_abs), p99=jnp.percentile(_abs.reshape(-1), 99.0),
+          nf=jnp.sum(~jnp.isfinite(_x_f32)), sh=x.shape,
+      )
+    # --- MLP boundary stabilizer (AITER_FP8_CLIP_MLP) ---
+    # "1" = full clip to BF16 max (±65504)
+    # "2" = inf/nan only — replace non-finite with 0 (lightest)
+    # "3" = tight threshold clamp (±1024)
+    import os
+    _clip_mode = os.environ.get("AITER_FP8_CLIP_MLP", "0")
+    if _clip_mode == "1":
+      x = jnp.clip(x, -65504.0, 65504.0)
+    elif _clip_mode == "2":
+      x = jnp.where(jnp.isfinite(x), x, jnp.zeros_like(x))
+    elif _clip_mode == "3":
+      x = jnp.clip(x, -1024.0, 1024.0)
     # Apply dropout and final dense output projection.
     x = self.dropout(x, deterministic=deterministic)  # Broadcast along length.
     x = self._maybe_shard_with_logical(x, self.intermediate_logical)

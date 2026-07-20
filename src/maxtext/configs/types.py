@@ -91,6 +91,13 @@ class QuantizationType(str, Enum):
   FP8_E4M3 = "fp8_e4m3"
   FP8 = "fp8"
   NANOO_FP8 = "nanoo_fp8"
+  AITER_BF16 = "aiter_bf16"
+  AITER_FP8 = "aiter_fp8"
+  AITER_FP8_DELAYED = "aiter_fp8_delayed"
+  AITER_FP8_QDQ = "aiter_fp8_qdq"
+  AITER_FP8_MLP_ONLY = "aiter_fp8_mlp_only"
+  AITER_NANOO_FP8 = "aiter_nanoo_fp8"
+  AITER_FP4 = "aiter_fp4"
   FP8_NANO_V2 = "fp8_nanoo"
   FP8_GPU = "fp8_gpu"
   FP8_FULL = "fp8_full"
@@ -180,6 +187,8 @@ class DatasetType(str, Enum):
   TFDS = "tfds"
   C4MLPERF = "c4_mlperf"
   OLMO_GRAIN = "olmo_grain"
+  MEGATRON = "megatron"
+  MEGATRON_REPLAY = "megatron_replay"
 
 
 class SamplingStrategy(str, Enum):
@@ -475,6 +484,33 @@ class Quantization(BaseModel):
   )
 
 
+class Aiter(BaseModel):
+  """Configuration for AITER kernel integration (ROCm MI350/MI355X).
+
+  AITER provides hand-tuned ASM kernels that can replace hipBLASLt for specific
+  operations. The tiered strategy automatically selects FFI kernels on 1-GPU and
+  XLA-compatible pure-JAX implementations on multi-GPU.
+  """
+
+  use_jax_aiter: bool = Field(False, description="Master flag: enable all AITER kernel optimizations.")
+  aiter_gemm: bool = Field(True, description="AITER ASM GEMM for forward matmuls (requires use_jax_aiter=True).")
+  aiter_rmsnorm: bool = Field(True, description="Fused add+RMSNorm (requires use_jax_aiter=True).")
+  aiter_silu_and_mul: bool = Field(False, description="Fused silu(gate)*up activation via FFI. DISABLED by default — FFI inside scan+remat serializes backward, causing ~55% regression. Only useful for non-scan or single-GPU. (requires use_jax_aiter=True).")
+  aiter_attention: bool = Field(
+      False,
+      description="AITER CK flash attention via jax-aiter FFI. "
+      "Set attention=aiter_flash or enable this flag (requires use_jax_aiter=True). "
+      "Note: TE attention (cudnn_flash_te) already uses the same CK kernels on ROCm.",
+  )
+  aiter_moe: bool = Field(
+      False,
+      description="AITER MXFP4 fused-MoE forward via jax-aiter MoeFwdJA FFI. "
+      "Bypasses MaxText's default ragged_dot/gmm sparse_matmul path; routes "
+      "MoE expert GEMMs through AITER's fmoe_bf16_pertokenMXfp4_g1u1_silu "
+      "ASM kernel. Inference-only (forward pass). Requires use_jax_aiter=True.",
+  )
+
+
 class ModelArchitecture(BaseModel):
   """Core model architecture parameters."""
 
@@ -553,6 +589,18 @@ class Logits(BaseModel):
       description="Soft-cap value for the final logits. None or 0.0 means no cap.",
   )
   z_loss_multiplier: float = Field(0.0, description="The multiplier for the z-loss (e.g., 1e-4). 0.0 to disable.")
+  megatron_init_std: float = Field(
+      0.0,
+      description=(
+          "If >0, use Megatron-style fixed normal(0, std) weight init for q/k/v/wi/embedding, "
+          "with residual output projections (attention out, MLP wo) scaled by 1/sqrt(2*num_decoder_layers) "
+          "when megatron_residual_scale is True. 0.0 = MaxText default fan-in variance-scaling init (off, byte-identical)."
+      ),
+  )
+  megatron_residual_scale: bool = Field(
+      True,
+      description="When megatron_init_std>0, shrink residual output projections (attn out, MLP wo) by 1/sqrt(2*num_decoder_layers).",
+  )
 
 
 class Attention(BaseModel):
@@ -611,6 +659,17 @@ class Attention(BaseModel):
   chunk_attn_window_size: NonNegativeInt = Field(0, description="The window size for chunked attention.")
   attn_logits_soft_cap: None | NonNegativeFloat = Field(
       None, description="Soft-cap value for attention logits. None means no cap."
+  )
+  query_pre_attn_scalar: NonNegativeFloat = Field(
+      0.0,
+      description=(
+          "Optional runtime query-pre-attention scalar for the llama-style decoder block. "
+          "0.0 (default) = disabled: keep MaxText's default behavior of folding 1/sqrt(head_dim) "
+          "into the query projection KERNEL at init (depth_scaling). Setting a positive value "
+          "(e.g. head_dim**-0.5 = 1/sqrt(head_dim)) moves that scaling from the WEIGHT to RUNTIME "
+          "(query *= scalar), which is FORWARD-EQUIVALENT but un-inflates the query-weight gradient "
+          "(matches Megatron's runtime query scaling). Default-off; only the llama2 decoder reads it."
+      ),
   )
   use_post_attn_norm: bool = Field(False, description="Apply LayerNorm after the attention block.")
   use_post_ffw_norm: bool = Field(False, description="Apply LayerNorm after the feed-forward block.")
@@ -1380,6 +1439,23 @@ class OlmoGrainDataset(BaseModel):
   olmo_apply_ngram_filter: bool = Field(True, description="Mask repetitive instances per OLMo-core's repetition filter.")
 
 
+class MegatronReplayDataset(BaseModel):
+  """Configuration for the exact-batch replay pipeline (dataset_type=megatron_replay).
+
+  Replays a directory of pre-dumped Megatron/Primus per-step global batches
+  verbatim (input_ids/labels/loss_mask/position_ids stored as .npy with shape
+  (N, GBS, S)), bypassing every data-pipeline difference. Used to separate a
+  MaxText data-pipeline mismatch from an optimizer/update-path mismatch by
+  feeding MaxText the IDENTICAL batches Megatron trained on, in order.
+  """
+
+  megatron_replay_path: PathStr = Field(
+      "",
+      description="Directory containing input_ids.npy/labels.npy/loss_mask.npy/meta.json "
+      "produced by mega_analysis/code/dump_megatron_batches.py.",
+  )
+
+
 class DPO(BaseModel):
   """Configuration for DPO and ORPO preference optimization algorithms."""
 
@@ -1561,6 +1637,23 @@ class TrainingLoop(BaseModel):
   enable_data_shuffling: bool = Field(True, description="Enables shuffling of the training data.")
   data_shuffle_seed: int = Field(0, description="Seed for data shuffling.")
   init_weights_seed: int = Field(0, description="Seed for model weight initialization.")
+  enable_mlperf_logging: bool = Field(
+      False,
+      description="Emit the MLPerf training MLLOG key set (mllog) for compliance checking. No-op if disabled.",
+  )
+  mlperf_log_path: str = Field(
+      "",
+      description="Explicit MLLOG output path; empty => <base_output_directory>/<run_name>/mlperf.log.",
+  )
+  mlperf_submission_org: str = Field("", description="MLPerf submission_org (must be non-empty for a compliant log).")
+  mlperf_submission_platform: str = Field(
+      "", description="MLPerf submission_platform (must be non-empty for a compliant log)."
+  )
+  mlperf_submission_division: str = Field("closed", description="MLPerf submission_division: 'closed' or 'open'.")
+  mlperf_submission_benchmark: str = Field("llama31_8b", description="MLPerf submission_benchmark name.")
+  mlperf_lowest_precision_linear: str = Field(
+      "", description="Optional MLPerf lowest_numerical_precision_in_linear value (empty => not emitted)."
+  )
 
 
 class ManifoldConstrainedHyperConnections(BaseModel):
@@ -2492,6 +2585,7 @@ class MaxTextConfig(
     # Data Types and Quantization
     DataTypes,
     Quantization,
+    Aiter,
     # Core Model Architecture
     ModelArchitecture,
     Engram,
@@ -2544,6 +2638,7 @@ class MaxTextConfig(
     HfDataset,
     GrainDataset,
     OlmoGrainDataset,
+    MegatronReplayDataset,
     Tokenizer,
     # Inference
     InferenceGeneral,
@@ -2917,6 +3012,16 @@ class MaxTextConfig(
         self.quantization_local_shard_count = jax.local_device_count()
       except RuntimeError:
         self.quantization_local_shard_count = 1
+
+    # AITER <-> config flag sync.
+    if self.quantization in ("aiter_bf16", "aiter_fp8", "aiter_fp8_delayed", "aiter_fp8_qdq", "aiter_fp8_mlp_only", "aiter_fp4") and not self.use_jax_aiter:
+      self.use_jax_aiter = True
+    if self.attention == "aiter_flash" and not self.use_jax_aiter:
+      self.use_jax_aiter = True
+    if self.use_jax_aiter and self.aiter_gemm and not self.quantization:
+      self.quantization = QuantizationType.AITER_BF16
+    if self.use_jax_aiter and self.aiter_attention and self.attention not in ("aiter_flash",):
+      self.attention = "aiter_flash"
 
     # F. CALCULATE BATCH SIZES
     def calculate_global_batch_sizes(per_device_batch_size, expansion_factor, num_devices, grad_accum_steps):
