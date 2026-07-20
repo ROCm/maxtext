@@ -74,6 +74,47 @@ from maxtext.utils import sharding
 # ------------------------------------------------------------------------------
 
 
+def _maybe_depth_tail_quant(default_quant, lyr, num_layers):
+  """Depth-tail high-precision lever (NVFP4 2509.25149), default-OFF / reversible.
+
+  For full-scope MXFP4 (AiterFp4Quantization) ONLY, optionally run the last N
+  and/or first M decoder layers fully in bf16 (both MLP and attention
+  projections) by swapping in AiterBf16Quantization for those layers. NVIDIA
+  showed the final layers carry the largest Wgrad/Dgrad FP4 quant error;
+  keeping a small high-precision tail recovers accuracy at low perf cost.
+
+  Env knobs (read at trace time; unset/0 => identity, full FP4):
+    AITER_FP4_BF16_TAIL_LAYERS  int, last N decoder layers -> bf16
+    AITER_FP4_BF16_HEAD_LAYERS  int, first M decoder layers -> bf16
+    AITER_FP4_BF16_TAIL_SCOPE   'all' (default, this swap) | 'attn'
+                                ('attn' is a no-op here; handled op-side in
+                                 quantizations.AiterFp4DotGeneralOp)
+
+  Only applies to the unscanned decoder loop (scan_layers=False), which the
+  accuracy harness uses; under scan_layers=True the layers share one traced
+  body so per-layer swapping is not expressed and this is a no-op.
+  """
+  import os
+
+  if not isinstance(default_quant, quantizations.AiterFp4Quantization):
+    return default_quant
+  scope = os.environ.get("AITER_FP4_BF16_TAIL_SCOPE", "all").lower()
+  if scope != "all":
+    return default_quant
+  tail = int(os.environ.get("AITER_FP4_BF16_TAIL_LAYERS", "") or 0)
+  head = int(os.environ.get("AITER_FP4_BF16_HEAD_LAYERS", "") or 0)
+  if tail <= 0 and head <= 0:
+    return default_quant
+  in_tail = tail > 0 and lyr >= (num_layers - tail)
+  in_head = head > 0 and lyr < head
+  swap = in_tail or in_head
+  if os.environ.get("AITER_FP4_LOG_DEPTH", "0") == "1":
+    print(f"FP4_DEPTH_SWAP: layer={lyr}/{num_layers} -> {'bf16' if swap else 'fp4'} (tail={tail} head={head})")
+  if swap:
+    return quantizations.AiterBf16Quantization()
+  return default_quant
+
+
 class DecoderLayer(nn.Module):
   """
   Transformer decoder layer that attends to the encoder.
@@ -322,8 +363,8 @@ class Decoder(nn.Module):
           config=self.config, layers=build_pipeline_stage_layers, mesh=self.mesh, remat_policy=remat_policy
       )
 
-  def minimal_policy(self, with_context=False, with_quantization=False):
-    """Helper for creating minimal checkpoint policies."""
+  def _minimal_names(self, with_context=False, with_quantization=False):
+    """The intermediate names saved by the 'minimal' family of remat policies."""
     names = [
         "query_proj",
         "value_proj",
@@ -340,7 +381,13 @@ class Decoder(nn.Module):
       names.append("context")
     if with_quantization:
       names.append("quantization")
-    return jax.checkpoint_policies.save_only_these_names(*names)
+    return names
+
+  def minimal_policy(self, with_context=False, with_quantization=False):
+    """Helper for creating minimal checkpoint policies."""
+    return jax.checkpoint_policies.save_only_these_names(
+        *self._minimal_names(with_context=with_context, with_quantization=with_quantization)
+    )
 
   def get_remat_policy(self):
     """Get remat policy"""
@@ -353,6 +400,27 @@ class Decoder(nn.Module):
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
         policy = self.minimal_policy(with_context=True)
+      elif cfg.remat_policy in (
+          "minimal_flash_save_fp4_wtcol",
+          "minimal_flash_save_fp4col",
+      ):
+        # minimal_flash (== minimal_with_context) PLUS save the jax-aiter MXFP4
+        # columnwise dual-cast residuals so the backward dgrad/wgrad reuse them
+        # instead of re-firing CastMxfp4DualJA (the rematerialized re-casts, see
+        # mxfp4_analysis/parsed/remat_recast_sizing.md). jax-aiter tags those
+        # residuals via checkpoint_name when JA_FP4_REMAT_SAVE_COL is set
+        # ('wt' / 'act' / 'both'); the names must match here. Saving (vs
+        # recompute) is a graph-scheduling change only -> numerics are
+        # byte-identical. '_wtcol' saves only the small weight-col residual
+        # (~6 ms/step floor at 8B, lowest extra memory); the full variant also
+        # saves the larger activation-col residual.
+        fp4_names = ["mxfp4_wt_col"]
+        if cfg.remat_policy == "minimal_flash_save_fp4col":
+          fp4_names.append("mxfp4_act_col")
+        policy = jax.checkpoint_policies.save_only_these_names(
+            *self._minimal_names(with_context=True),
+            *fp4_names,
+        )
       elif cfg.remat_policy == "minimal":
         # save all except context
         policy = self.minimal_policy()
@@ -1219,8 +1287,9 @@ class Decoder(nn.Module):
               layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
             if cfg.decoder_block == DecoderBlockType.OLMO3:
               layer_kwargs = {"attention_type": olmo3.get_attention_type(layer_id=lyr)}
+            layer_quant = _maybe_depth_tail_quant(self.quant, lyr, cfg.num_decoder_layers)
             layer = RemattedBlockLayer(
-                config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=self.model_mode, **layer_kwargs
+                config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=layer_quant, model_mode=self.model_mode, **layer_kwargs
             )
             y, returned_cache = layer(
                 y,
