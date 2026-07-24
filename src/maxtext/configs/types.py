@@ -84,6 +84,7 @@ class QuantizationType(str, Enum):
   """Supported quantization schemes."""
 
   NONE = ""
+  FP4 = "fp4"
   INT4 = "int4"
   INT8 = "int8"
   INTMP = "intmp"
@@ -646,6 +647,14 @@ class Attention(BaseModel):
   force_q_layout: bool = Field(False, description="Force the Q layout")
   use_qk_clip: bool = Field(False, description="Whether to use QK-Clip (MuonClip) for training stability.")
   qk_clip_threshold: float = Field(100.0, description="Threshold for QK-Clip (tau).")
+  mla_qk_head_chunk_size: int = Field(
+      0,
+      ge=0,
+      description=(
+          "Chunk size over heads dimension for QK attention dot product in mla. "
+          "Default is 0 (no chunking). Reduces memory footprint at the cost of time."
+      ),
+  )
 
 
 class MoBa(BaseModel):
@@ -2171,6 +2180,10 @@ class AudioEncoder(BaseModel):
   max_sample_len_for_audio: int = Field(10000, description="Maximum sample length for audio input.")
 
 
+class Multimodal(MultimodalGeneral, VisionTower, VisionProjector, AudioEncoder):
+  """Configurations for multimodal"""
+
+
 class RLCluster(BaseModel):
   """Cluster configurations specific to RL training."""
 
@@ -3260,6 +3273,21 @@ class MaxTextConfig(
       raise ValueError("MoBA is only supported with dot_product attention.")
     if self.decoder_block == DecoderBlockType.DEEPSEEK4 and self.attention != "dot_product":
       raise ValueError("DeepSeek4 decoder block currently only supports dot_product attention.")
+    if self.mla_qk_head_chunk_size > 0:
+      if self.attention != "dot_product":
+        raise ValueError("`mla_qk_head_chunk_size` is only supported with `dot_product` attention.")
+      if self.mla_qk_head_chunk_size > self.num_query_heads or self.num_query_heads % self.mla_qk_head_chunk_size != 0:
+        raise ValueError(
+            f"`mla_qk_head_chunk_size` ({self.mla_qk_head_chunk_size}) must cleanly divide exactly into "
+            f"`num_query_heads` ({self.num_query_heads})."
+        )
+      if self.use_indexer and (
+          self.mla_qk_head_chunk_size > self.indexer_n_heads or self.indexer_n_heads % self.mla_qk_head_chunk_size != 0
+      ):
+        raise ValueError(
+            f"`mla_qk_head_chunk_size` ({self.mla_qk_head_chunk_size}) must cleanly divide exactly into "
+            f"`indexer_n_heads` ({self.indexer_n_heads})."
+        )
     if self.use_indexer:
       if self.q_lora_rank == 0:
         raise NotImplementedError("Sparse indexer has not implemented for q_lora_rank = 0.")
@@ -3706,20 +3734,23 @@ class RLConfig(
     LogitsAndLoss,
     RematAndOffload,
     Attention,
-    PositionalEmbedding,
     LayoutAndSharding,
     InferenceLayout,
     InferenceGeneral,
     Decoding,
-    Rope,
     IciParallelism,
     DcnParallelism,
     HardwareAndMesh,
     ModelArchitecture,
     MoBa,
+    # Positional Embeddings
+    PositionalEmbedding,
+    Rope,
+    YarnRope,
     # Mixture of Experts
     MoEGeneral,
     MoEKernels,
+    DeepSeekMoE,
     # General MaxText Configs
     RunInfo,
     Checkpointing,
