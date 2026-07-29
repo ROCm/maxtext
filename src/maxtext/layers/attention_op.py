@@ -71,6 +71,7 @@ from maxtext.kernels.attention.ragged_attention import ragged_mha
 from maxtext.layers import nnx_wrappers
 from maxtext.layers.initializers import variable_to_logically_partitioned
 from maxtext.layers.quantizations import AqtQuantization as Quant
+from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils.sharding import logical_to_mesh_axes, maybe_shard_with_pspec
 import numpy as np
@@ -121,12 +122,56 @@ def apply_mask_to_logits(logits: Array, mask: Array):
   return jnp.where((mask >= DEFAULT_MASK_VALUE * 0.5), logits, DEFAULT_MASK_VALUE)
 
 
-def validate_gpu_flash_attention(sinks: Array | None, record_max_logits: bool) -> None:
+def validate_gpu_flash_attention(
+    sinks: Array | None,
+    record_max_logits: bool,
+    attention_kernel: str | None = None,
+) -> None:
   """Helper function to check for unsupported features with flash attention on GPU."""
-  if sinks is not None:
-    raise ValueError("The flash attention with sinks is not supported on GPU yet.")
+  if sinks is not None and attention_kernel not in ("cudnn_flash_te",):
+    raise ValueError(
+        "Attention sinks on GPU are only supported with attention=cudnn_flash_te. "
+        f"Got attention_kernel={attention_kernel!r}."
+    )
   if record_max_logits:
     raise NotImplementedError("record_max_logits (QK-Clip) is not supported for GPU flash attention kernels yet.")
+
+
+def _sinks_to_te_softmax_offset(sinks: Array, num_query_heads: int) -> Array:
+  """Convert MaxText per-head sinks (H,) to TE softmax_offset (1, H, 1, 1) float32."""
+  sinks = jnp.asarray(sinks, dtype=jnp.float32)
+  if sinks.ndim == 1:
+    if sinks.shape[0] != num_query_heads:
+      raise ValueError(f"Expected sinks shape ({num_query_heads},), got {sinks.shape}.")
+    return sinks.reshape(1, num_query_heads, 1, 1)
+  if sinks.shape == (1, num_query_heads, 1, 1):
+    return sinks
+  raise ValueError(
+      f"Unsupported sinks shape {sinks.shape}; expected ({num_query_heads},) or (1, {num_query_heads}, 1, 1)."
+  )
+
+
+def _inject_te_softmax_offset(dpa_layer, softmax_offset: Array) -> None:
+  """Overwrites the learnable softmax offset of a ToNNX-wrapped TE DotProductAttention.
+
+  Transformer Engine owns `softmax_offset` as a parameter of its own module (matching the
+  PyTorch API), so MaxText grafts its `sinks` parameter into that slot right before the call.
+  The grafted array is an ordinary input of the computation, so gradients flow back to `sinks`
+  and TE's internal zero-initialized parameter never reaches the optimizer or the checkpoint.
+
+  The parameter lives under a TE-internal submodule whose name depends on whether the fused or
+  the unfused backend was selected, hence the lookup by leaf name.
+  """
+  flat_state = nnx.to_flat_state(nnx.state(dpa_layer))
+  offset_path = next((path for path, _ in flat_state if path[-1] == "softmax_offset"), None)
+  if offset_path is None:
+    raise RuntimeError(
+        "Attention sinks require a `softmax_offset` parameter in Transformer Engine's "
+        "DotProductAttention, but no such parameter was found after initialization. The "
+        "installed Transformer Engine likely renamed it. Available parameters: "
+        f"{sorted('/'.join(map(str, path)) for path, _ in flat_state)}."
+    )
+  nnx.update(dpa_layer, nnx.from_flat_state([(offset_path, nnx.Param(softmax_offset))]))
 
 
 # TODO(agagik): change splash_attention_mask._ComputableMask to be non protected
@@ -1025,7 +1070,7 @@ class AttentionOp(nnx.Module):
               wv_product_einsum=wv_product_einsum,
           )
         else:
-          validate_gpu_flash_attention(sinks, record_max_logits)
+          validate_gpu_flash_attention(sinks, record_max_logits, attention_kernel=self.attention_kernel)
           head_axis = -2
           num_query_heads = query.shape[head_axis]
           num_kv_heads = key.shape[head_axis]
@@ -1049,7 +1094,7 @@ class AttentionOp(nnx.Module):
           out = gpu_pallas_attention.mha(query, key, value, decoder_segment_ids, sm_scale=1.0, causal=True)
           return out, None, None
     elif self.attention_kernel == "cudnn_flash_te":
-      validate_gpu_flash_attention(sinks, record_max_logits)
+      validate_gpu_flash_attention(sinks, record_max_logits, attention_kernel=self.attention_kernel)
       if isinstance(key, KVTensor):
         key = key.dequant()
       if isinstance(value, KVTensor):
@@ -1060,12 +1105,20 @@ class AttentionOp(nnx.Module):
                            Use `dot_product` instead."""
         )
       return (
-          self.cudnn_flash_attention(query, key, value, decoder_segment_ids, segment_positions, model_mode),
+          self.cudnn_flash_attention(
+              query,
+              key,
+              value,
+              decoder_segment_ids,
+              segment_positions,
+              model_mode,
+              sinks=sinks,
+          ),
           None,
           None,
       )
     elif self.attention_kernel == "cudnn_flash_jax":
-      validate_gpu_flash_attention(sinks, record_max_logits)
+      validate_gpu_flash_attention(sinks, record_max_logits, attention_kernel=self.attention_kernel)
       if isinstance(key, KVTensor):
         key = key.dequant()
       if isinstance(value, KVTensor):
@@ -1558,6 +1611,7 @@ class AttentionOp(nnx.Module):
       decoder_segment_ids: Array | None,
       segment_positions: Array | None,
       model_mode: str = MODEL_MODE_TRAIN,
+      sinks: Array | None = None,
   ) -> Array:
     """CUDNN Flash Attention with Transformer Engine.
     1. Stable API, supports MHA, GQA, SWA, Packing and Context Parallelism
@@ -1566,11 +1620,6 @@ class AttentionOp(nnx.Module):
       (context_parallel_strategy="ring" and context_parallel_load_balance=true)
     4. Breaks with TE 2.12 and 2.13 (known bug); works with TE stable release <=2.11 or >=2.14.
     """
-    # These imports are only meant to work in a GPU build.
-    # pylint: disable=import-outside-toplevel
-    from transformer_engine.jax.flax.transformer import DotProductAttention  # pytype: disable=import-error
-    from transformer_engine.jax.attention import SequenceDescriptor  # pytype: disable=import-error
-
     _, _, _, head_dim = query.shape  # pylint: disable=unused-variable
 
     using_context_parallelism = self.mesh.shape[self.config.context_sharding] > 1
@@ -1590,8 +1639,22 @@ class AttentionOp(nnx.Module):
     if self.attention_type == AttentionType.LOCAL_SLIDING:
       sliding_window_size = [self.sliding_window_size, 0]
 
+    if sinks is not None:
+      # TE rejects a non-vanilla softmax inside its context parallel partitioner, which surfaces
+      # as an opaque custom_partitioner error, so reject the combination here instead.
+      if using_context_parallelism:
+        raise ValueError(
+            "Attention sinks are not supported with context parallelism by Transformer Engine "
+            "fused attention, which requires a vanilla softmax when context parallelism is "
+            f"active (mesh axis {self.config.context_sharding!r} has size "
+            f"{self.mesh.shape[self.config.context_sharding]}). Disable context parallelism or "
+            "use attention=dot_product."
+        )
     # Handle packing configurations
     if self.config.packing and self.config.dataset_type != "synthetic":
+      # pylint: disable=import-outside-toplevel
+      from transformer_engine.jax.attention import SequenceDescriptor  # pytype: disable=import-error
+
       if using_context_parallelism and not using_load_balanced_ring_cp:
         raise ValueError("Packing is only supported for load balanced ring attention with context parallelism.")
       qkv_layout = "THD_THD_THD"  # Packed format: 'T3HD', 'THD_T2HD' or 'THD_THD_THD'
@@ -1639,6 +1702,10 @@ class AttentionOp(nnx.Module):
       attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
       attn_mask = jnp.where((attn_mask >= DEFAULT_MASK_VALUE * 0.5), 0, 1).astype(jnp.uint8)
 
+    # These imports are only meant to work in a GPU build.
+    # pylint: disable=import-outside-toplevel
+    from transformer_engine.jax.flax.transformer import DotProductAttention  # pytype: disable=import-error
+
     dpa_layer = DotProductAttention(
         head_dim=head_dim,
         num_attention_heads=self.num_query_heads,
@@ -1657,6 +1724,7 @@ class AttentionOp(nnx.Module):
         context_parallel_axis=self.config.context_sharding,
         context_parallel_strategy=self.config.context_parallel_strategy,
         max_segments_per_seq=max_segments_per_seq,
+        softmax_type="learnable" if sinks is not None else "vanilla",
     )
 
     dpa_layer = nnx_wrappers.ToNNX(dpa_layer, rngs=self.rngs)
@@ -1679,6 +1747,8 @@ class AttentionOp(nnx.Module):
         dummy_value_prefill,
         sequence_descriptor=dummy_attn_mask,
     )
+    if sinks is not None:
+      _inject_te_softmax_offset(dpa_layer, _sinks_to_te_softmax_offset(sinks, self.num_query_heads))
     return dpa_layer(query, key, value, sequence_descriptor=attn_mask)
 
   def cudnn_jax_flash_attention(
