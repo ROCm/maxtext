@@ -18,6 +18,7 @@ import dataclasses
 import functools
 from functools import partial
 import math
+import os
 from typing import Any, Callable, Optional, Tuple
 
 from flax import linen as nn
@@ -481,7 +482,14 @@ class AttentionOp(nnx.Module):
     self.kv_quant = kv_quant
     self.attention_type = attention_type
     # Block sizes are only used by TPU splash attention kernels. Exclude non-splash kernels
-    if self.attention_kernel not in ("dot_product", "paged", "vllm_rpa", "cudnn_flash_te", "cudnn_flash_jax"):
+    if self.attention_kernel not in (
+        "dot_product",
+        "paged",
+        "vllm_rpa",
+        "cudnn_flash_te",
+        "cudnn_flash_jax",
+        "aiter_flash",
+    ):
       if self.attention_type == AttentionType.LOCAL_SLIDING:
         self.block_q = self.config.local_sa_block_q
         self.block_kv = self.config.local_sa_block_kv
@@ -1094,11 +1102,19 @@ class AttentionOp(nnx.Module):
       if model_mode == MODEL_MODE_AUTOREGRESSIVE:
         return self.apply_attention_dot(
             query, key, value, decoder_segment_ids, model_mode, previous_chunk,
-            bidirectional_mask=bidirectional_mask, sinks=sinks, index_mask=index_mask,
+            segment_positions=segment_positions,
+            bidirectional_mask=bidirectional_mask, sinks=sinks, indexer_mask=indexer_mask,
+            compressed_mask=compressed_mask,
             record_max_logits=record_max_logits,
             qk_product_einsum=qk_product_einsum, wv_product_einsum=wv_product_einsum,
         )
-      return self.aiter_flash_attention(query, key, value, decoder_segment_ids), None, None
+      return (
+          self.aiter_flash_attention(
+              query, key, value, decoder_segment_ids, segment_positions
+          ),
+          None,
+          None,
+      )
     elif self.attention_kernel in ("flash", "autoselected"):
       if target_hardware == "tpu":
         if isinstance(key, KVTensor):
@@ -1868,21 +1884,89 @@ class AttentionOp(nnx.Module):
     )
     return dpa_layer(query, key, value, sequence_descriptor=attn_mask)
 
+  def _aiter_packed_metadata(self, segment_ids: Array, seq_len: int) -> tuple[Array, Array]:
+    """THD sequence metadata for one device-local ``[b_local, seq_len]`` shard.
+
+    Mirrors what TE derives for its CK backend
+    (`transformer_engine/jax/attention.py::_get_seqlens_and_offsets` plus the
+    compaction in `cpp_extensions/attention.py`), so both attention backends
+    describe the same segments to the same AITER kernels:
+
+    * ``seqstart``  -- cumulative **physical** token offsets, padding included.
+    * ``cu_seqlen`` -- cumulative **logical** lengths, padding excluded.
+
+    Segment id ``0`` is padding, never a sequence
+    (`input_pipeline/packing/sequence_packing.py`). Both arrays are statically
+    sized at ``b_local * max_segments_per_seq + 1`` slots; unused slots get a
+    zero logical length, which is how AITER is told to skip them.
+
+    Assumes MaxText's packing invariants: ids are monotonic within a row and
+    each id forms one contiguous run, with padding only between/after segments.
+    """
+    max_seg = self.config.max_segments_per_seq
+    b_local = segment_ids.shape[0]
+    n_slots = b_local * max_seg
+    total = b_local * seq_len
+    sid = segment_ids.astype(jnp.int32)
+
+    # Logical length of every (row, id) pair; drop the id-0 (padding) bucket.
+    lengths = jax.vmap(partial(jnp.bincount, length=max_seg + 1))(sid)[:, 1:]
+
+    # First token of each non-padding run, as a flattened offset.
+    starts_row = jnp.concatenate(
+        [
+            sid[:, :1] != 0,
+            jnp.logical_and(sid[:, 1:] != sid[:, :-1], sid[:, 1:] != 0),
+        ],
+        axis=1,
+    )
+    offsets = jax.vmap(partial(jnp.argwhere, size=max_seg + 1, fill_value=-1))(starts_row)
+    offsets = offsets.squeeze(-1)
+    offsets = jnp.where(offsets >= 0, offsets + (jnp.arange(b_local) * seq_len)[:, None], -1)
+
+    def _compact(x, keep, fill):
+      """Move kept entries of a [b, k] array to the front of one flat array."""
+      flat = x.reshape(-1)
+      idx = jnp.nonzero(keep.reshape(-1), size=flat.size, fill_value=flat.size)[0]
+      return jnp.take(flat, idx, fill_value=fill)
+
+    # Real segments first, in token order; unused slots are empty (length 0) and
+    # point one past the end of the buffer.
+    lengths = _compact(lengths, lengths > 0, fill=0)[:n_slots]
+    seqstart = _compact(offsets, offsets >= 0, fill=total)[:n_slots]
+
+    seqstart = jnp.concatenate([seqstart, jnp.full((1,), total, jnp.int32)]).astype(jnp.int32)
+    cu_seqlen = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), jnp.cumsum(lengths).astype(jnp.int32)]
+    )
+    return seqstart, cu_seqlen
+
   def aiter_flash_attention(
       self,
       query: Array,
       key: Array | KVTensor,
       value: Array | KVTensor,
       decoder_segment_ids: Array | None,
+      segment_positions: Array | None = None,
   ) -> Array:
     """Direct jax-aiter AITER flash attention.
 
-    Packed real data (decoder_segment_ids present) -> flash_attn_varlen over the
-    flattened [b*s, h, d] tokens with cu_seqlens built from segment_ids (true
-    block-diagonal per-segment causal attention). Non-packed -> batch flash_attn_func.
-    MaxText pre-scales the query via the projection kernel (depth_scaling), so the
-    attention softmax scale is 1.0 (matching the cudnn_flash_te path).
+    Route selection matches `cudnn_flash_attention` so the two backends are
+    comparable: real packed data uses THD/varlen, everything else uses batched
+    attention. Synthetic data reports all-ones segment ids rather than ``None``,
+    so branching on the ids alone would push a plain batch of full-length
+    sequences down the varlen path.
+
+    MaxText pre-scales the query in the projection (depth_scaling), so the
+    softmax scale here is 1.0, as on the `cudnn_flash_te` path.
+
+    `segment_positions` is accepted for interface parity with TE but is not
+    needed here: TE's position-based seqlen/offset correction
+    (`_fast_causal_adjust_seqlen_and_offsets`) compares the first and last
+    position of the Q and KV segments, and for self-attention those are the same
+    tensor, so both corrections are identically zero.
     """
+    del segment_positions
     # pylint: disable=import-outside-toplevel
     from jax_aiter.mha import flash_attn_func, flash_attn_varlen_raw  # pytype: disable=import-error
     from jax.experimental.shard_map import shard_map  # pytype: disable=import-error
@@ -1893,16 +1977,43 @@ class AttentionOp(nnx.Module):
     if isinstance(value, KVTensor):
       value = value.dequant()
 
-    if decoder_segment_ids is None:
-      return flash_attn_func(query, key, value, causal=True, softmax_scale=1.0)[0]
+    if self.attention_type not in (AttentionType.GLOBAL, AttentionType.FULL):
+      raise NotImplementedError(
+          f"attention=aiter_flash supports global causal attention only, got {self.attention_type}. "
+          "Use attention=cudnn_flash_te for sliding-window or chunked attention."
+      )
+    if self.dropout_rate and self.dropout_rate > 0.0:
+      raise NotImplementedError("attention=aiter_flash does not implement attention dropout.")
 
-    max_seg = self.config.max_segments_per_seq
+    # Same predicate as cudnn_flash_attention: packing is inert for synthetic
+    # data, which MaxText warns about and which keeps TE on the batched layout.
+    use_packed = bool(self.config.packing) and self.config.dataset_type != "synthetic"
+
+    if not use_packed or decoder_segment_ids is None:
+      # Full-length causal sequences. Row padding is not expressible on either
+      # route (TE covers that case with an explicit mask), so it stays on TE.
+      #
+      # Batched attention and one tight varlen segment per row compute the same
+      # function here, but they do not reach the same kernels: at this shape AITER
+      # has no batch-mode ASM v3 backward and silently falls back to CK, while
+      # group mode reaches `bwd_hd128_bf16_causal_br_a32_psskddv_group`. Since the
+      # newer ASM backward is the whole reason to route through jax-aiter, the
+      # default is one tight segment per row. `JA_MHA_NONPACKED_ROUTE=batch`
+      # selects the batched layout TE uses for this input, for a layout-matched
+      # comparison. Dispatch and per-call evidence:
+      # docs/runs/llama3_8b/kernels/20260730_8b_bf16_mha_packed_contract_097_i1/
+      #
+      # Without segment ids there is nothing to shard-map over, so batched is the
+      # only option.
+      if decoder_segment_ids is None or os.environ.get("JA_MHA_NONPACKED_ROUTE", "varlen") == "batch":
+        return flash_attn_func(query, key, value, causal=True, softmax_scale=1.0)[0]
+
     mesh = self.mesh
     # The activation batch dim is sharded over these mesh axes (base.yml
     # logical_axis_rules: activation_batch -> data/fsdp/fsdp_transpose/expert).
     # shard_map makes each device hold a fully-LOCAL [b_local, s, h, d] shard so
-    # we can build device-local cu_seqlens and call the raw varlen FFI per-shard
-    # (the global-offset cu_seqlens cannot be used on a token-sharded q).
+    # we can build device-local metadata and call the raw varlen FFI per-shard
+    # (global-offset metadata cannot be used on a token-sharded q).
     batch_axes = tuple(
         ax for ax in ("data", "fsdp", "fsdp_transpose", "expert")
         if ax in mesh.axis_names and mesh.shape[ax] > 1
@@ -1918,19 +2029,20 @@ class AttentionOp(nnx.Module):
     def _local_varlen(q_l, k_l, v_l, sid_l):
       bl, sl, hq_l, d_l = q_l.shape
       n = bl * sl
-      sid = sid_l.astype(jnp.int32).reshape(-1)
-      idx = jnp.arange(n, dtype=jnp.int32)
-      row = idx // sl
-      prev_sid = jnp.concatenate([jnp.full((1,), -1, jnp.int32), sid[:-1]])
-      prev_row = jnp.concatenate([jnp.full((1,), -1, jnp.int32), row[:-1]])
-      is_start = (sid != prev_sid) | (row != prev_row)
-      start_off = jnp.where(is_start, idx, jnp.int32(n))
-      max_slots = bl * (max_seg + 2)
-      cu = jnp.concatenate([jnp.sort(start_off)[:max_slots], jnp.full((1,), n, jnp.int32)])
+      if use_packed:
+        seqstart, cu_seqlen = self._aiter_packed_metadata(sid_l, sl)
+      else:
+        # One full-length segment per row: physical and logical agree, so the
+        # logical array is omitted (AITER's group mode without padding).
+        seqstart = jnp.arange(bl + 1, dtype=jnp.int32) * sl
+        cu_seqlen = None
       qf = q_l.reshape(n, hq_l, d_l)
       kf = k_l.reshape(n, k_l.shape[2], d_l)
       vf = v_l.reshape(n, v_l.shape[2], v_l.shape[3])
-      out = flash_attn_varlen_raw(qf, kf, vf, cu, cu, sl, sl, 0.0, 1.0, True, (-1, -1))
+      out = flash_attn_varlen_raw(
+          qf, kf, vf, seqstart, seqstart, cu_seqlen, cu_seqlen,
+          sl, sl, 0.0, 1.0, True, (-1, -1),
+      )
       return out.reshape(bl, sl, hq_l, vf.shape[-1])
 
     return shard_map(
