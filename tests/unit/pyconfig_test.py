@@ -38,6 +38,52 @@ class PyconfigTest(unittest.TestCase):
 
     self.assertTrue(config.quantization is None or config.quantization == "")
 
+  def test_aiter_fp4_defaults_to_direct_mha(self):
+    config = pyconfig.initialize(
+        [
+            os.path.join(MAXTEXT_PKG_DIR, "train.py"),
+            os.path.join(MAXTEXT_CONFIGS_DIR, "gpu", "models", "llama3_8b.yml"),
+        ],
+        skip_jax_distributed_system=True,
+        quantization="aiter_fp4",
+    )
+
+    self.assertEqual(config.attention, "aiter_flash")
+    self.assertTrue(config.aiter_attention)
+    self.assertTrue(config.use_jax_aiter)
+
+  def test_aiter_fp4_explicit_attention_preserves_te_rollback(self):
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        quantization="aiter_fp4",
+        attention="cudnn_flash_te",
+    )
+
+    self.assertEqual(config.attention, "cudnn_flash_te")
+
+  def test_aiter_fp4_flag_preserves_te_rollback(self):
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        quantization="aiter_fp4",
+        aiter_attention=False,
+    )
+
+    self.assertNotEqual(config.attention, "aiter_flash")
+    self.assertFalse(config.aiter_attention)
+
+  def test_aiter_fp4_unvalidated_model_does_not_auto_route_mha(self):
+    config = pyconfig.initialize(
+        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+        skip_jax_distributed_system=True,
+        quantization="aiter_fp4",
+        enable_dropout=False,
+    )
+
+    self.assertNotIn(config.model_name, ("llama3-8b", "llama3.1-8b"))
+    self.assertNotEqual(config.attention, "aiter_flash")
+
   def test_multiple_unmodifiable_configs(self):
     config_train = pyconfig.initialize(
         [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],

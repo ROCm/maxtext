@@ -577,6 +577,25 @@ def _initialize_pydantic(argv: list[str] | None = None, config_class: type[Any] 
   pydantic_config = config_class(**pydantic_kwargs)
   explicit_keys = set((cli_keys | kwargs_keys | env_keys) & frozenset(config_class.model_fields.keys()))
   object.__setattr__(pydantic_config, "__pydantic_fields_set__", explicit_keys)
+
+  # The validated Llama 3/3.1 8B MXFP4 recipe uses the repository-owned
+  # JAX-AITER MHA path by default. Apply this *after* computing explicit_keys so either
+  # `attention=cudnn_flash_te` or `aiter_attention=False` remains a deliberate
+  # rollback. Keep the auto-route narrow: AITER FP4, global/full attention, and
+  # dropout disabled. Other AITER precisions and attention variants retain
+  # their existing backend.
+  if (
+      pydantic_config.quantization == types.QuantizationType.AITER_FP4
+      and pydantic_config.model_name in ("llama3-8b", "llama3.1-8b")
+      and pydantic_config.attention_type in ("global", "full")
+      and not pydantic_config.enable_dropout
+      and "attention" not in explicit_keys
+      and "aiter_attention" not in explicit_keys
+  ):
+    pydantic_config.attention = "aiter_flash"
+    pydantic_config.aiter_attention = True
+    pydantic_config.use_jax_aiter = True
+
   config = HyperParameters(pydantic_config)
 
   if config.log_config:

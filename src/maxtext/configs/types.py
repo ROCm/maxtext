@@ -506,8 +506,10 @@ class Aiter(BaseModel):
   aiter_attention: bool = Field(
       False,
       description="AITER CK flash attention via jax-aiter FFI. "
-      "Set attention=aiter_flash or enable this flag (requires use_jax_aiter=True). "
-      "Note: TE attention (cudnn_flash_te) already uses the same CK kernels on ROCm.",
+      "The validated global, dropout-free Llama 3/3.1 8B aiter_fp4 recipe "
+      "auto-enables this unless attention or aiter_attention was explicitly set. "
+      "Set attention=cudnn_flash_te or aiter_attention=False for the TE rollback "
+      "(requires use_jax_aiter=True).",
   )
   aiter_moe: bool = Field(
       False,

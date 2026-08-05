@@ -14,6 +14,7 @@
 
 """Tests for Attentions."""
 
+import functools
 import itertools
 import os
 import random
@@ -572,6 +573,156 @@ class CudnnTePackedSequenceDescriptorTest(unittest.TestCase):
           attention_type=AttentionType.CHUNK,
           chunk_attn_window_size=2,
       )
+
+
+class AiterPackedMetadataTest(unittest.TestCase):
+  """THD metadata handed to the jax-aiter varlen kernels.
+
+  `seqstart` is cumulative physical offsets (padding included) and `cu_seqlen`
+  is cumulative logical lengths (padding excluded), matching what TE derives for
+  the same segment ids. Runs on CPU: no kernel is invoked.
+  """
+
+  def _metadata(self, segment_ids, max_segments_per_seq):
+    fake_self = types.SimpleNamespace(
+        config=types.SimpleNamespace(max_segments_per_seq=max_segments_per_seq)
+    )
+    segment_ids = jnp.asarray(segment_ids, dtype=jnp.int32)
+    build = functools.partial(
+        AttentionOp._aiter_packed_metadata,  # pylint: disable=protected-access
+        fake_self,
+    )
+    seqstart, cu_seqlen = jax.jit(build, static_argnums=(1,))(segment_ids, segment_ids.shape[1])
+    return np.asarray(seqstart), np.asarray(cu_seqlen)
+
+  def test_trailing_padding_is_excluded_from_logical_lengths(self):
+    # Row 0: ids 1,1,1 then 2,2 then padding. Row 1: one segment, then padding.
+    segment_ids = [[1, 1, 1, 2, 2, 0, 0, 0], [1, 1, 1, 1, 0, 0, 0, 0]]
+    seqstart, cu_seqlen = self._metadata(segment_ids, max_segments_per_seq=4)
+
+    total = 16
+    # Physical starts: row 0 at 0 and 3, row 1 at 8; unused slots point past the end.
+    np.testing.assert_array_equal(seqstart[:3], [0, 3, 8])
+    np.testing.assert_array_equal(seqstart[3:], [total] * (len(seqstart) - 3))
+    # Logical lengths 3, 2, 4 then nothing.
+    np.testing.assert_array_equal(cu_seqlen[:4], [0, 3, 5, 9])
+    np.testing.assert_array_equal(cu_seqlen[4:], [9] * (len(cu_seqlen) - 4))
+
+  def test_static_slot_count_is_independent_of_real_segment_count(self):
+    max_seg = 4
+    one = [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1]]
+    many = [[1, 1, 2, 2, 3, 3, 4, 4], [1, 1, 2, 2, 3, 3, 4, 4]]
+    seqstart_one, cu_one = self._metadata(one, max_seg)
+    seqstart_many, cu_many = self._metadata(many, max_seg)
+
+    expected_slots = 2 * max_seg + 1
+    for arr in (seqstart_one, cu_one, seqstart_many, cu_many):
+      self.assertEqual(arr.shape, (expected_slots,))
+
+    # Unpadded rows: physical spans and logical lengths agree.
+    np.testing.assert_array_equal(seqstart_one[:3], [0, 8, 16])
+    np.testing.assert_array_equal(cu_one[:3], [0, 8, 16])
+    np.testing.assert_array_equal(seqstart_many[:9], [0, 2, 4, 6, 8, 10, 12, 14, 16])
+    np.testing.assert_array_equal(cu_many[:9], [0, 2, 4, 6, 8, 10, 12, 14, 16])
+
+  def test_all_ones_segmentation_is_one_sequence_per_row(self):
+    # The shape synthetic data produces; every token is real.
+    segment_ids = np.ones((4, 8), dtype=np.int32)
+    seqstart, cu_seqlen = self._metadata(segment_ids, max_segments_per_seq=32)
+
+    np.testing.assert_array_equal(seqstart[:5], [0, 8, 16, 24, 32])
+    np.testing.assert_array_equal(cu_seqlen[:5], [0, 8, 16, 24, 32])
+    # Tail slots are empty, so AITER skips them.
+    np.testing.assert_array_equal(seqstart[5:], [32] * (len(seqstart) - 5))
+    np.testing.assert_array_equal(cu_seqlen[5:], [32] * (len(cu_seqlen) - 5))
+
+  def test_segment_ids_are_monotonic_offsets_in_token_order(self):
+    segment_ids = [[1, 1, 0, 2, 2, 2, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0]]
+    seqstart, cu_seqlen = self._metadata(segment_ids, max_segments_per_seq=4)
+
+    self.assertTrue(np.all(np.diff(seqstart) >= 0), msg=f"seqstart not sorted: {seqstart}")
+    self.assertTrue(np.all(np.diff(cu_seqlen) >= 0), msg=f"cu_seqlen not sorted: {cu_seqlen}")
+    np.testing.assert_array_equal(seqstart[:3], [0, 3, 8])
+    np.testing.assert_array_equal(cu_seqlen[:4], [0, 2, 5, 6])
+
+
+class AiterAttentionRoutingTest(parameterized.TestCase):
+  """Which jax-aiter entry point each input shape selects.
+
+  Non-packed input must not be described as packed with phantom segments, and
+  must still reach the group-mode ASM backward: batched attention at this shape
+  has no ASM v3 backward and falls back to CK. Real packed input carries genuine
+  segments and needs the varlen route with its logical lengths.
+  """
+
+  def _route_for(self, packing, dataset_type, segment_ids_present, nonpacked_route=None):
+    calls = []
+
+    def fake_flash_attn_func(*args, **kwargs):  # pylint: disable=unused-argument
+      calls.append("batch")
+      return (jnp.zeros((1, 4, 2, 2), dtype=jnp.float32),)
+
+    def fake_flash_attn_varlen_raw(*args, **kwargs):  # pylint: disable=unused-argument
+      calls.append("varlen")
+      return jnp.zeros((4, 2, 2), dtype=jnp.float32)
+
+    mha_module = types.ModuleType("jax_aiter.mha")
+    mha_module.flash_attn_func = fake_flash_attn_func
+    mha_module.flash_attn_varlen_raw = fake_flash_attn_varlen_raw
+    fake_modules = {
+        "jax_aiter": types.ModuleType("jax_aiter"),
+        "jax_aiter.mha": mha_module,
+    }
+
+    config = types.SimpleNamespace(
+        context_sharding="context",
+        context_parallel_strategy="ring",
+        context_parallel_load_balance=False,
+        packing=packing,
+        dataset_type=dataset_type,
+        max_segments_per_seq=2,
+        head_dim=2,
+        attention_kernel="aiter_flash",
+    )
+    mesh = Mesh(np.array(jax.devices()[:1]), ("fsdp",))
+    attention = AttentionOp(
+        config=config,
+        mesh=mesh,
+        attention_kernel="aiter_flash",
+        max_target_length=4,
+        num_query_heads=2,
+        num_kv_heads=2,
+        dtype=jnp.float32,
+    )
+    query = jnp.zeros((1, 4, 2, 2), dtype=jnp.float32)
+    key = jnp.zeros((1, 4, 2, 2), dtype=jnp.float32)
+    value = jnp.zeros((1, 4, 2, 2), dtype=jnp.float32)
+    segment_ids = jnp.ones((1, 4), dtype=jnp.int32) if segment_ids_present else None
+
+    env = {} if nonpacked_route is None else {"JA_MHA_NONPACKED_ROUTE": nonpacked_route}
+    with mock.patch.dict(sys.modules, fake_modules), mock.patch.dict(os.environ, env):
+      attention.aiter_flash_attention(query, key, value, segment_ids)
+    return calls
+
+  @parameterized.named_parameters(
+      {"testcase_name": "synthetic_with_packing", "packing": True, "dataset_type": "synthetic"},
+      {"testcase_name": "no_packing", "packing": False, "dataset_type": "grain"},
+  )
+  def test_non_packed_inputs_use_one_tight_segment_per_row(self, packing, dataset_type):
+    calls = self._route_for(packing, dataset_type, segment_ids_present=True)
+    self.assertEqual(calls, ["varlen"])
+
+  def test_non_packed_inputs_can_be_forced_to_batched_layout(self):
+    calls = self._route_for(True, "synthetic", segment_ids_present=True, nonpacked_route="batch")
+    self.assertEqual(calls, ["batch"])
+
+  def test_real_packed_input_uses_varlen(self):
+    calls = self._route_for(True, "grain", segment_ids_present=True)
+    self.assertEqual(calls, ["varlen"])
+
+  def test_missing_segment_ids_use_batched_attention(self):
+    calls = self._route_for(True, "grain", segment_ids_present=False)
+    self.assertEqual(calls, ["batch"])
 
 
 class AttentionTest(parameterized.TestCase):
