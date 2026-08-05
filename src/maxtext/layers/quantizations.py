@@ -1345,7 +1345,57 @@ class AiterFp4DotGeneralOp(nn.Module):
 
     if use_fp4:
       from jax_aiter.gemm_fp4 import gemm_fp4_bf16 as aiter_fp4_gemm
-      out_2d = aiter_fp4_gemm(a_bf16, b_bf16)
+      sr_tokens = {
+          token.strip().lower()
+          for token in os.environ.get("JA_FP4_SR_PASSES", "").split(",")
+          if token.strip()
+      }
+      sr_enabled = (
+          os.environ.get("AITER_FP4_SR", "0") == "1"
+          or bool(
+              sr_tokens
+              & {
+                  "dgrad_grad",
+                  "grad",
+                  "dgrad",
+                  "dgrad_row",
+                  "dgrad_grad_row",
+                  "wgrad_col",
+                  "wgrad_grad_col",
+                  "act",
+                  "fprop",
+                  "fprop_act",
+                  "wt",
+                  "weight",
+              }
+          )
+      )
+      if sr_enabled:
+        if not self.has_rng("params"):
+          raise ValueError(
+              "AITER FP4 stochastic rounding requires the runtime 'params' RNG"
+          )
+        site_key = self.make_rng("params")
+        sr_key = jax.random.key_data(site_key)
+        if sr_key.dtype != jnp.uint32:
+          raise ValueError(
+              f"AITER FP4 SR key data must be uint32, got {sr_key.dtype}"
+          )
+        if sr_key.shape == (2,):
+          sr_key = jnp.concatenate(
+              (
+                  sr_key,
+                  sr_key ^ jnp.array([0x9E3779B9, 0xD1B54A35], dtype=jnp.uint32),
+              )
+          )
+        elif sr_key.shape != (4,):
+          raise ValueError(
+              "AITER FP4 deterministic SR requires uint32[2] or uint32[4] "
+              f"site key data, got shape={sr_key.shape}"
+          )
+        out_2d = aiter_fp4_gemm(a_bf16, b_bf16, sr_key=sr_key)
+      else:
+        out_2d = aiter_fp4_gemm(a_bf16, b_bf16)
     elif os.environ.get("AITER_BF16_HIPBLASLT", "0") == "1":
       # Default-OFF A/B knob (20260616): route the non-FP4 (bf16) attention
       # projections + logits through XLA lax.dot_general (hipBLASLt) for

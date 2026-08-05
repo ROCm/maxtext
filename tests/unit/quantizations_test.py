@@ -17,6 +17,7 @@
 import functools
 import os.path
 import sys
+import types
 from typing import Any
 import unittest
 from aqt.jax.v2 import aqt_tensor
@@ -40,6 +41,43 @@ import pytest
 
 _QUERY_REGEX = ".*/query"
 _VALUE_REGEX = ".*/value"
+
+
+def test_aiter_fp4_sr_uses_replayable_runtime_site_key(monkeypatch):
+  captured_keys = []
+  fake_module = types.ModuleType("jax_aiter.gemm_fp4")
+
+  def fake_gemm(a, b, *, sr_key=None):
+    captured_keys.append(np.asarray(sr_key))
+    return jnp.zeros((a.shape[0], b.shape[0]), dtype=jnp.bfloat16)
+
+  fake_module.gemm_fp4_bf16 = fake_gemm
+  monkeypatch.setitem(sys.modules, "jax_aiter.gemm_fp4", fake_module)
+  monkeypatch.setenv("JA_FP4_SR_PASSES", "wgrad_col")
+  monkeypatch.setenv("AITER_FP4_SR", "0")
+
+  module = quantizations.AiterFp4DotGeneralOp(module_context="mlp_gate")
+  inputs = jnp.ones((64, 64), dtype=jnp.bfloat16)
+  kernel = jnp.ones((32, 64), dtype=jnp.bfloat16)
+  dims = (((1,), (1,)), ((), ()))
+  variables = module.init(
+      {"params": jax.random.PRNGKey(0)}, inputs, kernel, dims
+  )
+
+  captured_keys.clear()
+  for seed in (17, 17, 18):
+    module.apply(
+        variables,
+        inputs,
+        kernel,
+        dims,
+        rngs={"params": jax.random.PRNGKey(seed)},
+    )
+
+  np.testing.assert_array_equal(captured_keys[0], captured_keys[1])
+  assert captured_keys[0].shape == (4,)
+  assert captured_keys[0].dtype == np.uint32
+  assert np.any(captured_keys[0] != captured_keys[2])
 
 
 class QuantTestModule(nnx.Module):
