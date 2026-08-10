@@ -1469,7 +1469,12 @@ class RoutedMoE(nnx.Module):
       if inputs.shape[0] != expert_assignments.shape[0]:
         raise ValueError("The number of input tokens must match the number of expert assignments!")
 
-      tokamax_group_sizes = get_tokamax_group_sizes(group_sizes, inputs, kernel)
+      # Only the tokamax branch consumes this; the megablox and ragged_dot branches
+      # use group_sizes directly. Computing it unconditionally also breaks against
+      # tokamax 0.0.10, whose RaggedDotGroupSizes wants an iterable representative_value.
+      tokamax_group_sizes = (
+          get_tokamax_group_sizes(group_sizes, inputs, kernel) if self.config.use_tokamax_gmm else group_sizes
+      )
       orig_inputs_shape = inputs.shape  # save shape of inputs before potentially padding.
       inputs, padding_amount = max_utils.maybe_pad(inputs, self.config.wi_tile_fwd_batch_seq)
       if padding_amount > 0 and partial_sum is not None:
