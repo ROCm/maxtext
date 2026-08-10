@@ -948,6 +948,16 @@ class MoEKernels(BaseModel):
 
   megablox: bool = Field(True, description="Whether to use Megablox kernels for MoE.")
   sparse_matmul: bool = Field(True, description="Whether to use sparse matmul kernels for MoE.")
+  use_flydsl_moe: bool = Field(
+      False,
+      description=(
+          "Train routed MoE with the FlyDSL grouped MXFP8 GEMM: the three expert matmuls "
+          "of the sparse_matmul path contract in MXFP8 while routing, activation, and "
+          "unpermute stay unchanged. Requires sparse_matmul, the jax_flydsl package, and "
+          "expert dims that are multiples of 128 and at least 256 -- both the embed and "
+          "MLP dims, since each is contracted somewhere in a step."
+      ),
+  )
   wi_tile_fwd_batch_seq: int = Field(
       512,
       description="forward pass tiling dimension for batch/sequence in GMM for wi.",

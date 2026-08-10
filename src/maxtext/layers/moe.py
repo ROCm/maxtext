@@ -1379,6 +1379,11 @@ class RoutedMoE(nnx.Module):
       input_ids=None,
   ):
     """Perform sparse matrix multiplication of inputs and Experts."""
+    if self.config.use_flydsl_moe and self.config.num_moe_emb_chunks > 0:
+      raise ValueError(
+          "use_flydsl_moe does not support num_moe_emb_chunks > 0, which takes a "
+          "separate path that does its own routing and never reaches the grouped GEMM."
+      )
 
     def jax_ragged_dot_gmm(inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount):
       """Execute jax.lax.ragged_dot, with potential quantization"""
@@ -2116,6 +2121,9 @@ class RoutedMoE(nnx.Module):
         rngs,
     ):
       batch_size, sequence_length, embed_dim = x.shape
+      # Set by the MXFP8 branch below and read again after the activation, which
+      # is shared with the megablox path. `None` means that path is not in use.
+      group_offsets = None
       if self.config.num_moe_emb_chunks > 0:
         output0, output1, gmm_fn, routing, route_metadata, wo_bias = moe_emb_chunking(
             x,
@@ -2136,17 +2144,34 @@ class RoutedMoE(nnx.Module):
         if self.config.mlp_bias:
           w0_bias, w1_bias, wo_bias = self.transform_bias(routing.selected_experts, w0_bias, w1_bias, wo_bias)
 
-        gmm_fn = get_gmm_for_local_experts(x, routing, route_metadata)
-        output0, output1 = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather)
+        if self.config.use_flydsl_moe:
+          # `route` has already stacked this shard's tokens by local expert, one
+          # row per (token, expert) copy, which is the ragged layout the grouped
+          # MXFP8 GEMM reads -- so only the three expert matmuls change here.
+          # Everything around them, including the router weights applied in
+          # `unpermute`, is MaxText's own and differentiable as it stands.
+          from maxtext.integration.flydsl import moe_bridge  # local import: optional dep
+
+          group_offsets = moe_bridge.group_offsets_from_sizes(routing.group_sizes)
+          output0 = moe_bridge.grouped_gemm_mxfp8_experts(x, w0, group_offsets)
+          output1 = moe_bridge.grouped_gemm_mxfp8_experts(x, w1, group_offsets)
+        else:
+          gmm_fn = get_gmm_for_local_experts(x, routing, route_metadata)
+          output0, output1 = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather)
 
       intermediate_layer = self.apply_ffn_activation(output0, output1)
-      wo_gather_axes, wo_tile_size = get_wo_gmm_params()
-      intermediate_output = gmm_fn(
-          intermediate_layer,
-          wo,
-          tiling=wo_tile_size,
-          weight_gather_axes=wo_gather_axes,
-      )
+      if group_offsets is not None:
+        from maxtext.integration.flydsl import moe_bridge  # local import: optional dep
+
+        intermediate_output = moe_bridge.grouped_gemm_mxfp8_experts(intermediate_layer, wo, group_offsets)
+      else:
+        wo_gather_axes, wo_tile_size = get_wo_gmm_params()
+        intermediate_output = gmm_fn(
+            intermediate_layer,
+            wo,
+            tiling=wo_tile_size,
+            weight_gather_axes=wo_gather_axes,
+        )
       if self.get_tensor_parallelism_size() > 1:
         intermediate_output = jax.lax.psum_scatter(
             intermediate_output,
