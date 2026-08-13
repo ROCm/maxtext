@@ -676,12 +676,9 @@ class Attention(BaseModel):
   query_pre_attn_scalar: NonNegativeFloat = Field(
       0.0,
       description=(
-          "Optional runtime query-pre-attention scalar for the llama-style decoder block. "
-          "0.0 (default) = disabled: keep MaxText's default behavior of folding 1/sqrt(head_dim) "
-          "into the query projection KERNEL at init (depth_scaling). Setting a positive value "
-          "(e.g. head_dim**-0.5 = 1/sqrt(head_dim)) moves that scaling from the WEIGHT to RUNTIME "
-          "(query *= scalar), which is FORWARD-EQUIVALENT but un-inflates the query-weight gradient "
-          "(matches Megatron's runtime query scaling). Default-off; only the llama2 decoder reads it."
+          "Optional runtime query-pre-attention scalar override for the llama-style decoder block. "
+          "0.0 preserves release/v26.6's runtime default of head_dim**-0.5; a positive value "
+          "replaces that default explicitly. Only the llama2 decoder reads this field."
       ),
   )
   use_post_attn_norm: bool = Field(False, description="Apply LayerNorm after the attention block.")

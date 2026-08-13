@@ -192,10 +192,9 @@ cast_logits_to_fp32: true # whether to cast the logits to fp32. the higher preci
 float32_qk_product: false # in dot_product attention, whether to cast to fp32 the inputs to qk product
 float32_logits: false # in dot_product attention, whether to cast to fp32 the inputs to softmax
 mla_qk_head_chunk_size: 0 # Limits HBM footprint by sequentially evaluating the QK matrix across the unsharded local heads dimension natively.
-# Runtime query-pre-attention scalar (llama2 decoder only). 0.0 = disabled (default):
-# 1/sqrt(head_dim) stays FOLDED into the query kernel at init (depth_scaling). A positive value
-# (e.g. head_dim**-0.5) moves that scaling to RUNTIME (forward-equivalent) so the query-weight
-# gradient is not inflated by sqrt(head_dim) -- matching Megatron's runtime query scaling.
+# Runtime query-pre-attention scalar override (llama2 decoder only). 0.0 keeps
+# release/v26.6's default runtime scale of head_dim**-0.5; a positive value
+# overrides it explicitly.
 query_pre_attn_scalar: 0.0
 float32_weight_sum: true # whether to use full fp32 precision to sum expert weights for numerical stability
 float32_gate_logits: false # whether to cast inputs to fp32 to compute MoE gate logits for numerical stability
