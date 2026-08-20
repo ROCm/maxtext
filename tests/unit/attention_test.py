@@ -2544,6 +2544,142 @@ class AttentionTest(parameterized.TestCase):
         )
     )
 
+  def _gpu_paged_config(self, seq_len, **overrides):
+    arguments = self.config_arguments.copy()
+    arguments["max_target_length"] = seq_len
+    arguments["max_prefill_predict_length"] = seq_len
+    arguments["scan_layers"] = False
+    arguments.update(overrides)
+    return pyconfig.initialize([sys.argv[0], get_test_config_path()], **arguments)
+
+  def _build_attention(self, config, seq_len, model_mode):
+    dummy = jnp.ones((self.global_batch_size, seq_len, config.base_emb_dim))
+    return Attention(
+        config=config,
+        num_query_heads=config.num_query_heads,
+        num_kv_heads=config.num_kv_heads,
+        head_dim=config.head_dim,
+        max_target_length=seq_len,
+        max_prefill_predict_length=seq_len,
+        inputs_q_shape=dummy.shape,
+        inputs_kv_shape=dummy.shape,
+        mesh=self.mesh,
+        attention_kernel="dot_product",
+        dtype=config.dtype,
+        dropout_rate=config.dropout_rate,
+        model_mode=model_mode,
+        rngs=self.nnx_rng,
+    )
+
+  @pytest.mark.gpu_only
+  def test_gpu_paged_matches_the_dense_path(self):
+    """`gpu_paged` prefill must agree with dense attention over the same tokens.
+
+    Both sides see identical weights and identical inputs, and a full prefill of
+    a whole sequence is exactly causal attention over that sequence, so the two
+    are comparable directly. The dense side runs in TRAIN mode specifically so
+    neither module allocates a dense KV cache, which keeps the two parameter
+    trees identical and lets `nnx.update` copy weights across.
+    """
+    try:
+      import jax_aiter  # pylint: disable=import-outside-toplevel,unused-import
+      from jax_aiter.ffi.registry import standalone_symbol_available  # pylint: disable=import-outside-toplevel
+    except ImportError:
+      self.skipTest("jax-aiter is not importable; set PYTHONPATH to the jax-aiter checkout")
+    for symbol in ("AppendKvJA", "PagedPrefillJA"):
+      if not standalone_symbol_available(symbol):
+        self.skipTest(f"{symbol} is not built; run 'make -f Makefile.kv ja_kv' in jax-aiter")
+
+    from maxtext.inference.kv_common import KvPageTableV1  # pylint: disable=import-outside-toplevel
+
+    seq_len, tokens_per_page = 128, 16
+    dense_cfg = self._gpu_paged_config(seq_len, attention="dot_product")
+    paged_cfg = self._gpu_paged_config(seq_len, attention="gpu_paged")
+
+    batch = self.global_batch_size
+    lnx = jax.random.normal(self.rng, (batch, seq_len, dense_cfg.base_emb_dim), dtype=dense_cfg.dtype)
+    # One segment per request, positions in order: the plain causal case, which
+    # is what a full prefill of the sequence computes.
+    segment_ids = jnp.ones((batch, seq_len), dtype=jnp.int32)
+    positions = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32), (batch, seq_len))
+
+    dense = self._build_attention(dense_cfg, seq_len, MODEL_MODE_TRAIN)
+    dense_out, _ = dense(
+        lnx,
+        lnx,
+        decoder_segment_ids=segment_ids,
+        inputs_positions=positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+
+    paged = self._build_attention(paged_cfg, seq_len, MODEL_MODE_PREFILL)
+    nnx.update(paged, nnx.state(dense))
+    self.assertIsNone(paged.KVCache_0, "gpu_paged must not allocate the dense KV cache")
+
+    pages_per_request = seq_len // tokens_per_page
+    # Page 0 is the padding sentinel and is never handed out.
+    page_ids = [
+        [1 + r * pages_per_request + p for p in range(pages_per_request)] for r in range(batch)
+    ]
+    page_table = KvPageTableV1(
+        page_ids=page_ids,
+        seq_lens=np.full((batch,), seq_len, np.int32),
+        query_lens=np.full((batch,), seq_len, np.int32),
+        write_positions=np.tile(np.arange(seq_len, dtype=np.int32), batch),
+        request_order=np.arange(batch, dtype=np.int32),
+    )
+    pool_shape = (1 + batch * pages_per_request, tokens_per_page, paged_cfg.num_kv_heads, paged_cfg.head_dim)
+    pools = [jnp.zeros(pool_shape, paged_cfg.dtype), jnp.zeros(pool_shape, paged_cfg.dtype)]
+
+    paged_out, updated = paged(
+        lnx,
+        lnx,
+        decoder_segment_ids=segment_ids,
+        inputs_positions=positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_PREFILL,
+        kv_cache=pools,
+        attention_metadata=page_table,
+    )
+
+    self.assertEqual(len(updated), 2, "the step must return both pools")
+    self.assertEqual(paged_out.shape, dense_out.shape)
+
+    got = np.asarray(paged_out, np.float32)
+    want = np.asarray(dense_out, np.float32)
+    # One ulp of the output dtype at the scale of the tensor, plus the usual
+    # relative term. A purely element-wise relative metric is meaningless here:
+    # attention output passes through zero, where one ulp reads as a 100% miss.
+    #
+    # One ulp is what the two paths actually achieve, so the bound is set to it
+    # rather than to a comfortable multiple of it. That is deliberate — the
+    # paged path is supposed to be arithmetically the same attention over the
+    # same numbers, so anything worse than the dtype's own resolution is a real
+    # difference and should fail. The bound has already earned this: it caught a
+    # double-scaling bug where passing the kernel's default 1/sqrt(head_dim) on
+    # top of MaxText's already-scaled query produced an error fifty times larger.
+    eps = float(jnp.finfo(paged_cfg.dtype).eps)
+    atol = eps * max(float(np.abs(want).max()), 1e-6)
+    self.assertTrue(
+        np.all(np.abs(got - want) <= atol + eps * np.abs(want)),
+        f"gpu_paged disagrees with the dense path: max abs error "
+        f"{float(np.abs(got - want).max()):.5f}, atol {atol:.5f}",
+    )
+
+  @pytest.mark.gpu_only
+  def test_gpu_paged_dry_run_passes_through(self):
+    """Model init and JIT tracing reach the branch with nothing to attend over."""
+    seq_len = 128
+    cfg = self._gpu_paged_config(seq_len, attention="gpu_paged")
+    paged = self._build_attention(cfg, seq_len, MODEL_MODE_PREFILL)
+
+    query = jnp.ones((self.global_batch_size, seq_len, cfg.num_query_heads, cfg.head_dim), cfg.dtype)
+    out, cache = paged.forward_serve_gpu_paged(query, query, query, kv_pools=None, metadata=None)
+
+    self.assertEqual(cache, [])
+    self.assertEqual(out.shape, (self.global_batch_size * seq_len, cfg.num_query_heads, cfg.head_dim))
+
   @pytest.mark.skip(reason="Requires `vllm-tpu` package which is not yet a MaxText dependency.")
   @pytest.mark.tpu_only
   @mock.patch("tpu_inference.layers.common.attention_interface.sharded_ragged_paged_attention", create=True)

@@ -598,7 +598,17 @@ class Attention(BaseModel):
 
   attention: str = Field(
       "autoselected",
-      description="The attention algorithm to use (dot_product, flash, cudnn_flash_te, vllm_rpa, vllm_batched_rpa, etc).",
+      description=(
+          "The attention algorithm to use (dot_product, flash, cudnn_flash_te, vllm_rpa, vllm_batched_rpa, "
+          "gpu_paged, etc)."
+      ),
+  )
+  paged_attention_backend: Literal["auto", "aiter", "flashinfer"] = Field(
+      "auto",
+      description=(
+          "Leaf kernel provider for attention='gpu_paged'. Everything above the kernel call is "
+          "vendor-neutral, so 'auto' picks aiter on ROCm and flashinfer on CUDA."
+      ),
   )
   attention_type: Literal["global", "local_sliding", "chunk", "mla", "full", "compressed", "block_diffusion"] = Field(
       "global", description="The variant of attention to use."
@@ -3157,6 +3167,22 @@ class MaxTextConfig(
     # Explicitly setting encoding removes the need for the pylint disable comment
     with open(custom_mesh_path, "r", encoding="utf-8") as f:
       return yaml.safe_load(f) or {}
+
+  @model_validator(mode="after")
+  def validate_gpu_paged_attention(self) -> "MaxTextConfig":
+    """Reject `gpu_paged` combinations that would be silently pathological.
+
+    `scan_layers` stacks the per-layer KV caches with `jnp.stack(kv_caches)` so
+    they can ride the scan carry. For a paged pool that copies the entire pool
+    on every step, which shows up as a mysterious slowdown rather than an error,
+    so refuse it outright instead of quietly overriding it.
+    """
+    if self.attention == "gpu_paged" and self.scan_layers:
+      raise ValueError(
+          "attention='gpu_paged' requires scan_layers=False. Scanning stacks the per-layer "
+          "KV caches into the scan carry, which copies the whole paged pool every step."
+      )
+    return self
 
   @model_validator(mode="after")
   def set_derived_and_validate_values(self) -> "MaxTextConfig":
