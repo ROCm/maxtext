@@ -656,5 +656,28 @@ class TestReorderSequence(unittest.TestCase):
     self.assertTrue(jnp.allclose(x, restored, rtol=1e-5, atol=1e-6))
 
 
+@pytest.mark.parametrize(
+    "hardware,attention,quantization,use_te_comm_gemm_overlap,expected",
+    [
+        ("gpu", "aiter_flash", "aiter_fp4", False, False),
+        ("gpu", "cudnn_flash_te", "fp8", False, True),
+        ("gpu", "dot_product", "te_fp8_currentscaling", False, True),
+        ("gpu", "aiter_flash", "aiter_fp4", True, True),
+        ("cpu", "cudnn_flash_te", "te_fp8_currentscaling", True, False),
+    ],
+)
+def test_should_use_transformer_engine(
+    hardware, attention, quantization, use_te_comm_gemm_overlap, expected
+):
+  config = mock.Mock(
+      hardware=hardware,
+      attention=attention,
+      quantization=quantization,
+      use_te_comm_gemm_overlap=use_te_comm_gemm_overlap,
+  )
+
+  assert max_utils._should_use_transformer_engine(config) is expected
+
+
 if __name__ == "__main__":
   unittest.main()

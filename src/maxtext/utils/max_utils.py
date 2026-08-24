@@ -1246,13 +1246,23 @@ def bootstrap_transformer_engine_cgemm(config):
 
 @contextmanager
 def maybe_get_transformer_engine_context(config):
-  """Runs a transformer engine context engine manager for GPUs only."""
-  if config.hardware in ["gpu", "gpu_multiprocess"]:
+  """Runs TransformerEngine context only for recipes that consume TE."""
+  if _should_use_transformer_engine(config):
     with transformer_engine_context():
       yield
   else:
     with dummy_context_manager():
       yield
+
+
+def _should_use_transformer_engine(config):
+  """Whether this resolved GPU recipe needs TransformerEngine loaded."""
+  quantization = getattr(config.quantization, "value", config.quantization)
+  return config.hardware in ("gpu", "gpu_multiprocess") and (
+      config.attention == "cudnn_flash_te"
+      or str(quantization).startswith("te_")
+      or config.use_te_comm_gemm_overlap
+  )
 
 
 @contextmanager
