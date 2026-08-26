@@ -1962,6 +1962,18 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
       )
 
     layout = build_storage_layout(self.config, self._mesh)
+    if layout.kv_head_shards > 1:
+      # The pool shards correctly (see `kv_pool_sharding`), but the aiter kernels
+      # reach the pool through an FFI custom call, and XLA cannot partition one.
+      # Left to itself it neither gathers nor splits and the step simply hangs,
+      # which is a far worse thing to ship than a refusal. Lifting this needs the
+      # forward wrapped in `shard_map` so each device runs the kernel on its own
+      # shard -- the remaining half of M6.
+      raise ValueError(
+          f"attention='gpu_paged' does not yet support tensor parallelism: this mesh shards KV heads "
+          f"{layout.kv_head_shards} ways. Run the paged path on a single device, or use "
+          f"attention='dot_product' for a sharded run."
+      )
     if layout.dtype not in ("bfloat16", "float16"):
       raise ValueError(
           f"the paged attention kernels accept bfloat16 and float16 only, but dtype is "
@@ -1995,10 +2007,16 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
 
     Pages are the leading axis and are never sharded -- a page belongs to one
     request and splitting it would put half a token's KV on another device. The
-    KV-head axis is the one tensor parallelism divides, which is M6's work; until
-    then the pool is replicated and this returns None.
+    KV-head axis is the one tensor parallelism divides, and `kv_pool_sharding`
+    works out which head belongs on which device, including the case where TP
+    exceeds the KV head count and heads are replicated rather than divided.
     """
-    return None
+    # pylint: disable=import-outside-toplevel
+    from maxtext.inference.kv_execution.layout_builder import build_storage_layout, kv_pool_sharding
+
+    if self.config.attention != "gpu_paged":
+      return None
+    return kv_pool_sharding(self._mesh, build_storage_layout(self.config, self._mesh))
 
   def _paged_pool_arrays(self):
     """The pool as the nested list `kv_caches` expects: one `[k, v]` per layer."""

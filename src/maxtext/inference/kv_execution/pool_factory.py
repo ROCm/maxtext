@@ -57,6 +57,13 @@ class PagedKvPool:
 
   @property
   def page_shape(self) -> tuple[int, ...]:
+    """Global shape of one layer's pages, before sharding splits the head axis."""
+    layout = self.layout
+    return (layout.num_pages, layout.tokens_per_page, layout.num_kv_heads, layout.head_dim)
+
+  @property
+  def local_page_shape(self) -> tuple[int, ...]:
+    """What one device holds, and what the kernel sees inside `shard_map`."""
     layout = self.layout
     return (layout.num_pages, layout.tokens_per_page, layout.heads_per_shard(), layout.head_dim)
 
@@ -76,29 +83,37 @@ def allocate_pool(
 ) -> PagedKvPool:
   """Allocate a zero-initialised pool for every layer.
 
+  The arrays are *globally* shaped: the head axis carries `num_kv_heads`, and
+  `sharding` is what puts a slice of it on each device. On one device the two
+  coincide, since `kv_head_shards` is then 1 and `heads_per_shard()` is the whole
+  count, so a single-device caller sees no change from passing None.
+
   Args:
-    layout: pool geometry. `heads_per_shard()` is already the per-device head
-      count, including the replication case where TP exceeds the KV head count,
-      so the shape below is the local shard rather than the global pool.
-    sharding: optional sharding for each array. Passed through to
-      `jax.device_put`; a `NamedSharding` carrying a `memory_kind` is how the
-      pool would later be placed in a collective memory space.
+    layout: pool geometry.
+    sharding: optional sharding for each array, normally from
+      `kv_pool_sharding`. Passed through to `jax.device_put`; a `NamedSharding`
+      carrying a `memory_kind` is how the pool would later be placed in a
+      collective memory space.
     dtype: overrides the layout's dtype. Only useful for tests that want a
       dtype numpy can print.
 
   Returns:
     A `PagedKvPool` whose arrays are all zeros.
   """
-  shape = (layout.num_pages, layout.tokens_per_page, layout.heads_per_shard(), layout.head_dim)
+  shape = (layout.num_pages, layout.tokens_per_page, layout.num_kv_heads, layout.head_dim)
   resolved = jnp.dtype(dtype) if dtype is not None else jnp.dtype(layout.dtype)
+
+  if sharding is None:
+    make = lambda: jnp.zeros(shape, resolved)
+  else:
+    # Built sharded rather than built whole and then distributed. `device_put` of
+    # a locally-created array would materialise the entire pool on one device
+    # first, which at 70B is the difference between allocating a shard and
+    # failing outright.
+    make = jax.jit(lambda: jnp.zeros(shape, resolved), out_shardings=sharding)
 
   k_pages, v_pages = [], []
   for _ in range(layout.num_layers):
-    k = jnp.zeros(shape, resolved)
-    v = jnp.zeros(shape, resolved)
-    if sharding is not None:
-      k = jax.device_put(k, sharding)
-      v = jax.device_put(v, sharding)
-    k_pages.append(k)
-    v_pages.append(v)
+    k_pages.append(make())
+    v_pages.append(make())
   return PagedKvPool(layout=layout, k_pages=k_pages, v_pages=v_pages)

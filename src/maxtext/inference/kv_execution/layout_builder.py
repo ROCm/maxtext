@@ -24,11 +24,19 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 from maxtext.inference.kv_common import KvStorageLayoutV1
 
 # MaxText spells the KV-head tensor-parallel axes several ways depending on the
 # model; these are the ones that shard `num_kv_heads`.
 _KV_HEAD_MESH_AXES = ("tensor", "tensor_transpose", "tensor_sequence")
+
+# Axis names for the pool's own mesh. Deliberately not MaxText's: the pool needs
+# the tensor-parallel axis split into the part that selects a KV head and the
+# part that replicates it, and MaxText's mesh has them fused into one axis.
+KV_SHARD_AXIS = "kv_head_shard"
+KV_REPLICA_AXIS = "kv_head_replica"
 
 
 def kv_head_shards(mesh: Any | None) -> int:
@@ -40,6 +48,57 @@ def kv_head_shards(mesh: Any | None) -> int:
   for axis in _KV_HEAD_MESH_AXES:
     shards *= int(shape.get(axis, 1))
   return max(shards, 1)
+
+
+def kv_pool_sharding(mesh: Any | None, layout: KvStorageLayoutV1) -> Any | None:
+  """Where each KV head of the pool lives, as a `NamedSharding`.
+
+  The pool arrays are *globally* shaped -- `num_kv_heads` on the head axis -- and
+  this sharding is what puts the right heads on the right devices. Allocating
+  per-device shards directly would be the other option, but it puts the caller in
+  charge of device order and makes the arrays unusable as ordinary jit inputs.
+
+  **The tensor-parallel axis has to be split in two, which is why the pool builds
+  its own mesh.** MaxText's mesh fuses them: `tensor` of width 8 says nothing
+  about whether eight ranks hold eight distinct KV heads or two heads replicated
+  four ways. Both happen, and they need different device assignments.
+
+  The split is `(kv_head_shard, kv_head_replica)`, row-major over the same device
+  order MaxText uses, because that is the assignment the model already implies.
+  Rank `i` computes query head `i`, and query head `i` reads KV head
+  `i // replication_factor` -- so consecutive ranks share a KV head, which is
+  exactly what a row-major reshape produces. Getting this backwards would put a
+  rank's KV on another rank's device and force a gather on every step, which is
+  the cost M6 exists to remove and which would show up as a correct-but-slow run
+  rather than a failure.
+
+  Returns None when there is nothing to shard, so a single-device caller passes
+  the result straight through and gets the ordinary unsharded pool.
+  """
+  # pylint: disable=import-outside-toplevel
+  import jax
+
+  shards = int(layout.kv_head_shards)
+  if mesh is None or shards <= 1:
+    return None
+
+  devices = np.asarray(getattr(mesh, "devices", None))
+  if devices.size != shards:
+    raise ValueError(
+        f"the pool is sharded {shards} ways but the mesh holds {devices.size} devices. The layout's "
+        f"kv_head_shards must come from this mesh, or the pool will be laid out for a different one."
+    )
+
+  replication = layout.replication_factor()
+  kv_axis = shards // replication
+  # Row-major, and matching MaxText's device order rather than imposing one.
+  grid = devices.reshape(kv_axis, replication)
+  pool_mesh = jax.sharding.Mesh(grid, (KV_SHARD_AXIS, KV_REPLICA_AXIS))
+  # Only the head axis is partitioned; pages, tokens within a page, and head_dim
+  # are whole on every device. Replication across the second axis is implicit in
+  # not naming it.
+  spec = jax.sharding.PartitionSpec(None, None, KV_SHARD_AXIS, None)
+  return jax.sharding.NamedSharding(pool_mesh, spec)
 
 
 def build_storage_layout(config: Any, mesh: Any | None = None) -> KvStorageLayoutV1:
