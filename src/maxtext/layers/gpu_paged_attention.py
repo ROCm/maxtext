@@ -297,6 +297,13 @@ def paged_attention_step_sharded(
   out, k_pool, v_pool = jax.shard_map(
       body,
       mesh=mesh,
+      # Only the KV-head axes go manual. Left to default, `shard_map` makes
+      # *every* mesh axis manual, and MaxText's mesh carries a dozen -- so the
+      # region would be entered under a different set of manual axes than the
+      # computation around it, which is not what the specs describe. A
+      # single-axis mesh cannot expose this, which is how an isolated test stays
+      # bit-exact while the model does not.
+      axis_names=frozenset(axes if isinstance(axes, tuple) else (axes,)),
       in_specs=(
           qkv_spec, qkv_spec, qkv_spec, pool_spec, pool_spec,
           replicated, replicated, replicated, replicated, replicated,
