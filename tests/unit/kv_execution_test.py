@@ -29,7 +29,7 @@ import unittest
 
 import numpy as np
 
-from maxtext.inference.kv_common import KvPageTableV1, KvStorageLayoutV1
+from maxtext.inference.kv_common import CacheNamespace, KvPageTableV1, KvStorageLayoutV1
 from maxtext.inference.kv_control import NativeKvControlPlane, RequestHandle
 from maxtext.inference.kv_execution import allocate_pool, PagedDriver, PagedRequest
 from maxtext.inference.kv_execution.bucketing import (
@@ -459,6 +459,167 @@ class PagedDriverTest(unittest.TestCase):
   def test_an_empty_driver_does_nothing(self):
     self.assertIsNone(self._driver().step())
     self.assertEqual(self._driver().run(), [])
+
+
+class DriverPrefixCacheTest(unittest.TestCase):
+  """The driver's use of the prefix index: fewer prefill tokens, no lost pages.
+
+  The index itself is covered in `kv_prefix_cache_test.py`. What is at stake here
+  is the wiring -- that the saving reaches the step's query length, and that the
+  two page-lifetime hazards sharing introduces are handled.
+  """
+
+  def _driver(self, *, num_pages=65, max_requests=4, max_context_len=128, step=None, **kw):
+    layout = _layout(num_pages=num_pages)
+    plane = NativeKvControlPlane(
+        layout=layout,
+        max_requests=max_requests,
+        max_context_len=max_context_len,
+        debug_mode=True,
+        enable_prefix_cache=True,
+    )
+    return PagedDriver(plane, allocate_pool(layout), step or _CountingStep(), max_batch=max_requests, **kw)
+
+  def _request(self, request_id, prompt, max_new_tokens=2):
+    return PagedRequest(
+        request_id=request_id,
+        prompt_len=len(prompt),
+        max_new_tokens=max_new_tokens,
+        prompt_tokens=np.asarray(prompt, dtype=np.int64),
+    )
+
+  def test_a_repeated_prompt_prefills_fewer_tokens(self):
+    """The milestone's whole point, measured as tokens the step actually computes.
+
+    Not as the bucketed shape: the token ladder floors at 64, so a saving smaller
+    than that is real but invisible there. The prompt here is long enough that
+    both figures move, and both are checked -- the token count because it is the
+    work avoided, the bucket because it is what the work costs.
+    """
+    step = _CountingStep()
+    driver = self._driver(step=step, max_requests=1, max_context_len=512)
+    prompt = list(range(256))
+
+    driver.submit([self._request("first", prompt)])
+    first = driver.step()
+    driver.run()
+    first_bucket = step.views[0].shape.num_tokens
+
+    step.views.clear()
+    driver.submit([self._request("second", prompt)])
+    second = driver.step()
+
+    self.assertEqual(first.num_tokens, 256)
+    self.assertEqual(second.num_tokens, 16, "only the held-back final page should be recomputed")
+    self.assertLess(step.views[0].shape.num_tokens, first_bucket)
+
+  def test_a_diverging_prompt_shares_only_what_it_has_in_common(self):
+    driver = self._driver(max_requests=1, max_context_len=512)
+    shared = list(range(128))
+
+    driver.submit([self._request("first", shared + list(range(900, 964)))])
+    driver.run()
+
+    driver.submit([self._request("second", shared + list(range(500, 564)))])
+    outcome = driver.step()
+    self.assertEqual(
+        outcome.num_tokens, 64, "exactly the divergent tail should be computed, and the shared 128 skipped"
+    )
+
+  def test_a_request_without_tokens_is_unaffected(self):
+    """Supplying prompt ids is opt-in, so the cache must tolerate their absence."""
+    driver = self._driver()
+    driver.submit([PagedRequest(request_id=f"r{i}", prompt_len=20, max_new_tokens=4) for i in range(3)])
+    done = driver.run()
+    self.assertEqual(len(done), 3)
+    self.assertEqual(driver.plane.prefix_index.num_cached_pages, 0)
+    self.assertEqual(driver.plane.allocator.num_allocated_pages, 0)
+
+  def test_only_pages_with_computed_kv_are_published(self):
+    """The final generated token has no K/V: its step never ran.
+
+    Publishing it would cache a page whose tail is whatever the scrub left, and
+    the next request to match that prefix would attend over zeros as though they
+    were real keys.
+    """
+    driver = self._driver(max_requests=1)
+    prompt = list(range(16))
+    driver.submit([self._request("r0", prompt, max_new_tokens=5)])
+    done = driver.run()
+
+    written = len(prompt) + len(done[0].generated) - 1
+    self.assertLessEqual(
+        driver.plane.prefix_index.num_cached_pages * PAGE,
+        written,
+        "published more tokens than had their K/V computed",
+    )
+
+  def test_nothing_leaks_once_the_cache_is_dropped(self):
+    driver = self._driver(max_requests=2)
+    prompts = [list(range(i * 100, i * 100 + 48)) for i in range(6)]
+    driver.submit([self._request(f"r{i}", p, max_new_tokens=3) for i, p in enumerate(prompts)])
+    driver.run()
+
+    driver.plane.evict_cached(driver.plane.prefix_index.num_cached_pages)
+    self.assertEqual(driver.plane.prefix_index.num_cached_pages, 0)
+    self.assertEqual(driver.plane.allocator.num_allocated_pages, 0)
+    self.assertEqual(driver.plane.allocator.available_pages, driver.plane.allocator.capacity_pages)
+
+  def test_the_cache_does_not_stop_a_tight_pool_making_progress(self):
+    """Retained pages must be reclaimable, or sharing turns into a deadlock."""
+    driver = self._driver(num_pages=9, max_requests=4, max_context_len=64)
+    driver.submit(
+        [self._request(f"r{i}", list(range(i * 100, i * 100 + 30)), max_new_tokens=25) for i in range(5)]
+    )
+    done = driver.run()
+    self.assertEqual(len(done), 5)
+    self.assertTrue(all(len(r.generated) == 25 for r in done))
+
+  def test_poison_on_free_does_not_destroy_a_retained_page(self):
+    """Poison must follow what was freed, not what the request held."""
+    driver = self._driver(max_requests=1, poison_on_free=True)
+    prompt = list(range(64))
+    driver.submit([self._request("first", prompt)])
+    driver.run()
+
+    cached = driver.plane.prefix_index.match(prompt, CacheNamespace()).pages
+    self.assertGreater(cached.size, 0)
+    k = np.asarray(driver.pool.k_pages[0])[cached]
+    self.assertFalse(np.any(k == POISON_SENTINEL), "poisoned a page the prefix cache had adopted")
+
+  def test_a_preempted_request_does_not_retain_its_pages(self):
+    """Preemption exists to free pages; publishing them would work against it.
+
+    Checked at the first preemption rather than at the end of the run, because by
+    then a completed request has published legitimately and the two sources of
+    cached pages are no longer distinguishable.
+    """
+    driver = self._driver(num_pages=9, max_requests=4, max_context_len=64)
+    requests = [
+        self._request(f"r{i}", list(range(i * 100, i * 100 + 30)), max_new_tokens=25) for i in range(5)
+    ]
+    driver.submit(requests)
+    while not any(r.preemptions for r in requests):
+      if driver.step() is None:
+        self.fail("this pool is too small not to preempt")
+
+    self.assertFalse(any(r.is_finished for r in requests), "no request should have completed this early")
+    self.assertEqual(
+        driver.plane.prefix_index.num_cached_pages,
+        0,
+        "a preempted request published its pages, so the preemption reclaimed fewer than it should",
+    )
+
+  def test_the_only_pages_left_allocated_are_the_ones_the_cache_holds(self):
+    """The leak invariant, restated for a runtime that deliberately retains pages."""
+    driver = self._driver(num_pages=9, max_requests=4, max_context_len=64)
+    driver.submit(
+        [self._request(f"r{i}", list(range(i * 100, i * 100 + 30)), max_new_tokens=25) for i in range(5)]
+    )
+    driver.run()
+    self.assertEqual(
+        driver.plane.allocator.num_allocated_pages, driver.plane.prefix_index.num_cached_pages
+    )
 
 
 class PagedRuntimeTest(unittest.TestCase):

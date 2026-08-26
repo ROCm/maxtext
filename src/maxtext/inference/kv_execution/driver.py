@@ -50,6 +50,7 @@ from typing import Callable, Iterable, Sequence
 
 import numpy as np
 
+from maxtext.inference.kv_common import CacheNamespace
 from maxtext.inference.kv_control import (
     NativeKvControlPlane,
     RequestDescriptor,
@@ -61,6 +62,8 @@ from maxtext.inference.kv_execution.bucketing import StepShape, StepShapePlanner
 from maxtext.inference.kv_execution.pool_factory import PagedKvPool
 from maxtext.inference.kv_execution.pool_ops import poison_pages, scrub_pages
 from maxtext.inference.kv_execution.step_view import StepView, build_step_view
+
+_DEFAULT_NAMESPACE = CacheNamespace()
 
 
 @dataclasses.dataclass(eq=False)
@@ -82,6 +85,12 @@ class PagedRequest:
   state: RequestState = RequestState.WAITING
   finish_reason: str | None = None
   preemptions: int = 0
+  # Optional, and only consulted when the control plane's prefix cache is on. A
+  # workload that never repeats a prefix pays nothing for leaving these unset,
+  # which is why the driver treats them as opt-in rather than required.
+  prompt_tokens: np.ndarray | None = None
+  namespace: CacheNamespace = _DEFAULT_NAMESPACE
+  cached_tokens: int = 0
 
   @property
   def is_finished(self) -> bool:
@@ -99,6 +108,26 @@ class PagedRequest:
         prompt_len=self.prompt_len + len(self.generated),
         max_new_tokens=max(self.max_new_tokens - len(self.generated), 0),
     )
+
+  def token_ids(self) -> np.ndarray | None:
+    """The full context: prompt plus whatever has been generated.
+
+    Generated tokens are included because they are context like any other, so a
+    preempted request replaying a longer prompt can match its own prefix from
+    before the preemption. That makes recovery from backpressure cheaper on
+    exactly the workload where backpressure is most likely.
+    """
+    if self.prompt_tokens is None:
+      return None
+    if not self.generated:
+      return self.prompt_tokens
+    return np.concatenate(
+        [np.asarray(self.prompt_tokens, dtype=np.int64), np.asarray(self.generated, dtype=np.int64)]
+    )
+
+  def prefill_len(self) -> int:
+    """Tokens this request must actually compute, after any cache hit."""
+    return self.descriptor().prompt_len - self.cached_tokens
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,7 +220,7 @@ class PagedDriver:
     """
     admitted = self._admit()
     if admitted:
-      return self._run_phase(admitted, [r.descriptor().prompt_len for r in admitted], is_decode=False)
+      return self._run_phase(admitted, [r.prefill_len() for r in admitted], is_decode=False)
     if self._live:
       return self._run_phase(self._live, [1] * len(self._live), is_decode=True)
     return None
@@ -208,28 +237,48 @@ class PagedDriver:
 
     tokens_per_page = self.plane.layout.tokens_per_page
     token_budget = self.planner.token_rungs[-1]
-    page_budget = self.plane.allocator.available_pages
     room = self.max_batch - len(self._live)
 
     admitted: list[PagedRequest] = []
     tokens = 0
+    committed = 0
     for request in list(self._waiting):
       if len(admitted) >= room or self.plane.page_map.available_rows == 0:
         break
       prompt_len = request.descriptor().prompt_len
       needed = pages_for_tokens(prompt_len, tokens_per_page)
-      if needed > page_budget or tokens + prompt_len > token_budget:
+      # Cached pages count towards the budget because reservation evicts on
+      # shortfall, so they are reclaimable rather than spoken for. Budgeting
+      # against the free list alone would stall a loop that could still make
+      # progress by giving up cache entries -- turning an optimisation into a
+      # reason requests stop being served. Recomputed each time round because
+      # attaching a prefix protects pages, which takes them out of the figure.
+      budget = self.plane.allocator.available_pages + self.plane.prefix_index.evictable_pages - committed
+      if needed > budget or tokens + prompt_len > token_budget:
         break
       handle = self.plane.admit(request.descriptor())
       if handle is None:
         break
       request.handle = handle
       request.state = RequestState.PREFILL
-      page_budget -= needed
-      tokens += prompt_len
+      # Charged at full price above and refunded here: the hit is only knowable
+      # once the handle exists, and over-estimating admits fewer requests than it
+      # might, where under-estimating would fail the whole batch's reservation.
+      request.cached_tokens = self._attach_prefix(request)
+      committed += needed - request.cached_tokens // tokens_per_page
+      tokens += prompt_len - request.cached_tokens
       admitted.append(request)
       self._waiting.remove(request)
     return admitted
+
+  def _attach_prefix(self, request: PagedRequest) -> int:
+    """Lend `request` any cached pages of its context. Returns tokens skipped."""
+    if not self.plane.prefix_cache_enabled:
+      return 0
+    tokens = request.token_ids()
+    if tokens is None:
+      return 0
+    return self.plane.attach_prefix(request.handle, tokens, request.namespace).num_tokens
 
   def _run_phase(
       self,
@@ -322,34 +371,53 @@ class PagedDriver:
     Its generated tokens are kept, so the replay is a longer prompt rather than
     lost output. What is lost is the compute that built its KV, which is the
     price of not deadlocking.
+
+    Nothing is published on the way out. Preemption happens precisely because
+    pages are scarce, and the prefix cache holds onto what it adopts -- so
+    publishing here would hand back fewer pages than the preemption was trying
+    to reclaim, and could leave the retry no better off than the attempt that
+    triggered it.
     """
     if not batch:
       return
     victim = batch.pop()
-    self._release_pages(victim)
+    self._release_pages(victim, publish=False)
     victim.state = RequestState.WAITING
     victim.preemptions += 1
     if victim in self._live:
       self._live.remove(victim)
     self._waiting.insert(0, victim)
 
-  def _release_pages(self, request: PagedRequest) -> None:
-    """Give up a request's pages, poisoning them first when asked.
+  def _release_pages(self, request: PagedRequest, publish: bool = True) -> None:
+    """Give up a request's pages, poisoning the ones that actually came free.
 
-    Poison is applied *before* the pages leave the request, and does not count as
-    a scrub: the control plane keeps them dirty, so the next occupant still has
-    to zero them. That ordering is what makes the sentinel a detector of a missed
-    scrub rather than a substitute for one.
+    Poison is applied to what `release` reports rather than to everything the
+    request held, because with prefix sharing those differ: a page the index
+    adopted, or one this request only borrowed, stays live for the next reader
+    and poisoning it would destroy K/V that is about to be trusted.
+
+    The pages are still dirty when poisoned -- `release` marks them so, and the
+    poison does not count as a scrub -- so the next occupant must still zero
+    them. That is what makes the sentinel a detector of a missed scrub rather
+    than a substitute for one.
+
+    `publish` is what the prefix cache is offered. The recorded sequence length
+    is the written extent by definition, since a step advances it by exactly the
+    tokens it is about to write, so it is the right bound to publish under: the
+    final generated token is in the token list but its K/V will not be computed
+    until a step that now never runs.
     """
     if request.handle is None:
       return
-    pages = self.plane.page_map.pages(request.handle)
-    if self.poison_on_free and pages.size:
+    tokens = request.token_ids() if publish else None
+    valid = self.plane.page_map.seq_len(request.handle)
+    freed = self.plane.release(request.handle, tokens, num_valid_tokens=valid)
+    if self.poison_on_free and freed.size:
       for layer in range(self.pool.num_layers):
-        k, v = poison_pages(self.pool.k_pages[layer], self.pool.v_pages[layer], pages)
+        k, v = poison_pages(self.pool.k_pages[layer], self.pool.v_pages[layer], freed)
         self.pool.replace_layer(layer, k, v)
-    self.plane.release(request.handle)
     request.handle = None
+    request.cached_tokens = 0
 
   def _retire(self, batch: Sequence[PagedRequest], tokens: np.ndarray, *, is_decode: bool) -> None:
     """Record this step's tokens and release whatever finished.

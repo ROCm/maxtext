@@ -25,6 +25,14 @@ past valid data, so the redundancy is deliberate -- it costs one page write per
 page-boundary crossing and removes any dependence on every kernel, present and
 future, honouring that bound.
 
+**Prefix sharing, when enabled, changes which pages a request owns but not how a
+step is described.** A shared page is attached to the request's row like any
+other, so it appears in the page table and the kernel reads it. What keeps it
+read-only is that the request's query length covers only its uncached suffix,
+and write positions are derived from that -- so a shared page cannot enter a
+`slot_mapping` without the query length being wrong first. Under `debug_mode`
+that implication is checked rather than assumed.
+
 Copyright 2026 Advanced Micro Devices, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,20 +50,46 @@ limitations under the License.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Sequence
 
 import numpy as np
 
-from maxtext.inference.kv_common import KvPageTableV1, KvStorageLayoutV1
+from maxtext.inference.kv_common import CacheNamespace, KvPageTableV1, KvStorageLayoutV1
 from maxtext.inference.kv_control import metadata
 from maxtext.inference.kv_control.allocator import PagedBlockAllocator
 from maxtext.inference.kv_control.logical_block import new_pages_for_extend, pages_for_tokens
 from maxtext.inference.kv_control.page_map import PageCapacityError, PageMap
+from maxtext.inference.kv_control.prefix_index import PrefixIndex, PrefixMatch, PrefixNode
 from maxtext.inference.kv_control.request import RequestDescriptor, RequestHandle
+
+_DEFAULT_NAMESPACE = CacheNamespace()
 
 
 class DirtyPageError(RuntimeError):
   """A step would have read a page still holding another request's KV."""
+
+
+class SharedPageWriteError(RuntimeError):
+  """A step would have written into a page another request is reading."""
+
+
+@dataclasses.dataclass
+class _PrefixState:
+  """What a request borrowed from the prefix index, and under whose identity.
+
+  Held per live request because neither the page map nor the allocator can
+  distinguish a borrowed page from an owned one, and releasing a request must
+  free exactly the ones it owns.
+
+  Recorded even when the lookup missed, because the namespace is needed again at
+  release to publish under. Inferring it then would mean guessing, and a wrong
+  guess publishes one configuration's K/V where another will find it.
+  """
+
+  namespace: CacheNamespace
+  node: PrefixNode | None = None
+  shared_pages: np.ndarray = dataclasses.field(default_factory=lambda: np.empty((0,), dtype=np.int32))
 
 
 class NativeKvControlPlane:
@@ -67,15 +101,22 @@ class NativeKvControlPlane:
       max_requests: int,
       max_context_len: int,
       debug_mode: bool = False,
+      enable_prefix_cache: bool = False,
   ):
     if max_context_len < 1:
       raise ValueError(f"max_context_len must be at least 1, got {max_context_len}")
 
     self._layout = layout
     self.max_context_len = int(max_context_len)
+    self.debug_mode = bool(debug_mode)
     self.allocator = PagedBlockAllocator.from_layout(layout, debug_mode=debug_mode)
     self.page_map = PageMap.from_layout(layout, max_requests=max_requests, max_context_len=max_context_len)
     self._pending_scrub: list[np.ndarray] = []
+    # Off unless asked for: sharing is only sound when the caller supplies a
+    # namespace that genuinely distinguishes its configurations, and defaulting
+    # it on would make that someone else's problem to discover.
+    self.prefix_index = PrefixIndex(layout.tokens_per_page, enabled=enable_prefix_cache)
+    self._prefix_state: dict[RequestHandle, _PrefixState] = {}
 
     # Caught here rather than as a mid-serving allocation failure, which would
     # look like ordinary backpressure and never resolve.
@@ -106,6 +147,51 @@ class NativeKvControlPlane:
       )
     return self.page_map.admit(descriptor)
 
+  @property
+  def prefix_cache_enabled(self) -> bool:
+    return self.prefix_index.enabled
+
+  def attach_prefix(
+      self,
+      handle: RequestHandle,
+      token_ids: Sequence[int] | np.ndarray,
+      namespace: CacheNamespace = _DEFAULT_NAMESPACE,
+  ) -> PrefixMatch:
+    """Lend the request every already-computed page of its prompt.
+
+    The shared pages are attached to the request's row and its length advanced
+    over them, so the request begins as though it had already prefilled that
+    much. The caller then prefills only `prompt_len - match.num_tokens` tokens,
+    and that difference is the entire benefit.
+
+    Must be called before the request holds any pages, since a prefix is by
+    definition the front of the sequence and the page list is positional.
+    """
+    if self.page_map.num_pages(handle) or self.page_map.seq_len(handle):
+      raise ValueError(
+          f"request {handle.request_id!r} already holds "
+          f"{self.page_map.num_pages(handle)} pages at length {self.page_map.seq_len(handle)}; "
+          "a prefix can only be attached to a request that has not yet reserved anything"
+      )
+
+    match = self.prefix_index.match(token_ids, namespace)
+    # Recorded on a miss too: this is where the caller states which
+    # configuration the request belongs to, and release needs it to publish
+    # under the same one.
+    self._prefix_state[handle] = _PrefixState(namespace=namespace)
+    if not match:
+      return match
+
+    self.prefix_index.acquire(match.node)
+    self.page_map.append_pages(handle, match.pages)
+    self.page_map.advance(handle, match.num_tokens)
+    self._prefix_state[handle] = _PrefixState(
+        namespace=namespace,
+        node=match.node,
+        shared_pages=match.pages,
+    )
+    return match
+
   def reserve(
       self,
       handles: Sequence[RequestHandle],
@@ -135,9 +221,19 @@ class NativeKvControlPlane:
         )
       per_request_pages.append(new_pages_for_extend(prefix_len, new_len, tokens_per_page))
 
-    pages = self.allocator.alloc(int(sum(per_request_pages)))
+    needed = int(sum(per_request_pages))
+    pages = self.allocator.alloc(needed)
     if pages is None:
-      return False
+      # Cached pages are the one reclaimable thing left: they hold K/V nothing
+      # currently needs, and recomputing them is strictly better than refusing
+      # to make progress. Evicting only the shortfall keeps the rest of the
+      # cache for whoever asks next.
+      reclaimed = self.evict_cached(needed - self.allocator.available_pages)
+      if reclaimed.size == 0:
+        return False
+      pages = self.allocator.alloc(needed)
+      if pages is None:
+        return False
 
     recycled = self.allocator.dirty_among(pages)
     if recycled.size:
@@ -177,15 +273,67 @@ class NativeKvControlPlane:
   def reserve_decode(self, handles: Sequence[RequestHandle]) -> bool:
     return self.reserve(handles, np.ones((len(handles),), dtype=np.int32))
 
-  def release(self, handle: RequestHandle) -> np.ndarray:
-    """Reclaim the request's pages and report them.
+  def evict_cached(self, num_pages: int) -> np.ndarray:
+    """Drop `num_pages` unreferenced cached pages and return them to the pool.
 
-    The pages are returned so a caller can zero or poison them before they can
-    be handed out again. Nothing here does that -- the pool is device memory and
-    this layer never touches a device -- which is why the pages have to leave
-    through the return value rather than being quietly recycled.
+    The pages come back dirty, as any freed page does, so a later step that
+    reserves them will scrub them through the ordinary path.
     """
-    pages = self.page_map.release(handle)
+    reclaimed = self.prefix_index.evict(num_pages)
+    if reclaimed.size:
+      self.allocator.free(reclaimed)
+    return reclaimed
+
+  def release(
+      self,
+      handle: RequestHandle,
+      token_ids: Sequence[int] | np.ndarray | None = None,
+      num_valid_tokens: int | None = None,
+      namespace: CacheNamespace | None = None,
+  ) -> np.ndarray:
+    """Reclaim the request's pages and report the ones actually freed.
+
+    With prefix sharing on and `token_ids` supplied, the request's full pages are
+    offered to the index first, and the ones it adopts stay allocated for the
+    next request with the same prefix. Those are excluded from the return value,
+    which continues to mean "pages that are now free and may be poisoned" -- so a
+    caller that poisons what it gets back cannot corrupt a page it just donated.
+
+    Pages borrowed at admission are likewise never freed here: the index owns
+    them and this request was only reading them.
+
+    Publishing needs to know which configuration produced the K/V. That comes
+    from the `attach_prefix` call that admitted the request, or from `namespace`
+    for a caller that never made one. It is never defaulted: publishing under a
+    namespace the request did not belong to files its K/V where a different
+    configuration will find and trust it.
+    """
+    state = self._prefix_state.pop(handle, None)
+    held = self.page_map.release(handle)
+
+    keep = np.zeros((0,), dtype=np.int32)
+    if state is not None:
+      if state.node is not None:
+        self.prefix_index.release(state.node)
+        keep = state.shared_pages
+      if namespace is not None and namespace != state.namespace:
+        raise ValueError(
+            f"request {handle.request_id!r} was admitted under namespace ({state.namespace.describe()}) "
+            f"but is being released under a different one ({namespace.describe()})"
+        )
+      namespace = state.namespace
+
+    if token_ids is not None and self.prefix_index.enabled:
+      if namespace is None:
+        raise ValueError(
+            f"cannot publish request {handle.request_id!r} without a namespace. Either admit it via "
+            "attach_prefix, which records one, or pass namespace= here."
+        )
+      published = self.prefix_index.publish(token_ids, held, namespace, num_valid_tokens)
+      if published.adopted.size:
+        keep = np.union1d(keep, published.adopted)
+
+    pages = held[~np.isin(held, keep)] if keep.size else held
     if pages.size:
       self.allocator.free(pages)
     return pages
@@ -209,7 +357,30 @@ class NativeKvControlPlane:
           f"by this step. Scrub the pages from pending_scrub() and call confirm_scrubbed() before "
           f"building the table."
       )
+    if self.debug_mode and self._prefix_state:
+      self._check_no_shared_writes(table)
     return table
+
+  def _check_no_shared_writes(self, table: KvPageTableV1) -> None:
+    """Confirm this step writes into no page it is only borrowing.
+
+    The property already follows from query lengths covering only the uncached
+    suffix, so this can never fire against correct arithmetic. It is here
+    because the failure it would catch -- one request overwriting the cached
+    prefix that several others are reading -- corrupts those requests silently
+    and at a distance, and is worth paying a debug-mode set intersection to rule
+    out while the arithmetic is still new.
+    """
+    borrowed = np.unique(np.concatenate([s.shared_pages for s in self._prefix_state.values()]))
+    slots = table.slot_mapping(self._layout.tokens_per_page, self.allocator.padding_page_id).reshape(-1)
+    written = np.unique(slots[slots >= 0] // self._layout.tokens_per_page).astype(np.int32)
+    clash = np.intersect1d(written, borrowed)
+    if clash.size:
+      raise SharedPageWriteError(
+          f"pages {clash[:8].tolist()} are shared prefix pages that other requests are reading, but "
+          f"this step's slot_mapping writes into them. A query length is covering tokens that were "
+          f"served from the prefix cache."
+      )
 
   def build_decode_table(self, handles: Sequence[RequestHandle]) -> KvPageTableV1:
     return self.build_page_table(handles, np.ones((len(handles),), dtype=np.int32))

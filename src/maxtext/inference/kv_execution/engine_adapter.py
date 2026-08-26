@@ -76,12 +76,33 @@ class PagedRuntime:
     self.observed_shapes: set[StepShape] = set()
     self._by_slot: dict[int, RequestHandle] = {}
     self._by_request_id: dict[str, RequestHandle] = {}
+    self._cached_tokens: dict[str, int] = {}
 
   def admit(self, request_id: str, prompt_len: int, max_new_tokens: int) -> RequestHandle | None:
     """Start tracking a request, returning None when there is no room."""
     return self.control_plane.admit(
         RequestDescriptor(request_id=request_id, prompt_len=prompt_len, max_new_tokens=max_new_tokens)
     )
+
+  def attach_prefix(self, handle: RequestHandle, token_ids, namespace=None) -> int:
+    """Lend the request any cached pages of its prompt. Returns tokens skipped.
+
+    The caller must then shorten the step's query to the tokens that remain, and
+    offset their positions by what was skipped -- the suffix sits at absolute
+    positions `cached..prompt_len`, and RoPE is not translation invariant.
+    """
+    if not self.control_plane.prefix_cache_enabled or token_ids is None:
+      return 0
+    if namespace is None:
+      cached = self.control_plane.attach_prefix(handle, token_ids).num_tokens
+    else:
+      cached = self.control_plane.attach_prefix(handle, token_ids, namespace).num_tokens
+    self._cached_tokens[handle.request_id] = cached
+    return cached
+
+  def cached_tokens(self, handle: RequestHandle) -> int:
+    """Tokens this request did not have to prefill. Zero without a hit."""
+    return self._cached_tokens.get(handle.request_id, 0)
 
   def prepare_step(
       self,
@@ -150,7 +171,7 @@ class PagedRuntime:
   def handle_for_request(self, request_id: str) -> RequestHandle | None:
     return self._by_request_id.get(str(request_id))
 
-  def release(self, handle: RequestHandle) -> np.ndarray:
+  def release(self, handle: RequestHandle, token_ids=None) -> np.ndarray:
     """Reclaim everything the request holds. The canonical API.
 
     Idempotent at this level: an untracked handle is a no-op rather than an
@@ -159,18 +180,25 @@ class PagedRuntime:
     idempotent, and that is the right split -- a double release through a handle
     the adapter still knows about is a bug worth reporting, while a release of
     something already forgotten is just a duplicate notification.
+
+    `token_ids` is the full context, offered to the prefix cache. The recorded
+    sequence length bounds what may be published, since that is exactly the
+    extent whose K/V has been written; the final sampled token is in the list but
+    its own K/V never got computed.
     """
     known = self._by_request_id.get(handle.request_id)
     if known is None or known != handle:
       return np.empty((0,), dtype=np.int32)
-    if self.poison_on_free:
-      pages = self.control_plane.page_map.pages(handle)
+    valid = self.control_plane.page_map.seq_len(handle)
+    freed = self.control_plane.release(handle, token_ids, num_valid_tokens=valid)
+    # Poisoning what came free rather than what the request held: with sharing on
+    # they differ, and a page the cache adopted is about to be read as valid K/V.
+    if self.poison_on_free and freed.size:
       for layer in range(self.pool.num_layers):
-        k, v = poison_pages(self.pool.k_pages[layer], self.pool.v_pages[layer], pages)
+        k, v = poison_pages(self.pool.k_pages[layer], self.pool.v_pages[layer], freed)
         self.pool.replace_layer(layer, k, v)
-    pages = self.control_plane.release(handle)
     self._forget(handle)
-    return pages
+    return freed
 
   def release_slot(self, slot: int) -> np.ndarray:
     """Shim for `release_pages(slot)`."""
@@ -181,6 +209,7 @@ class PagedRuntime:
 
   def _forget(self, handle: RequestHandle) -> None:
     self._by_request_id.pop(handle.request_id, None)
+    self._cached_tokens.pop(handle.request_id, None)
     for slot, tracked in list(self._by_slot.items()):
       if tracked == handle:
         del self._by_slot[slot]

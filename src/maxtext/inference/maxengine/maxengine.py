@@ -1881,7 +1881,7 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
         "token_logp": inserted_token_logp,
     }
 
-  def release(self, request_handle: Any):
+  def release(self, request_handle: Any, token_ids=None):
     """Reclaim the pages a request holds. The canonical release API.
 
     Request-based rather than slot-based on purpose. A slot is the dense cache's
@@ -1889,13 +1889,20 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
     paged request owns a set of pages that changed size on every step, so the
     handle is its only durable name.
 
+    `token_ids` is the request's full context, offered to the prefix cache when
+    one is enabled. Pages it adopts stay allocated for the next request with the
+    same prefix, and are therefore *not* among the ids returned -- the return
+    value continues to mean "free now, safe to overwrite". Omitting the tokens
+    publishes nothing, which is the right default for a caller that has not
+    thought about cache identity.
+
     Returns the page ids reclaimed, or an empty array when no paged runtime is
     attached.
     """
     if self.paged_runtime is None:
       max_logging.log("release: paged attention is not configured, so there are no pages to release.")
       return np.empty((0,), dtype=np.int32)
-    return self.paged_runtime.release(request_handle)
+    return self.paged_runtime.release(request_handle, token_ids)
 
   def release_pages(self, slot: int):
     """Compatibility shim over `release`, for callers that only have a slot.
@@ -1966,6 +1973,7 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
         layout=layout,
         max_requests=max_requests,
         max_context_len=self.config.paged_max_context_len,
+        enable_prefix_cache=self.config.paged_enable_prefix_cache,
     )
     planner = StepShapePlanner(
         tokens_per_page=layout.tokens_per_page,
@@ -2132,6 +2140,8 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
       request_id: str | None = None,
       max_new_tokens: int | None = None,
       slot: int | None = None,
+      prompt_token_ids=None,
+      namespace=None,
       rng: PRNGKeyType | None = None,
       algorithm: str | None = None,
       topk: int | None = None,
@@ -2143,6 +2153,11 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
     The sibling of `prefill`. It returns a `RequestHandle` rather than a prefix
     dict, because there is no cache to carry: the K/V is already in the pool and
     the handle is what names the pages holding it.
+
+    Passing `prompt_token_ids` opts the request into prefix sharing, when the
+    control plane has it enabled. The prompt's already-computed leading pages are
+    then lent to the request and only the remainder is run, which is where the
+    milestone's saving actually comes from.
 
     Returns:
       `(handle, result_tokens)`, or `(None, None)` if the pool could not admit
@@ -2162,7 +2177,9 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
     if handle is None:
       return None, None
 
-    view = runtime.prepare_step([handle], [prompt_len], is_decode=False, num_requests=1)
+    cached = runtime.attach_prefix(handle, prompt_token_ids, namespace)
+    query_len = prompt_len - cached
+    view = runtime.prepare_step([handle], [query_len], is_decode=False, num_requests=1)
     if view is None:
       runtime.control_plane.release(handle)
       return None, None
@@ -2178,15 +2195,21 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
     # can see, which is exactly how an earlier measurement here ended up
     # three-quarters compile time while reporting zero unwarmed shapes. numpy has
     # no such cache to miss, and these arrays are a few hundred bytes.
+    #
+    # With a prefix hit the query is the prompt's *suffix*, so the tokens are
+    # sliced from `cached` and the positions start there too. Absolute positions
+    # are what RoPE encodes, so restarting them at zero would rotate the suffix
+    # as though it began the sequence and produce K/V that does not belong after
+    # the cached prefix -- a wrong answer rather than a slow one.
     width = view.shape.num_tokens
-    prompt = np.asarray(padded_tokens, dtype=np.int32).reshape(-1)[:width]
+    prompt = np.asarray(padded_tokens, dtype=np.int32).reshape(-1)[cached : cached + width]
     token_row = np.zeros((1, width), np.int32)
     token_row[0, : prompt.size] = prompt
     index = np.arange(width, dtype=np.int32)
     tokens = jnp.asarray(token_row)
-    positions = jnp.asarray(index[None, :])
+    positions = jnp.asarray((index + cached)[None, :])
     segment_ids = jnp.asarray(
-        np.where(index < prompt_len, DECODING_ACTIVE_SEQUENCE_INDICATOR, 0).astype(np.int32)[None, :]
+        np.where(index < query_len, DECODING_ACTIVE_SEQUENCE_INDICATOR, 0).astype(np.int32)[None, :]
     )
 
     if rng is None:
@@ -2205,7 +2228,9 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
         kv_page_indices=view.kv_page_indices,
         kv_last_page_lens=view.kv_last_page_lens,
         cu_seqlens_q=view.cu_seqlens_q,
-        sample_at=jnp.asarray([prompt_len - 1], jnp.int32),
+        # Indexed within the query window, not the sequence: the logits this step
+        # produces cover only the tokens it ran.
+        sample_at=jnp.asarray([query_len - 1], jnp.int32),
         rng=rng,
         model_mode=MODEL_MODE_PREFILL,
         max_seqlen_k=view.shape.max_seqlen_k,

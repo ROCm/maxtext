@@ -58,6 +58,7 @@ ALLOWED_ROOTS = frozenset(
         "dataclasses",
         "enum",
         "hashlib",
+        "heapq",
         "math",
         "numpy",
         "typing",

@@ -641,6 +641,17 @@ class Attention(BaseModel):
           "Costs a pool write per freed page, so it is off by default."
       ),
   )
+  paged_enable_prefix_cache: bool = Field(
+      False,
+      description=(
+          "Share already-computed KV pages between requests whose prompts begin with the same tokens, "
+          "for attention='gpu_paged'. Skips the prefill of the shared prefix, which is the dominant "
+          "cost for a workload with a common system prompt or multi-turn conversations. Off by "
+          "default because a hit is only sound if the caller supplies a cache namespace that "
+          "distinguishes everything affecting the KV -- weights, adapter, tokenizer, RoPE, quantisation "
+          "-- and defaulting it on would make that omission silent rather than opt-in."
+      ),
+  )
   attention_type: Literal["global", "local_sliding", "chunk", "mla", "full", "compressed", "block_diffusion"] = Field(
       "global", description="The variant of attention to use."
   )

@@ -99,6 +99,7 @@ def build_config(mode: str, args) -> object:
     overrides["paged_num_blocks"] = dense_kv_tokens // args.page_size
     overrides["paged_max_context_len"] = args.max_context
     overrides["per_device_batch_size"] = float(args.max_batch)
+    overrides["paged_enable_prefix_cache"] = bool(args.prefix_cache)
 
   overrides["run_name"] = f"paged_bench_{mode}"
   return pyconfig.initialize([sys.argv[0], args.config_path], **overrides)
@@ -120,6 +121,26 @@ def build_params(cfg, devices):
 def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--mode", choices=("paged", "dense", "both"), default="paged")
+  parser.add_argument(
+      "--shared-prefix",
+      type=int,
+      default=0,
+      help=(
+          "tokens of common leading context per request; 0 uses the independent-prompt trace. "
+          "Non-zero is the workload prefix sharing targets, so pair it with --prefix-cache"
+      ),
+  )
+  parser.add_argument(
+      "--prefix-variants",
+      type=int,
+      default=1,
+      help="distinct shared prefixes to spread requests across, as a deployment serving several system prompts",
+  )
+  parser.add_argument(
+      "--prefix-cache",
+      action="store_true",
+      help="share already-computed pages between requests with a common prefix (paged arm only)",
+  )
   parser.add_argument("--requests", type=int, default=24)
   parser.add_argument("--mean-prompt", type=int, default=48)
   parser.add_argument("--mean-output", type=int, default=32)
@@ -167,9 +188,24 @@ def main() -> int:
     # A factory rather than one list: each repeat needs requests with no
     # timestamps on them, and each arm needs an independent copy.
     def fresh_trace():
-      return copy.deepcopy(
-          benchmark.synthetic_trace(args.requests, args.mean_prompt, args.mean_output, seed=args.seed)
-      )
+      if args.shared_prefix:
+        # The unique tail is what is left of the mean prompt once the shared
+        # block is accounted for, so both traces present the same total prompt
+        # length and the comparison is about sharing rather than about size.
+        unique = max(args.mean_prompt - args.shared_prefix, args.page_size)
+        trace = benchmark.shared_prefix_trace(
+            args.requests,
+            args.shared_prefix,
+            unique,
+            args.mean_output,
+            seed=args.seed,
+            num_variants=args.prefix_variants,
+        )
+      else:
+        trace = benchmark.synthetic_trace(
+            args.requests, args.mean_prompt, args.mean_output, seed=args.seed
+        )
+      return copy.deepcopy(trace)
 
     if arm == "paged":
       # The batch cap must not bind, or the measurement reports the flag rather
@@ -236,6 +272,12 @@ def main() -> int:
     results[arm] = summary
     print(benchmark.report(arm, summary))
     print(f"  KV tokens committed: {summary['kv_tokens_committed']}")
+    if summary.get("prefix_cache_enabled"):
+      print(
+          f"  prefix cache: {summary['prefill_tokens_saved']} of {summary['prompt_tokens']} prompt tokens "
+          f"not recomputed ({summary['prefill_saving_fraction']:.1%}), "
+          f"page hit rate {summary['prefix_cache_page_hit_rate']:.1%}"
+      )
 
   if "paged" in results and "dense" in results:
     paged, dense = results["paged"], results["dense"]

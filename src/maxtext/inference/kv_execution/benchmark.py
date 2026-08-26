@@ -69,6 +69,16 @@ class Request:
   token_times: list[float] = dataclasses.field(default_factory=list)
   generated: list[int] = dataclasses.field(default_factory=list)
   handle: Any = None
+  token_ids: np.ndarray | None = None
+  prefill_tokens: int = 0
+
+  def context_tokens(self) -> np.ndarray | None:
+    """Prompt plus generated, which is what the prefix cache is offered."""
+    if self.token_ids is None:
+      return None
+    if not self.generated:
+      return self.token_ids
+    return np.concatenate([self.token_ids, np.asarray(self.generated, dtype=np.int64)])
 
   @property
   def ttft(self) -> float | None:
@@ -108,10 +118,62 @@ def synthetic_trace(
     return rng.integers(low, high, size=num_requests)
 
   prompts, outputs = spread(mean_prompt), spread(mean_output)
+  # Token ids are distinct per request on purpose. A constant filler would make
+  # every prompt a prefix of every other, so switching the prefix cache on would
+  # report a hit rate this workload does not represent -- the baseline has to be a
+  # workload with nothing to share.
   return [
-      Request(request_id=f"r{i}", prompt_len=int(prompts[i]), max_new_tokens=int(outputs[i]))
+      Request(
+          request_id=f"r{i}",
+          prompt_len=int(prompts[i]),
+          max_new_tokens=int(outputs[i]),
+          token_ids=rng.integers(1, 30000, size=int(prompts[i]), dtype=np.int64),
+      )
       for i in range(num_requests)
   ]
+
+
+def shared_prefix_trace(
+    num_requests: int,
+    shared_prefix: int,
+    mean_unique: int,
+    mean_output: int,
+    *,
+    seed: int = 0,
+    length_spread: float = 0.6,
+    num_variants: int = 1,
+) -> list[Request]:
+  """Requests that begin with a common block, as a served system prompt does.
+
+  This is the workload prefix sharing exists for, and the one where a paged
+  runtime's advantage over a dense one is largest: the shared block is prefilled
+  once and read by everything after it. `num_variants` splits the population
+  across several distinct prefixes, which is the realistic case -- a deployment
+  serves a handful of system prompts, not one -- and it also keeps the measurement
+  honest about eviction, since several prefixes compete for the same pool.
+  """
+  rng = np.random.default_rng(seed)
+  prefixes = [rng.integers(1, 30000, size=shared_prefix, dtype=np.int64) for _ in range(max(num_variants, 1))]
+
+  def spread(mean: int) -> np.ndarray:
+    low = max(1, int(mean * (1.0 - length_spread)))
+    high = max(low + 1, int(mean * (1.0 + length_spread)))
+    return rng.integers(low, high, size=num_requests)
+
+  uniques, outputs = spread(mean_unique), spread(mean_output)
+  requests = []
+  for i in range(num_requests):
+    tail = rng.integers(1, 30000, size=int(uniques[i]), dtype=np.int64)
+    tokens = np.concatenate([prefixes[i % len(prefixes)], tail])
+    requests.append(
+        Request(
+            request_id=f"r{i}",
+            prompt_len=int(tokens.size),
+            max_new_tokens=int(outputs[i]),
+            token_ids=tokens,
+        )
+    )
+  return requests
 
 
 def warmup_paged(engine, params, *, max_prompt: int, max_batch: int, target_context: int) -> set:
@@ -257,18 +319,25 @@ def run_paged(
   while waiting or live:
     while waiting and len(live) < max_batch:
       candidate = waiting[0]
-      padded = jnp.asarray(
-          candidate.generated[:0] + [1] * candidate.prompt_len, dtype=jnp.int32
+      prompt = (
+          candidate.token_ids
+          if candidate.token_ids is not None
+          else np.ones((candidate.prompt_len,), dtype=np.int64)
       )
       handle, result = engine.prefill_paged(
           params=params,
-          padded_tokens=padded,
+          padded_tokens=jnp.asarray(prompt, dtype=jnp.int32),
           true_length=candidate.prompt_len,
           request_id=candidate.request_id,
           max_new_tokens=candidate.max_new_tokens,
+          prompt_token_ids=candidate.token_ids,
       )
       if handle is None:
         break  # backpressure: the pool cannot take another request yet
+      # The tokens this prefill actually ran, which is the prompt minus whatever
+      # the cache supplied. Recorded per request so the saving can be reported as
+      # work avoided rather than inferred from a latency difference alone.
+      candidate.prefill_tokens = candidate.prompt_len - runtime.cached_tokens(handle)
       waiting.pop(0)
       candidate.handle = handle
       candidate.generated.append(int(result.data[0, 0]))
@@ -295,6 +364,8 @@ def run_paged(
       # Pool exhausted mid-decode. Give the newest request's pages back and let
       # it be replayed, which is the same recompute-preemption the driver uses.
       victim = live.pop()
+      # Nothing published: preemption is trying to reclaim pages, and the cache
+      # would hold onto whatever it adopted.
       engine.release(victim.handle)
       victim.handle, victim.generated = None, []
       waiting.insert(0, victim)
@@ -314,13 +385,14 @@ def run_paged(
     occupancy.append((now - start, allocator.num_allocated_pages * page_size, live_tokens, len(live)))
 
     for request in finished:
-      engine.release(request.handle)
+      engine.release(request.handle, request.context_tokens())
       request.handle = None
       live.remove(request)
       done.append(request)
 
   elapsed = time.perf_counter() - start
   summary = _summarise(done, occupancy, elapsed, steps, allocator, page_size)
+  summary.update(_summarise_prefix_cache(done, runtime.control_plane))
 
   # Shape accounting, which is necessary but *not sufficient*: it sees bucketed
   # `StepShape`s and is blind to eager host-side ops whose values enter a jaxpr as
@@ -336,6 +408,28 @@ def run_paged(
   if fresh:
     summary["unwarmed_shapes"] = [dataclasses.asdict(s) for s in sorted(fresh, key=str)]
   return summary
+
+
+def _summarise_prefix_cache(requests: Sequence[Request], control_plane) -> dict[str, Any]:
+  """What sharing avoided, in tokens rather than in seconds.
+
+  Reported separately from latency because it is the direct measurement: a
+  latency difference between two runs mixes in the pool pressure the retained
+  pages cause, whereas prompt tokens minus prefilled tokens is exactly the work
+  that did not happen.
+  """
+  prompted = sum(r.prompt_len for r in requests)
+  prefilled = sum(r.prefill_tokens for r in requests)
+  index = control_plane.prefix_index
+  return {
+      "prefix_cache_enabled": index.enabled,
+      "prompt_tokens": prompted,
+      "prefill_tokens_run": prefilled,
+      "prefill_tokens_saved": prompted - prefilled,
+      "prefill_saving_fraction": (prompted - prefilled) / prompted if prompted else 0.0,
+      "prefix_cache_page_hit_rate": index.hit_rate,
+      "prefix_cache_pages_retained": index.num_cached_pages,
+  }
 
 
 def run_repeated(engine, params, trace_factory, *, max_batch: int, warmed_shapes=None, repeats: int = 2):

@@ -25,6 +25,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from maxtext.inference.kv_common.namespace import CACHE_NAMESPACE_VERSION, CacheNamespace
 from maxtext.inference.kv_common.page_table import KV_PAGE_TABLE_VERSION, KvPageTableV1
 from maxtext.inference.kv_common.storage_layout import (
     KV_STORAGE_LAYOUT_VERSION,
@@ -32,8 +33,10 @@ from maxtext.inference.kv_common.storage_layout import (
 )
 
 __all__ = [
+    "CACHE_NAMESPACE_VERSION",
     "KV_PAGE_TABLE_VERSION",
     "KV_STORAGE_LAYOUT_VERSION",
+    "CacheNamespace",
     "KvPageTableV1",
     "KvStorageLayoutV1",
 ]

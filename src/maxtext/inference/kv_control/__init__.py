@@ -30,7 +30,11 @@ limitations under the License.
 """
 
 from maxtext.inference.kv_control.allocator import DoubleFreeError, PagedBlockAllocator
-from maxtext.inference.kv_control.control_plane import DirtyPageError, NativeKvControlPlane
+from maxtext.inference.kv_control.control_plane import (
+    DirtyPageError,
+    NativeKvControlPlane,
+    SharedPageWriteError,
+)
 from maxtext.inference.kv_control.logical_block import (
     LogicalBlock,
     PageState,
@@ -43,6 +47,13 @@ from maxtext.inference.kv_control.logical_block import (
 )
 from maxtext.inference.kv_control.metadata import build_decode_table, build_page_table
 from maxtext.inference.kv_control.page_map import PageCapacityError, PageMap, StaleRequestHandleError
+from maxtext.inference.kv_control.prefix_index import (
+    PrefixIndex,
+    PrefixMatch,
+    PrefixNode,
+    PublishResult,
+    block_hash,
+)
 from maxtext.inference.kv_control.protocols import KvControlPlane
 from maxtext.inference.kv_control.request import RequestDescriptor, RequestHandle, RequestState
 
@@ -57,10 +68,16 @@ __all__ = [
     "PageState",
     "PageStateError",
     "PagedBlockAllocator",
+    "PrefixIndex",
+    "PrefixMatch",
+    "PrefixNode",
+    "PublishResult",
     "RequestDescriptor",
     "RequestHandle",
     "RequestState",
+    "SharedPageWriteError",
     "StaleRequestHandleError",
+    "block_hash",
     "build_decode_table",
     "build_page_table",
     "decode_needs_new_page",
