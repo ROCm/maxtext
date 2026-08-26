@@ -1218,6 +1218,22 @@ class Attention(nnx.Module):
         total_tokens=query.shape[0],
         max_seqlen_k=self.max_target_length,
     )
+    backend = getattr(self.config, "paged_attention_backend", "auto")
+    axes = gpu_paged_attention.kv_head_axes(self.mesh)
+    if axes:
+      # Tensor parallelism: the kernels have to run in manual mode, because XLA
+      # cannot partition the FFI call they go through.
+      return gpu_paged_attention.paged_attention_step_sharded(
+          query,
+          key,
+          value,
+          k_pool,
+          v_pool,
+          plan,
+          mesh=self.mesh,
+          axes=axes if len(axes) > 1 else axes[0],
+          backend=backend,
+      )
     return gpu_paged_attention.paged_attention_step(
         query,
         key,
@@ -1225,7 +1241,7 @@ class Attention(nnx.Module):
         k_pool,
         v_pool,
         plan,
-        backend=getattr(self.config, "paged_attention_backend", "auto"),
+        backend=backend,
         # 1.0, not 1/sqrt(head_dim). MaxText folds the depth scaling into the
         # query projection's initializer (see `depth_scaling` in the kernel init)
         # and applies `query_pre_attn_scalar` above, so the query arriving here is

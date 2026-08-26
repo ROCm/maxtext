@@ -1963,15 +1963,17 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
 
     layout = build_storage_layout(self.config, self._mesh)
     if layout.kv_head_shards > 1:
-      # The pool shards correctly (see `kv_pool_sharding`), but the aiter kernels
-      # reach the pool through an FFI custom call, and XLA cannot partition one.
-      # Left to itself it neither gathers nor splits and the step simply hangs,
-      # which is a far worse thing to ship than a refusal. Lifting this needs the
-      # forward wrapped in `shard_map` so each device runs the kernel on its own
-      # shard -- the remaining half of M6.
+      # `shard_map` gets the kernels running under TP -- the step no longer hangs
+      # and donation survives manual mode -- but the output is still wrong: at
+      # TP=8 the first sampled token already differs from both the single-device
+      # paged path and the TP=8 dense path, which agree with each other. So the
+      # fault is in how the sharded operands are described to the kernels, not in
+      # the sharding of the pool. Refusing until that is understood, because a
+      # wrong answer that runs is far worse than a refusal.
       raise ValueError(
           f"attention='gpu_paged' does not yet support tensor parallelism: this mesh shards KV heads "
-          f"{layout.kv_head_shards} ways. Run the paged path on a single device, or use "
+          f"{layout.kv_head_shards} ways, and the sharded path does not yet reproduce the "
+          f"single-device result. Run the paged path on a single device, or use "
           f"attention='dot_product' for a sharded run."
       )
     if layout.dtype not in ("bfloat16", "float16"):

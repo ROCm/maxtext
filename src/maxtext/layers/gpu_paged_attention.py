@@ -239,3 +239,72 @@ def paged_attention_step(query, key, value, k_pool, v_pool, plan, *, backend="au
         causal=causal,
     )
   return out, [k_pool, v_pool]
+
+
+def kv_head_axes(mesh: Any, candidates: tuple[str, ...] = ("tensor", "tensor_transpose", "tensor_sequence")):
+  """The mesh axes that actually shard KV heads, or () when nothing does."""
+  if mesh is None:
+    return ()
+  shape = dict(getattr(mesh, "shape", {}) or {})
+  return tuple(axis for axis in candidates if int(shape.get(axis, 1)) > 1)
+
+
+def paged_attention_step_sharded(
+    query, key, value, k_pool, v_pool, plan, *, mesh, axes, backend="auto", scale=None, causal=True
+):
+  """`paged_attention_step` under `shard_map`, so each device sees its own heads.
+
+  XLA cannot partition an FFI custom call. Handed a sharded pool it neither
+  gathers nor splits and the step hangs, so the kernels have to be entered in
+  manual mode where every device runs the same code on its local shard and the
+  kernel sees a narrower pool than the global one. Nothing vendor-side changes:
+  the jax-aiter KV ops carry no `custom_partitioning`, which is what would
+  otherwise conflict with `shard_map`.
+
+  **The plan arrays are replicated, and that is the whole reason this is free.**
+  Page ids, slot offsets and last-page occupancies describe *pages*, and pages
+  are not sharded -- every device holds the same pages and differs only in which
+  heads it stores. So each device can compute its slice of the attention with no
+  knowledge of any other, and the step needs no cross-device KV traffic at all,
+  which is precisely the property M6 exists to establish.
+
+  `plan` is not a pytree, so its arrays are passed positionally and its static
+  fields are closed over.
+  """
+  qkv_spec = jax.sharding.PartitionSpec(None, axes, None)
+  pool_spec = jax.sharding.PartitionSpec(None, None, axes, None)
+  replicated = jax.sharding.PartitionSpec()
+
+  def body(query, key, value, k_pool, v_pool, slot_mapping, kv_indptr, page_indices, last_page_lens, cu_seqlens_q):
+    local = dataclasses.replace(
+        plan,
+        slot_mapping=slot_mapping,
+        kv_indptr=kv_indptr,
+        kv_page_indices=page_indices,
+        kv_last_page_lens=last_page_lens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    # Flattened, because `shard_map` matches out_specs against the output tree
+    # and a nested list there is one more level than the specs can describe.
+    out, pools = paged_attention_step(
+        query, key, value, k_pool, v_pool, local, backend=backend, scale=scale, causal=causal
+    )
+    return out, pools[0], pools[1]
+
+  # check_vma is off because the replicated plan arrays are read by every device
+  # and the pools are written per-device; the varying-manual-axes check cannot
+  # see that an aliased FFI write is confined to the local shard.
+  out, k_pool, v_pool = jax.shard_map(
+      body,
+      mesh=mesh,
+      in_specs=(
+          qkv_spec, qkv_spec, qkv_spec, pool_spec, pool_spec,
+          replicated, replicated, replicated, replicated, replicated,
+      ),
+      out_specs=(qkv_spec, pool_spec, pool_spec),
+      check_vma=False,
+  )(
+      query, key, value, k_pool, v_pool,
+      plan.slot_mapping, plan.kv_indptr, plan.kv_page_indices, plan.kv_last_page_lens, plan.cu_seqlens_q,
+  )
+  return out, [k_pool, v_pool]

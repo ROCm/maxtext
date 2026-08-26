@@ -82,6 +82,16 @@ def kv_pool_sharding(mesh: Any | None, layout: KvStorageLayoutV1) -> Any | None:
   if mesh is None or shards <= 1:
     return None
 
+  replication = layout.replication_factor()
+  if replication == 1:
+    # Clean partition, and the common case. The model's own mesh already
+    # expresses it, so use that rather than a private one: `shard_map` needs the
+    # pool and the activations on the *same* mesh, and a second mesh over the
+    # same devices is not the same mesh as far as it is concerned.
+    axes = tuple(a for a in _KV_HEAD_MESH_AXES if int(dict(mesh.shape).get(a, 1)) > 1)
+    spec = jax.sharding.PartitionSpec(None, None, axes if len(axes) > 1 else axes[0], None)
+    return jax.sharding.NamedSharding(mesh, spec)
+
   devices = np.asarray(getattr(mesh, "devices", None))
   if devices.size != shards:
     raise ValueError(
@@ -89,7 +99,6 @@ def kv_pool_sharding(mesh: Any | None, layout: KvStorageLayoutV1) -> Any | None:
         f"kv_head_shards must come from this mesh, or the pool will be laid out for a different one."
     )
 
-  replication = layout.replication_factor()
   kv_axis = shards // replication
   # Row-major, and matching MaxText's device order rather than imposing one.
   grid = devices.reshape(kv_axis, replication)
