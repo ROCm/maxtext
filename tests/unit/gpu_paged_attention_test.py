@@ -182,19 +182,41 @@ class ConfigGuardTest(parameterized.TestCase):
     arguments.update(overrides)
     return pyconfig.initialize([sys.argv[0], get_test_config_path()], **arguments)
 
+  def _paged(self, **overrides):
+    arguments = {"attention": "gpu_paged", "scan_layers": False, "paged_num_blocks": 256}
+    arguments.update(overrides)
+    return self._config(**arguments)
+
   def test_gpu_paged_is_an_accepted_attention_value(self):
-    cfg = self._config(attention="gpu_paged", scan_layers=False)
+    cfg = self._paged()
     self.assertEqual(cfg.attention, "gpu_paged")
     self.assertEqual(cfg.paged_attention_backend, "auto")
+    self.assertEqual(cfg.paged_page_size, TOKENS_PER_PAGE)
 
   def test_scan_layers_is_refused(self):
     """Scanning stacks the caches, which would copy the whole pool every step."""
     with self.assertRaisesRegex(ValueError, "scan_layers=False"):
-      self._config(attention="gpu_paged", scan_layers=True)
+      self._paged(scan_layers=True)
 
-  def test_other_attention_kernels_are_unaffected_by_the_guard(self):
+  def test_a_pool_size_is_required(self):
+    """Capacity has no safe default: too small caps concurrency silently."""
+    with self.assertRaisesRegex(ValueError, "paged_num_blocks"):
+      self._config(attention="gpu_paged", scan_layers=False)
+
+  def test_the_context_length_defaults_to_the_target_length(self):
+    """max_target_length already states the longest sequence to be served."""
+    cfg = self._paged()
+    self.assertEqual(cfg.paged_max_context_len, cfg.max_target_length)
+
+  def test_a_pool_too_small_for_one_request_is_refused(self):
+    """Otherwise this surfaces as backpressure that never clears."""
+    with self.assertRaisesRegex(ValueError, "no request could ever finish"):
+      self._paged(paged_num_blocks=2, paged_max_context_len=1024)
+
+  def test_other_attention_kernels_are_unaffected_by_the_guards(self):
     cfg = self._config(attention="dot_product", scan_layers=True)
     self.assertEqual(cfg.attention, "dot_product")
+    self.assertEqual(cfg.paged_num_blocks, 0)
 
 
 if __name__ == "__main__":

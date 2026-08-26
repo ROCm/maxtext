@@ -74,36 +74,86 @@ def _import_or_stub(
 # ---------------- JetStream -----------------
 
 
+class _StubEngine:  # minimal base class stub
+  """Stub Engine accepting any initialization signature."""
+
+  def __init__(self, *a, **k):  # pylint: disable=unused-argument
+    pass
+
+
+class _StubResultTokens:
+  """Container for result token arrays used by JetStream.
+
+  Defined at module scope rather than inside `_jetstream_stubs` so there is
+  exactly one type to register as a pytree, however many times the stubs are
+  requested. Two classes with the same name would be two unrelated types.
+  """
+
+  def __init__(
+      self,
+      *args,
+      data=None,
+      tokens_idx=None,
+      valid_idx=None,
+      length_idx=None,
+      log_prob=None,
+      samples_per_slot: int | None = None,
+      **kwargs,
+  ):
+    del args, kwargs  # unused
+    self.data = data
+    self.tokens_idx = tokens_idx
+    self.valid_idx = valid_idx
+    self.length_idx = length_idx
+    self.log_prob = log_prob
+    self.samples_per_slot = samples_per_slot
+
+
+_stub_result_tokens_registered = False
+
+
+def _register_stub_result_tokens():
+  """Make the stub a pytree, because the real `ResultTokens` is one.
+
+  `MaxEngine._prefill_jit` and `_generate_jit` return a `ResultTokens` from
+  *inside* `jit`, so the type has to be a registered pytree or the call fails
+  with "not a valid JAX type". Without this the stubs are enough to import
+  `maxengine` but not to run its dense prefill, which makes decoupled mode look
+  supported while the main serving path is unusable.
+
+  Registration is lazy and idempotent: this module is imported early and should
+  not pull in jax by itself, and only the stub type is ever registered, so an
+  environment with real JetStream installed is unaffected.
+  """
+  global _stub_result_tokens_registered  # pylint: disable=global-statement
+  if _stub_result_tokens_registered:
+    return
+  try:
+    import jax  # pylint: disable=import-outside-toplevel
+  except ImportError:
+    return
+  jax.tree_util.register_pytree_node(
+      _StubResultTokens,
+      # The arrays are children; the index tuples and sample count are static
+      # metadata, which is what lets them survive tracing unchanged.
+      lambda t: ((t.data, t.log_prob), (t.tokens_idx, t.valid_idx, t.length_idx, t.samples_per_slot)),
+      lambda aux, children: _StubResultTokens(
+          data=children[0],
+          log_prob=children[1],
+          tokens_idx=aux[0],
+          valid_idx=aux[1],
+          length_idx=aux[2],
+          samples_per_slot=aux[3],
+      ),
+  )
+  _stub_result_tokens_registered = True
+
+
 def _jetstream_stubs():
   """Return lightweight stubs for JetStream modules."""
-
-  class Engine:  # minimal base class stub
-    """Stub Engine accepting any initialization signature."""
-
-    def __init__(self, *a, **k):  # pylint: disable=unused-argument
-      pass
-
-  class ResultTokens:
-    """Container for result token arrays used by JetStream."""
-
-    def __init__(
-        self,
-        *args,
-        data=None,
-        tokens_idx=None,
-        valid_idx=None,
-        length_idx=None,
-        log_prob=None,
-        samples_per_slot: int | None = None,
-        **kwargs,
-    ):
-      del args, kwargs  # unused
-      self.data = data
-      self.tokens_idx = tokens_idx
-      self.valid_idx = valid_idx
-      self.length_idx = length_idx
-      self.log_prob = log_prob
-      self.samples_per_slot = samples_per_slot
+  _register_stub_result_tokens()
+  Engine = _StubEngine  # pylint: disable=invalid-name
+  ResultTokens = _StubResultTokens  # pylint: disable=invalid-name
 
   # Tokenizer placeholders (unused in decoupled tests due to runtime guard).
   class TokenizerParameters:  # pragma: no cover - placeholder

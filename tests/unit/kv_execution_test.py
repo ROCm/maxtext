@@ -1,0 +1,526 @@
+"""Tests for the paged KV execution layer: bucketing, step views, and the driver.
+
+These need jax, but only on CPU: the step function is injected, so the scheduling
+loop is exercised without a model or a kernel. The real-kernel checks -- the
+poisoned-page acceptance gate and the compile-count bound -- live in
+`kv_paged_runtime_test.py` and are `gpu_only`.
+
+Same marking trap as the rest of this work: `tests/conftest.py` auto-marks
+unmarked tests `cpu_only` and skips `cpu_only` on any accelerator testbed, so on a
+GPU box this file skips rather than passes. Run it with `JAX_PLATFORMS=cpu` and
+read the count.
+
+Copyright 2026 Advanced Micro Devices, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import unittest
+
+import numpy as np
+
+from maxtext.inference.kv_common import KvPageTableV1, KvStorageLayoutV1
+from maxtext.inference.kv_control import NativeKvControlPlane, RequestHandle
+from maxtext.inference.kv_execution import allocate_pool, PagedDriver, PagedRequest
+from maxtext.inference.kv_execution.bucketing import (
+    StepShapePlanner,
+    batch_ladder,
+    bucket_up,
+    seqlen_ladder,
+    token_ladder,
+)
+from maxtext.inference.kv_execution.engine_adapter import PagedRuntime
+from maxtext.inference.kv_execution.layout_builder import build_storage_layout, kv_head_shards
+from maxtext.inference.kv_execution.pool_ops import POISON_SENTINEL, poison_pages, scrub_pages
+from maxtext.inference.kv_execution.step_view import build_step_view
+
+PAGE = 16
+
+
+def _layout(**kw) -> KvStorageLayoutV1:
+  """A small pool geometry, overridable field by field."""
+  base = {
+      "tokens_per_page": PAGE,
+      "num_pages": 65,
+      "num_layers": 2,
+      "num_kv_heads": 4,
+      "head_dim": 32,
+      "dtype": "float32",
+  }
+  base.update(kw)
+  return KvStorageLayoutV1(**base)
+
+
+class _FakeMesh:
+  def __init__(self, shape):
+    self.shape = shape
+
+
+class _FakeConfig:
+  """The handful of attributes `build_storage_layout` reads."""
+
+  def __init__(self, **kw):
+    self.num_kv_heads = 4
+    self.head_dim = 128
+    self.num_decoder_layers = 8
+    self.paged_page_size = PAGE
+    self.paged_num_blocks = 256
+    self.dtype = "bfloat16"
+    for key, value in kw.items():
+      setattr(self, key, value)
+
+
+class LadderTest(unittest.TestCase):
+  """The power-of-two rungs that decide which shapes can exist."""
+
+  def test_bucket_up_finds_the_smallest_sufficient_rung(self):
+    ladder = (1, 2, 4, 8)
+    self.assertEqual(bucket_up(1, ladder), 1)
+    self.assertEqual(bucket_up(3, ladder), 4)
+    self.assertEqual(bucket_up(8, ladder), 8)
+
+  def test_exceeding_the_ladder_raises_rather_than_clamping(self):
+    """Clamping would silently drop the tokens that did not fit."""
+    with self.assertRaisesRegex(ValueError, "mis-sized"):
+      bucket_up(9, (1, 2, 4, 8))
+
+  def test_batch_ladder_starts_at_one(self):
+    self.assertEqual(batch_ladder(8), (1, 2, 4, 8))
+    self.assertEqual(batch_ladder(5), (1, 2, 4, 8))
+
+  def test_token_ladder_starts_at_sixty_four(self):
+    """Matching MaxText's existing prefill bucketing; finer rungs buy nothing."""
+    self.assertEqual(token_ladder(256), (64, 128, 256))
+    self.assertEqual(token_ladder(10), (64,))
+
+  def test_seqlen_ladder_starts_at_the_page_size(self):
+    """A shorter context still occupies a whole page, so a finer rung cannot occur."""
+    self.assertEqual(seqlen_ladder(16, 128), (16, 32, 64, 128))
+
+
+class StepShapeTest(unittest.TestCase):
+  """Which shapes the two phases produce, and how many there can be."""
+
+  def _planner(self, max_batch=8, max_context_len=128, pool_pages=65, max_batched_tokens=None):
+    return StepShapePlanner(
+        tokens_per_page=PAGE,
+        max_batch=max_batch,
+        max_context_len=max_context_len,
+        pool_pages=pool_pages,
+        max_batched_tokens=max_batched_tokens,
+    )
+
+  def test_decode_ties_the_token_count_to_the_batch_bucket(self):
+    """One token per request, so the token axis is not independently free."""
+    shape = self._planner().decode_shape(num_requests=3, max_seq_len=40)
+    self.assertEqual(shape.num_requests, 4)
+    self.assertEqual(shape.num_tokens, 4)
+    self.assertTrue(shape.is_decode)
+
+  def test_extend_pins_the_batch_and_varies_only_tokens(self):
+    planner = self._planner(max_batch=8, max_batched_tokens=512)
+    first = planner.extend_shape(num_tokens=100, max_seq_len=100)
+    second = planner.extend_shape(num_tokens=200, max_seq_len=100)
+    self.assertEqual(first.num_requests, 8)
+    self.assertEqual(second.num_requests, 8)
+    self.assertEqual(first.num_tokens, 128)
+    self.assertEqual(second.num_tokens, 256)
+
+  def test_the_token_budget_is_a_batch_budget_not_a_request_length(self):
+    """An extend step batches requests, so its total exceeds the longest one.
+
+    Sizing the token ladder from max_context_len made a perfectly legal batch --
+    four 100-token prompts against a 128-token cap -- impossible to bucket.
+    """
+    planner = self._planner(max_context_len=128, max_batched_tokens=1024)
+    self.assertEqual(planner.extend_shape(num_tokens=400, max_seq_len=128).num_tokens, 512)
+
+  def test_a_batch_past_the_token_budget_is_refused(self):
+    planner = self._planner(max_context_len=128, max_batched_tokens=128)
+    with self.assertRaisesRegex(ValueError, "mis-sized"):
+      planner.extend_shape(num_tokens=400, max_seq_len=128)
+
+  def test_the_gather_table_is_an_upper_bound_not_a_guess(self):
+    """Derived from batch and length, so it cannot under-size the page list."""
+    planner = self._planner(max_batch=4, max_context_len=64, pool_pages=1024)
+    shape = planner.decode_shape(num_requests=4, max_seq_len=64)
+    self.assertEqual(shape.num_pages, 4 * 4)
+
+  def test_the_gather_table_is_clamped_to_the_pool(self):
+    planner = self._planner(max_batch=256, max_context_len=4096, pool_pages=40)
+    self.assertEqual(planner.decode_shape(256, 4096).num_pages, 40)
+
+  def test_a_bucketed_shape_is_reached_by_a_range_of_batches(self):
+    """The property that bounds compilation: many inputs, one shape."""
+    planner = self._planner()
+    shapes = {planner.decode_shape(n, 40) for n in (5, 6, 7, 8)}
+    self.assertEqual(len(shapes), 1)
+
+  def test_the_shape_count_has_a_stated_bound(self):
+    planner = self._planner(max_batch=8, max_context_len=128)
+    # 4 batch rungs + 2 token rungs, each against 4 seqlen rungs
+    self.assertEqual(planner.max_distinct_shapes(), (4 + 2) * 4)
+
+
+class StepViewTest(unittest.TestCase):
+  """Padding a page table into a static shape, inertly."""
+
+  def _table(self):
+    return KvPageTableV1(
+        page_ids=[[1, 2, 3], [4, 5]],
+        seq_lens=np.array([33, 20], dtype=np.int32),
+        query_lens=np.array([1, 1], dtype=np.int32),
+        write_positions=np.array([32, 19], dtype=np.int32),
+        request_order=np.array([0, 1], dtype=np.int32),
+    )
+
+  def _view(self, num_requests=4, num_tokens=4, num_pages=8, max_seqlen_k=64):
+    """The two-request decode table above, padded to a given bucketed shape."""
+    from maxtext.inference.kv_execution.bucketing import StepShape  # pylint: disable=import-outside-toplevel
+
+    shape = StepShape(
+        num_requests=num_requests,
+        num_tokens=num_tokens,
+        num_pages=num_pages,
+        max_seqlen_k=max_seqlen_k,
+        is_decode=True,
+    )
+    return build_step_view(self._table(), shape, tokens_per_page=PAGE)
+
+  def test_the_arrays_have_exactly_the_bucketed_shapes(self):
+    view = self._view()
+    self.assertEqual(view.slot_mapping.shape, (4,))
+    self.assertEqual(view.kv_indptr.shape, (5,))
+    self.assertEqual(view.kv_page_indices.shape, (8,))
+    self.assertEqual(view.kv_last_page_lens.shape, (4,))
+    self.assertEqual(view.cu_seqlens_q.shape, (5,))
+    self.assertEqual(view.num_active_requests, 2)
+    self.assertEqual(view.num_active_tokens, 2)
+
+  def test_padded_writes_go_to_the_skip_sentinel(self):
+    """Not to a real slot, which would write garbage into a live page."""
+    slots = np.asarray(self._view().slot_mapping)
+    np.testing.assert_array_equal(slots[:2], [48, 83])
+    np.testing.assert_array_equal(slots[2:], [-1, -1])
+
+  def test_padded_requests_get_zero_length_page_ranges(self):
+    """A repeated final indptr entry, so a kernel does no work for them."""
+    view = self._view()
+    np.testing.assert_array_equal(np.asarray(view.kv_indptr), [0, 3, 5, 5, 5])
+    np.testing.assert_array_equal(np.asarray(view.cu_seqlens_q), [0, 1, 2, 2, 2])
+
+  def test_padded_gather_entries_point_at_the_reserved_page(self):
+    """Belt and braces behind the flat indptr: the reserved page reads as zeros."""
+    view = self._view()
+    indices = np.asarray(view.kv_page_indices)
+    np.testing.assert_array_equal(indices[:5], [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(indices[5:], [0, 0, 0])
+
+  def test_padded_lengths_are_zero(self):
+    view = self._view()
+    np.testing.assert_array_equal(np.asarray(view.kv_last_page_lens), [1, 4, 0, 0])
+    np.testing.assert_array_equal(np.asarray(view.seq_lens), [33, 20, 0, 0])
+
+  def test_a_bucket_too_small_for_the_batch_is_rejected(self):
+    with self.assertRaisesRegex(ValueError, "kv_page_indices"):
+      self._view(num_pages=2)
+
+  def test_a_sequence_longer_than_the_configured_bucket_is_rejected(self):
+    """Silently truncating max_seqlen_k would under-configure the kernel."""
+    with self.assertRaisesRegex(ValueError, "ladder is mis-sized"):
+      self._view(max_seqlen_k=32)
+
+  def test_it_converts_to_the_attention_path_plan(self):
+    plan = self._view().to_paged_plan()
+    self.assertTrue(plan.is_decode)
+    self.assertEqual(plan.max_seqlen_q, 1)
+    self.assertEqual(plan.max_seqlen_k, 64)
+
+
+class PoolTest(unittest.TestCase):
+  """Allocation and the two hygiene operations."""
+
+  def test_the_pool_starts_zeroed(self):
+    """Load-bearing: the reserved page and every unscrubbed page rely on it."""
+    pool = allocate_pool(_layout(num_pages=8, num_layers=3))
+    self.assertEqual(pool.num_layers, 3)
+    self.assertEqual(pool.page_shape, (8, PAGE, 4, 32))
+    for layer in range(3):
+      self.assertTrue(bool((np.asarray(pool.k_pages[layer]) == 0).all()))
+      self.assertTrue(bool((np.asarray(pool.v_pages[layer]) == 0).all()))
+
+  def test_scrubbing_zeroes_only_the_named_pages(self):
+    pool = allocate_pool(_layout(num_pages=8, num_layers=1))
+    k, v = poison_pages(pool.k_pages[0], pool.v_pages[0], [1, 2, 3])
+    k, v = scrub_pages(k, v, [2])
+    k, v = np.asarray(k), np.asarray(v)
+    self.assertTrue(bool((k[2] == 0).all()))
+    self.assertTrue(bool((k[1] == POISON_SENTINEL).all()))
+    self.assertTrue(bool((v[3] == POISON_SENTINEL).all()))
+
+  def test_scrubbing_nothing_is_a_no_op(self):
+    pool = allocate_pool(_layout(num_pages=8, num_layers=1))
+    k, v = scrub_pages(pool.k_pages[0], pool.v_pages[0], [])
+    self.assertTrue(bool((np.asarray(k) == 0).all()))
+    self.assertTrue(bool((np.asarray(v) == 0).all()))
+
+  def test_an_odd_page_count_is_padded_idempotently(self):
+    """Padding repeats a page already being written, so no mask is needed."""
+    pool = allocate_pool(_layout(num_pages=8, num_layers=1))
+    k, v = poison_pages(pool.k_pages[0], pool.v_pages[0], [1, 2, 3, 4, 5])
+    k = np.asarray(k)
+    for page in (1, 2, 3, 4, 5):
+      self.assertTrue(bool((k[page] == POISON_SENTINEL).all()), f"page {page} not filled")
+    for page in (0, 6, 7):
+      self.assertTrue(bool((k[page] == 0).all()), f"page {page} was filled and should not have been")
+    self.assertTrue(bool((np.asarray(v)[5] == POISON_SENTINEL).all()))
+
+
+class LayoutBuilderTest(unittest.TestCase):
+  """Config and mesh into pool geometry."""
+
+  def test_it_reads_the_model_dimensions(self):
+    layout = build_storage_layout(_FakeConfig())
+    self.assertEqual(layout.tokens_per_page, PAGE)
+    self.assertEqual(layout.num_kv_heads, 4)
+    self.assertEqual(layout.head_dim, 128)
+    self.assertEqual(layout.num_layers, 8)
+
+  def test_the_reserved_page_is_added_rather_than_taken_out_of_capacity(self):
+    """paged_num_blocks is what the operator asked to be usable."""
+    layout = build_storage_layout(_FakeConfig(paged_num_blocks=256))
+    self.assertEqual(layout.num_pages, 257)
+    self.assertEqual(layout.max_tokens(), 256 * PAGE)
+
+  def test_shards_come_from_the_mesh_not_from_a_config_field(self):
+    """Two sources of truth for TP width is how a pool ends up a factor too small."""
+    mesh = _FakeMesh({"data": 2, "tensor": 4})
+    self.assertEqual(kv_head_shards(mesh), 4)
+    self.assertEqual(build_storage_layout(_FakeConfig(), mesh).kv_head_shards, 4)
+
+  def test_multiple_tensor_axes_multiply(self):
+    self.assertEqual(kv_head_shards(_FakeMesh({"tensor": 2, "tensor_sequence": 2})), 4)
+
+  def test_no_mesh_means_unsharded(self):
+    self.assertEqual(kv_head_shards(None), 1)
+
+  def test_an_unset_pool_size_is_refused(self):
+    with self.assertRaisesRegex(ValueError, "paged_num_blocks"):
+      build_storage_layout(_FakeConfig(paged_num_blocks=0))
+
+
+class _CountingStep:
+  """A step function that records what it was handed."""
+
+  def __init__(self, token=7):
+    self.token = token
+    self.views = []
+
+  def __call__(self, view, pool):
+    del pool
+    self.views.append(view)
+    return np.full((view.num_active_requests,), self.token, dtype=np.int32)
+
+
+class PagedDriverTest(unittest.TestCase):
+  """Admission, scheduling, scrubbing and release, without a model."""
+
+  def _driver(self, *, num_pages=65, max_requests=4, max_context_len=128, step=None, **kw):
+    layout = _layout(num_pages=num_pages)
+    plane = NativeKvControlPlane(
+        layout=layout, max_requests=max_requests, max_context_len=max_context_len, debug_mode=True
+    )
+    pool = allocate_pool(layout)
+    return PagedDriver(plane, pool, step or _CountingStep(), max_batch=max_requests, **kw)
+
+  def _requests(self, count, prompt_len=20, max_new_tokens=8):
+    return [
+        PagedRequest(request_id=f"r{i}", prompt_len=prompt_len, max_new_tokens=max_new_tokens)
+        for i in range(count)
+    ]
+
+  def test_a_single_request_runs_to_its_length_cap(self):
+    driver = self._driver()
+    driver.submit(self._requests(1, prompt_len=20, max_new_tokens=5))
+    done = driver.run()
+    self.assertEqual(len(done), 1)
+    self.assertEqual(len(done[0].generated), 5)
+    self.assertEqual(done[0].finish_reason, "length")
+
+  def test_an_eos_token_stops_generation_early(self):
+    driver = self._driver(step=_CountingStep(token=99), eos_ids=(99,))
+    driver.submit(self._requests(1, max_new_tokens=50))
+    done = driver.run()
+    self.assertEqual(len(done[0].generated), 1)
+    self.assertEqual(done[0].finish_reason, "stop")
+
+  def test_prefill_is_preferred_over_decode(self):
+    """A deliberate policy, so it is worth pinning."""
+    step = _CountingStep()
+    driver = self._driver(step=step)
+    driver.submit(self._requests(2))
+    driver.step()
+    self.assertFalse(step.views[0].shape.is_decode)
+
+  def test_a_mixed_length_batch_completes_without_leaking(self):
+    driver = self._driver(max_requests=4)
+    lengths = [7, 19, 33, 48, 64, 5]
+    driver.submit(
+        [PagedRequest(request_id=f"r{i}", prompt_len=n, max_new_tokens=6) for i, n in enumerate(lengths)]
+    )
+    done = driver.run()
+
+    self.assertEqual(len(done), len(lengths))
+    self.assertTrue(all(len(r.generated) == 6 for r in done))
+    self.assertEqual(driver.plane.allocator.num_allocated_pages, 0)
+    self.assertEqual(driver.plane.allocator.available_pages, driver.plane.allocator.capacity_pages)
+    self.assertEqual(driver.plane.num_live, 0)
+
+  def test_churn_traces_a_bounded_set_of_shapes(self):
+    """The exit criterion, host side. Without bucketing this grows with the trace."""
+    driver = self._driver(max_requests=8, max_context_len=256, num_pages=257)
+    rng = np.random.default_rng(0)
+    driver.submit(
+        [
+            PagedRequest(
+                request_id=f"r{i}",
+                prompt_len=int(rng.integers(4, 120)),
+                max_new_tokens=int(rng.integers(1, 30)),
+            )
+            for i in range(60)
+        ]
+    )
+    driver.run()
+    self.assertLessEqual(driver.num_distinct_shapes, driver.planner.max_distinct_shapes())
+    self.assertLessEqual(driver.num_distinct_shapes, 20, "many more shapes than rungs means bucketing broke")
+    self.assertEqual(driver.plane.allocator.available_pages, driver.plane.allocator.capacity_pages)
+
+  def test_a_pool_under_pressure_preempts_rather_than_deadlocking(self):
+    """Recompute preemption: work is lost, but the loop always progresses."""
+    # 8 usable pages of 16 tokens, four concurrent requests each wanting 55.
+    driver = self._driver(num_pages=9, max_requests=4, max_context_len=64)
+    driver.submit(
+        [PagedRequest(request_id=f"r{i}", prompt_len=30, max_new_tokens=25) for i in range(5)]
+    )
+    done = driver.run()
+
+    self.assertEqual(len(done), 5)
+    self.assertTrue(all(len(r.generated) == 25 for r in done))
+    self.assertGreater(sum(r.preemptions for r in done), 0, "this pool is too small not to preempt")
+    self.assertEqual(driver.plane.allocator.num_allocated_pages, 0)
+
+  def test_a_preempted_request_keeps_the_tokens_it_generated(self):
+    """Preemption replays a longer prompt; it does not discard output."""
+    driver = self._driver(num_pages=9, max_requests=4, max_context_len=64)
+    driver.submit(
+        [PagedRequest(request_id=f"r{i}", prompt_len=30, max_new_tokens=25) for i in range(5)]
+    )
+    done = driver.run()
+    preempted = [r for r in done if r.preemptions]
+    self.assertTrue(preempted)
+    for request in preempted:
+      self.assertEqual(len(request.generated), 25)
+
+  def test_recycled_pages_are_scrubbed_before_the_step_reads_them(self):
+    """The driver's half of the acceptance gate.
+
+    A pool small enough to wrap forces recycling. If the driver failed to scrub,
+    the control plane would refuse to build the table and this would raise.
+    """
+    driver = self._driver(num_pages=6, max_requests=2, max_context_len=64)
+    driver.submit(self._requests(8, prompt_len=20, max_new_tokens=3))
+    done = driver.run()
+    self.assertEqual(len(done), 8)
+    self.assertEqual(driver.plane.pending_scrub().size, 0)
+
+  def test_poisoning_leaves_pages_dirty_so_they_must_still_be_scrubbed(self):
+    """Poison is a detector, not a substitute for zeroing."""
+    driver = self._driver(num_pages=6, max_requests=2, max_context_len=64, poison_on_free=True)
+    driver.submit(self._requests(2, prompt_len=20, max_new_tokens=2))
+    driver.run()
+    self.assertGreater(driver.plane.allocator.num_dirty_pages, 0)
+
+  def test_run_reports_a_stalled_loop_rather_than_returning_partial_output(self):
+    driver = self._driver()
+    driver.submit(self._requests(4, max_new_tokens=100))
+    with self.assertRaisesRegex(RuntimeError, "no progress"):
+      driver.run(max_steps=3)
+
+  def test_an_empty_driver_does_nothing(self):
+    self.assertIsNone(self._driver().step())
+    self.assertEqual(self._driver().run(), [])
+
+
+class PagedRuntimeTest(unittest.TestCase):
+  """The engine adapter, and the slot shim over the request-based API."""
+
+  def _runtime(self):
+    layout = _layout()
+    plane = NativeKvControlPlane(layout=layout, max_requests=4, max_context_len=128, debug_mode=True)
+    return PagedRuntime(plane, allocate_pool(layout)), plane
+
+  def _admit(self, plane, request_id="r0", prompt_len=20):
+    from maxtext.inference.kv_control import RequestDescriptor  # pylint: disable=import-outside-toplevel
+
+    handle = plane.admit(RequestDescriptor(request_id=request_id, prompt_len=prompt_len, max_new_tokens=4))
+    plane.reserve([handle], [prompt_len])
+    return handle
+
+  def test_release_by_handle_reclaims_the_pages(self):
+    runtime, plane = self._runtime()
+    handle = self._admit(plane, prompt_len=33)
+    runtime.track(handle)
+    self.assertEqual(runtime.release(handle).size, 3)
+    self.assertEqual(plane.allocator.num_allocated_pages, 0)
+
+  def test_the_slot_shim_reaches_the_same_pages(self):
+    """What keeps the three legacy release_pages call sites working."""
+    runtime, plane = self._runtime()
+    handle = self._admit(plane, prompt_len=33)
+    runtime.track(handle, slot=5)
+    self.assertEqual(runtime.release_slot(5).size, 3)
+    self.assertEqual(plane.allocator.num_allocated_pages, 0)
+
+  def test_an_unknown_slot_is_a_no_op(self):
+    """The legacy call sites fire on termination and do not coordinate."""
+    runtime, _ = self._runtime()
+    self.assertEqual(runtime.release_slot(11).size, 0)
+
+  def test_a_second_release_through_the_adapter_is_absorbed(self):
+    runtime, plane = self._runtime()
+    handle = self._admit(plane)
+    runtime.track(handle, slot=0)
+    runtime.release(handle)
+    self.assertEqual(runtime.release(handle).size, 0)
+    self.assertEqual(runtime.release_slot(0).size, 0)
+
+  def test_a_handle_from_another_epoch_is_not_honoured(self):
+    runtime, plane = self._runtime()
+    handle = self._admit(plane)
+    runtime.track(handle)
+    stale = RequestHandle(request_id=handle.request_id, row=handle.row, epoch=handle.epoch + 1)
+    self.assertEqual(runtime.release(stale).size, 0)
+
+  def test_handles_are_findable_by_request_id(self):
+    runtime, plane = self._runtime()
+    handle = self._admit(plane, request_id="abc")
+    runtime.track(handle, slot=2)
+    self.assertEqual(runtime.handle_for_request("abc"), handle)
+    self.assertEqual(runtime.handle_for_slot(2), handle)
+    runtime.release(handle)
+    self.assertIsNone(runtime.handle_for_request("abc"))
+    self.assertIsNone(runtime.handle_for_slot(2))
+
+
+if __name__ == "__main__":
+  unittest.main()

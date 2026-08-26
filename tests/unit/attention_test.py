@@ -2549,6 +2549,9 @@ class AttentionTest(parameterized.TestCase):
     arguments["max_target_length"] = seq_len
     arguments["max_prefill_predict_length"] = seq_len
     arguments["scan_layers"] = False
+    # Pool capacity has no safe default, so `gpu_paged` requires it. Enough here
+    # for one request of this length per batch row.
+    arguments["paged_num_blocks"] = 8 * (seq_len // 16 + 1)
     arguments.update(overrides)
     return pyconfig.initialize([sys.argv[0], get_test_config_path()], **arguments)
 

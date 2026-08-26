@@ -25,6 +25,7 @@ from jax.experimental.layout import Format
 from jax.sharding import PartitionSpec as P
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 if jax.__version_info__ >= (0, 6, 3):
   from jax.experimental.layout import Layout as DLL  # type: ignore
@@ -181,6 +182,10 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
     self.rng = None
     self._compiled_initialize_fn = None
     self._compiled_init_cache_fn = None
+    # Set by whatever builds the `attention="gpu_paged"` path. Left None here so
+    # that `release`/`release_pages` degrade to a log line on every other
+    # attention mode rather than requiring a paged runtime to exist.
+    self.paged_runtime = None
 
   def print_stats(self, label: str):
     max_utils.print_mem_stats(label)
@@ -231,8 +236,16 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
       encoder_video_masks=None,
       encoder_video_grid_thw=None,
       encoder_audios=None,
+      kv_caches=None,
+      attention_metadata=None,
   ):
-    """NNX equivalent of `model.apply(..., mutable=["cache"])`. Returns (logits, new_cache_dict)."""
+    """NNX equivalent of `model.apply(..., mutable=["cache"])`.
+
+    Returns `(logits, new_cache_dict)` normally, and
+    `(logits, new_cache_dict, kv_caches)` when a paged pool is threaded through.
+    The third value is not optional bookkeeping: the pool is donated and comes
+    back aliased, so a caller that does not rebind it is holding a deleted array.
+    """
     cache_state = self._nnx_cache_state_template(mode=model_mode)
     nnx.replace_by_pure_dict(cache_state, cache_dict)
     # Merge with the graphdef built for this mode. Layers that captured their
@@ -244,7 +257,7 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
     model = nnx.merge(  # pyrefly: ignore[no-matching-overload]
         graphdef, params, cache_state, self._nnx_rest_state, copy=True
     )  # pyrefly: ignore[no-matching-overload]
-    logits = model(
+    outputs = model(
         decoder_input_tokens,
         decoder_positions,
         decoder_segment_ids=decoder_segment_ids,
@@ -259,9 +272,14 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
         previous_chunk=previous_chunk,
         true_length=true_length,
         slot=slot,
+        kv_caches=kv_caches,
+        attention_metadata=attention_metadata,
     )
     new_cache = nnx.to_pure_dict(nnx.state(model, nnx.Cache))
-    return logits, new_cache
+    if kv_caches is not None:
+      logits, updated_pools = outputs
+      return logits, new_cache, updated_pools
+    return outputs, new_cache
 
   def generate_aot(
       self, params: Params, decode_state: DecodeState, rng: PRNGKeyType | None = None
@@ -1863,9 +1881,424 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
         "token_logp": inserted_token_logp,
     }
 
+  def release(self, request_handle: Any):
+    """Reclaim the pages a request holds. The canonical release API.
+
+    Request-based rather than slot-based on purpose. A slot is the dense cache's
+    unit -- one fixed reservation held for a request's whole life -- whereas a
+    paged request owns a set of pages that changed size on every step, so the
+    handle is its only durable name.
+
+    Returns the page ids reclaimed, or an empty array when no paged runtime is
+    attached.
+    """
+    if self.paged_runtime is None:
+      max_logging.log("release: paged attention is not configured, so there are no pages to release.")
+      return np.empty((0,), dtype=np.int32)
+    return self.paged_runtime.release(request_handle)
+
   def release_pages(self, slot: int):
-    """Releases pages associated with a specific slot (page group) via the PageManager."""
-    print(f"Warning: release_pages called for slot {slot} but paged attention is not configured.")
+    """Compatibility shim over `release`, for callers that only have a slot.
+
+    Kept because three existing call sites fire on sequence termination with a
+    fixed slot integer. Implementing the paged runtime around this signature
+    instead would have baked the dense cache's one-slot-per-request assumption
+    into the new code.
+    """
+    if self.paged_runtime is None:
+      max_logging.log(f"release_pages: slot {slot} ignored because paged attention is not configured.")
+      return np.empty((0,), dtype=np.int32)
+    return self.paged_runtime.release_slot(slot)
+
+  # ---------------------------------------------------------------------------
+  # Paged serving: a sibling entry path, not a rewrite of the dense one.
+  #
+  # `init_decode_state`, `_insert_jit` and `generate` are specific to the dense
+  # two-region cache -- one fixed slot per request, every slot advancing in
+  # lockstep, and a cache copied into a batch row at insert time. None of that
+  # survives contact with a page pool, where a request owns a varying set of
+  # pages and each one is at its own position. Rebuilding those three around
+  # pages would be a much larger change than it reads as, and it would put the
+  # working dense path at risk, so this is a parallel surface instead:
+  # `init_paged_runtime`, `prefill_paged`, `generate_paged`. Nothing above
+  # touches them and they touch nothing above.
+  # ---------------------------------------------------------------------------
+
+  def init_paged_runtime(
+      self,
+      max_requests: int | None = None,
+      max_batched_tokens: int | None = None,
+  ):
+    """Allocate the paged pool and control plane. The sibling of `init_decode_state`.
+
+    Args:
+      max_requests: concurrent requests to size the page-map rows for. Defaults
+        to the dense path's batch width, so a paged deployment is no narrower
+        than the dense one it replaces.
+      max_batched_tokens: token budget for one prefill step, and the top of the
+        token bucket ladder. Defaults to the per-request context limit.
+
+    Returns:
+      The `PagedRuntime`, also stored on `self.paged_runtime`.
+    """
+    # pylint: disable=import-outside-toplevel
+    from maxtext.inference.kv_control import NativeKvControlPlane
+    from maxtext.inference.kv_execution.bucketing import StepShapePlanner
+    from maxtext.inference.kv_execution.engine_adapter import PagedRuntime
+    from maxtext.inference.kv_execution.layout_builder import build_storage_layout
+    from maxtext.inference.kv_execution.pool_factory import allocate_pool
+
+    if self.config.attention != "gpu_paged":
+      raise ValueError(
+          f"init_paged_runtime requires attention='gpu_paged', but this engine is configured for "
+          f"'{self.config.attention}'."
+      )
+
+    layout = build_storage_layout(self.config, self._mesh)
+    if layout.dtype not in ("bfloat16", "float16"):
+      raise ValueError(
+          f"the paged attention kernels accept bfloat16 and float16 only, but dtype is "
+          f"'{layout.dtype}'. Set dtype=bfloat16 for attention='gpu_paged'."
+      )
+
+    max_requests = int(max_requests or self.max_concurrent_decodes)
+    control_plane = NativeKvControlPlane(
+        layout=layout,
+        max_requests=max_requests,
+        max_context_len=self.config.paged_max_context_len,
+    )
+    planner = StepShapePlanner(
+        tokens_per_page=layout.tokens_per_page,
+        max_batch=max_requests,
+        max_context_len=self.config.paged_max_context_len,
+        pool_pages=layout.num_pages,
+        max_batched_tokens=max_batched_tokens,
+    )
+    self.paged_runtime = PagedRuntime(
+        control_plane=control_plane,
+        pool=allocate_pool(layout, sharding=self.kv_pool_sharding()),
+        planner=planner,
+        poison_on_free=bool(getattr(self.config, "paged_poison_freed_pages", False)),
+    )
+    return self.paged_runtime
+
+  def kv_pool_sharding(self):
+    """Sharding for one layer's pool array, or None while unsharded.
+
+    Pages are the leading axis and are never sharded -- a page belongs to one
+    request and splitting it would put half a token's KV on another device. The
+    KV-head axis is the one tensor parallelism divides, which is M6's work; until
+    then the pool is replicated and this returns None.
+    """
+    return None
+
+  def _paged_pool_arrays(self):
+    """The pool as the nested list `kv_caches` expects: one `[k, v]` per layer."""
+    pool = self.paged_runtime.pool
+    return [[pool.k_pages[i], pool.v_pages[i]] for i in range(pool.num_layers)]
+
+  def _rebind_paged_pool(self, updated):
+    """Store the aliased pool handles returned by a step.
+
+    Not optional. The pool is donated into the step, so the arrays passed in are
+    invalid afterwards and only these handles refer to live memory.
+    """
+    pool = self.paged_runtime.pool
+    for layer, pair in enumerate(updated):
+      pool.replace_layer(layer, pair[0], pair[1])
+
+  @functools.partial(
+      jax.jit,
+      static_argnums=(0,),
+      static_argnames=("model_mode", "max_seqlen_k", "is_decode", "algorithm", "topk", "nucleus_topp"),
+      donate_argnames=("kv_caches",),
+  )
+  def _paged_forward_jit(
+      self,
+      *,
+      params: Params,
+      kv_caches,
+      tokens: jax.Array,
+      positions: jax.Array,
+      segment_ids: jax.Array | None,
+      slot_mapping: jax.Array,
+      kv_indptr: jax.Array,
+      kv_page_indices: jax.Array,
+      kv_last_page_lens: jax.Array,
+      cu_seqlens_q: jax.Array,
+      sample_at: jax.Array,
+      rng: PRNGKeyType,
+      model_mode: str,
+      max_seqlen_k: int,
+      is_decode: bool,
+      algorithm: str | None = None,
+      topk: int | None = None,
+      nucleus_topp: float | None = None,
+      temperature: float | None = None,
+  ):
+    """One paged step: write this step's K/V into the pool, attend, and sample.
+
+    The page bookkeeping arrives as plain int32 arrays rather than as a
+    `PagedPlan`, because the plan is not a pytree and could not cross a `jit`
+    boundary; it is reassembled here where the arrays are already tracers.
+
+    `sample_at` is the per-row index whose logits to sample, traced rather than
+    static so a new prompt length does not force a new trace.
+    """
+    # pylint: disable=import-outside-toplevel
+    from maxtext.layers.gpu_paged_attention import PagedPlan
+
+    plan = PagedPlan(
+        slot_mapping=slot_mapping,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=1 if is_decode else int(tokens.shape[1]),
+        max_seqlen_k=max_seqlen_k,
+        is_decode=is_decode,
+    )
+
+    rng, run_rng = jax.random.split(rng)
+    with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      if self.config.pure_nnx:
+        logits, _, updated_pools = self._nnx_run_model(
+            params=params,
+            cache_dict=self._nnx_init_cache_dict(mode=model_mode),
+            decoder_input_tokens=tokens,
+            decoder_positions=positions,
+            decoder_segment_ids=segment_ids,
+            enable_dropout=False,
+            model_mode=model_mode,
+            kv_caches=kv_caches,
+            attention_metadata=plan,
+        )
+      else:
+        (logits, updated_pools), _ = self.model.apply(
+            params,
+            tokens,
+            positions,
+            decoder_segment_ids=segment_ids,
+            enable_dropout=False,
+            model_mode=model_mode,
+            rngs={"params": run_rng},
+            mutable=["cache"],
+            kv_caches=kv_caches,
+            attention_metadata=plan,
+        )
+
+    # One row per request, each sampled at its own index: for prefill that is the
+    # last prompt token, for decode the single new token. Doing it with a gather
+    # rather than a slice is what lets a decode batch hold requests at different
+    # positions, which is the whole point of paging.
+    rows = jnp.arange(logits.shape[0])
+    selected = logits[rows, sample_at][:, None, :]
+    selected = jax.lax.with_sharding_constraint(selected, self.replicated_sharding)
+
+    rng, sample_rng = jax.random.split(rng)
+    sampled = inference_utils.sampling(
+        selected,
+        sample_rng,
+        algorithm if algorithm is not None else self.config.decode_sampling_strategy,
+        topk=topk if topk is not None else self.config.decode_sampling_top_k,
+        nucleus_topp=nucleus_topp if nucleus_topp is not None else self.config.decode_sampling_nucleus_p,
+        temperature=temperature if temperature is not None else self.config.decode_sampling_temperature,
+    )
+    return sampled, selected, updated_pools
+
+  def _paged_result_tokens(self, sampled: jax.Array, selected: jax.Array, step: int):
+    """Wrap sampled tokens in the same `ResultTokens` shape the dense path returns."""
+    all_valid = jnp.ones(sampled.shape, dtype=jnp.int8)
+    lengths = jnp.full(sampled.shape, step, dtype=jnp.int32)
+    if self.config.return_log_prob:
+      token_logp = inference_utils.log_prob_of_chosen_token(selected, sampled)
+    else:
+      token_logp = jnp.zeros(sampled.shape, dtype=jnp.float32)
+    return engine_api.ResultTokens(
+        data=jnp.concatenate((sampled, all_valid, lengths), axis=1),
+        tokens_idx=(0, 1),
+        valid_idx=(1, 2),
+        length_idx=(2, 3),
+        log_prob=token_logp,
+        samples_per_slot=1,
+    )
+
+  def prefill_paged(
+      self,
+      *,
+      params: Params,
+      padded_tokens: jax.Array,
+      true_length: int,
+      request_id: str | None = None,
+      max_new_tokens: int | None = None,
+      slot: int | None = None,
+      rng: PRNGKeyType | None = None,
+      algorithm: str | None = None,
+      topk: int | None = None,
+      nucleus_topp: float | None = None,
+      temperature: float | None = None,
+  ):
+    """Prefill one prompt into the page pool and sample its first token.
+
+    The sibling of `prefill`. It returns a `RequestHandle` rather than a prefix
+    dict, because there is no cache to carry: the K/V is already in the pool and
+    the handle is what names the pages holding it.
+
+    Returns:
+      `(handle, result_tokens)`, or `(None, None)` if the pool could not admit
+      the request -- backpressure, not an error.
+    """
+    if self.paged_runtime is None:
+      raise ValueError("call init_paged_runtime() before prefill_paged()")
+
+    runtime = self.paged_runtime
+    prompt_len = int(true_length)
+    budget = self.config.paged_max_context_len - prompt_len
+    handle = runtime.admit(
+        request_id=request_id if request_id is not None else f"req-{uuid.uuid4()}",
+        prompt_len=prompt_len,
+        max_new_tokens=int(max_new_tokens) if max_new_tokens is not None else max(budget, 0),
+    )
+    if handle is None:
+      return None, None
+
+    view = runtime.prepare_step([handle], [prompt_len], is_decode=False, num_requests=1)
+    if view is None:
+      runtime.control_plane.release(handle)
+      return None, None
+
+    # The flattened query the attention layer sees is batch times sequence, so
+    # the padded prompt has to be exactly as long as the token bucket.
+    #
+    # Built in numpy, deliberately. The obvious `jnp` spelling of these three
+    # lines compiles a fresh program per *prompt length*: the input to a pad is a
+    # different shape each time, and `arange(n) < prompt_len` bakes `prompt_len`
+    # into the jaxpr as a literal. A serving trace with two dozen distinct prompt
+    # lengths then pays two dozen compilations that no shape-bucket accounting
+    # can see, which is exactly how an earlier measurement here ended up
+    # three-quarters compile time while reporting zero unwarmed shapes. numpy has
+    # no such cache to miss, and these arrays are a few hundred bytes.
+    width = view.shape.num_tokens
+    prompt = np.asarray(padded_tokens, dtype=np.int32).reshape(-1)[:width]
+    token_row = np.zeros((1, width), np.int32)
+    token_row[0, : prompt.size] = prompt
+    index = np.arange(width, dtype=np.int32)
+    tokens = jnp.asarray(token_row)
+    positions = jnp.asarray(index[None, :])
+    segment_ids = jnp.asarray(
+        np.where(index < prompt_len, DECODING_ACTIVE_SEQUENCE_INDICATOR, 0).astype(np.int32)[None, :]
+    )
+
+    if rng is None:
+      if self.rng is None:
+        self.rng = jax.random.PRNGKey(0)
+      self.rng, rng = jax.random.split(self.rng)
+
+    sampled, selected, updated = self._paged_forward_jit(
+        params=params,
+        kv_caches=self._paged_pool_arrays(),
+        tokens=tokens,
+        positions=positions,
+        segment_ids=segment_ids,
+        slot_mapping=view.slot_mapping,
+        kv_indptr=view.kv_indptr,
+        kv_page_indices=view.kv_page_indices,
+        kv_last_page_lens=view.kv_last_page_lens,
+        cu_seqlens_q=view.cu_seqlens_q,
+        sample_at=jnp.asarray([prompt_len - 1], jnp.int32),
+        rng=rng,
+        model_mode=MODEL_MODE_PREFILL,
+        max_seqlen_k=view.shape.max_seqlen_k,
+        is_decode=False,
+        algorithm=algorithm,
+        topk=topk,
+        nucleus_topp=nucleus_topp,
+        temperature=temperature,
+    )
+    self._rebind_paged_pool(updated)
+    runtime.track(handle, slot=slot)
+    return handle, self._paged_result_tokens(sampled, selected, step=0)
+
+  def generate_paged(
+      self,
+      params: Params,
+      handles,
+      next_tokens: jax.Array,
+      rng: PRNGKeyType | None = None,
+      algorithm: str | None = None,
+      topk: int | None = None,
+      nucleus_topp: float | None = None,
+      temperature: float | None = None,
+  ):
+    """Advance every live request by one token. The sibling of `generate`.
+
+    Unlike the dense path there is no lockstep: each request contributes one
+    token at its own position, which is read from the control plane rather than
+    from a shared counter.
+
+    Returns:
+      `(result_tokens, ok)`. `ok` is False when the pool could not back the step,
+      which the caller resolves by releasing or preempting something.
+    """
+    if self.paged_runtime is None:
+      raise ValueError("call init_paged_runtime() before generate_paged()")
+
+    runtime = self.paged_runtime
+    handles = list(handles)
+    if not handles:
+      raise ValueError("generate_paged needs at least one live request")
+
+    # Read before reserving: this is each request's position for the token about
+    # to be written, and reserving advances the recorded length past it.
+    positions = [runtime.control_plane.page_map.seq_len(h) for h in handles]
+
+    view = runtime.prepare_step(handles, [1] * len(handles), is_decode=True)
+    if view is None:
+      return None, False
+
+    # numpy for the same reason as `prefill_paged`: padding a variable-length
+    # array with `jnp` compiles once per distinct live-request count, and the
+    # live count changes constantly under continuous batching.
+    width = view.shape.num_requests
+    token_col = np.zeros((width, 1), np.int32)
+    supplied = np.asarray(next_tokens, dtype=np.int32).reshape(-1)[:width]
+    token_col[: supplied.size, 0] = supplied
+    position_col = np.zeros((width, 1), np.int32)
+    recorded = np.asarray(positions, dtype=np.int32).reshape(-1)[:width]
+    position_col[: recorded.size, 0] = recorded
+    tokens = jnp.asarray(token_col)
+    pos = jnp.asarray(position_col)
+
+    if rng is None:
+      if self.rng is None:
+        self.rng = jax.random.PRNGKey(0)
+      self.rng, rng = jax.random.split(self.rng)
+
+    sampled, selected, updated = self._paged_forward_jit(
+        params=params,
+        kv_caches=self._paged_pool_arrays(),
+        tokens=tokens,
+        positions=pos,
+        # None, not zeros: the model refuses segment ids in autoregressive mode,
+        # where every token is by definition in the active sequence.
+        segment_ids=None,
+        slot_mapping=view.slot_mapping,
+        kv_indptr=view.kv_indptr,
+        kv_page_indices=view.kv_page_indices,
+        kv_last_page_lens=view.kv_last_page_lens,
+        cu_seqlens_q=view.cu_seqlens_q,
+        sample_at=jnp.zeros((width,), jnp.int32),
+        rng=rng,
+        model_mode=MODEL_MODE_AUTOREGRESSIVE,
+        max_seqlen_k=view.shape.max_seqlen_k,
+        is_decode=True,
+        algorithm=algorithm,
+        topk=topk,
+        nucleus_topp=nucleus_topp,
+        temperature=temperature,
+    )
+    self._rebind_paged_pool(updated)
+    return self._paged_result_tokens(sampled, selected, step=1), True
 
   def get_prefix_destination_sharding(self) -> Any:
     return {

@@ -610,6 +610,37 @@ class Attention(BaseModel):
           "vendor-neutral, so 'auto' picks aiter on ROCm and flashinfer on CUDA."
       ),
   )
+  paged_page_size: PositiveInt = Field(
+      16,
+      description=(
+          "Tokens per KV page for attention='gpu_paged' ('block_size' in vLLM vocabulary). Smaller "
+          "wastes less on partial final pages and costs more page-table indirection."
+      ),
+  )
+  paged_num_blocks: NonNegativeInt = Field(
+      0,
+      description=(
+          "Usable KV pages in the paged pool, which sets serving capacity: total tokens held is "
+          "paged_num_blocks * paged_page_size across all requests at once. One further page is "
+          "allocated and reserved as a padding target, so this is the count actually available. "
+          "Required when attention='gpu_paged'."
+      ),
+  )
+  paged_max_context_len: NonNegativeInt = Field(
+      0,
+      description=(
+          "Longest context a single paged request may reach. Bounds the per-request page-table row "
+          "and the sequence-length bucket ladder. Defaults to max_target_length when left at 0."
+      ),
+  )
+  paged_poison_freed_pages: bool = Field(
+      False,
+      description=(
+          "Debug aid for attention='gpu_paged': fill a page with a recognisable sentinel when it is "
+          "freed, so a missed scrub produces an obviously wrong value rather than a plausible one. "
+          "Costs a pool write per freed page, so it is off by default."
+      ),
+  )
   attention_type: Literal["global", "local_sliding", "chunk", "mla", "full", "compressed", "block_diffusion"] = Field(
       "global", description="The variant of attention to use."
   )
@@ -3177,10 +3208,33 @@ class MaxTextConfig(
     on every step, which shows up as a mysterious slowdown rather than an error,
     so refuse it outright instead of quietly overriding it.
     """
-    if self.attention == "gpu_paged" and self.scan_layers:
+    if self.attention != "gpu_paged":
+      return self
+
+    if self.scan_layers:
       raise ValueError(
           "attention='gpu_paged' requires scan_layers=False. Scanning stacks the per-layer "
           "KV caches into the scan carry, which copies the whole paged pool every step."
+      )
+
+    if self.paged_num_blocks < 1:
+      raise ValueError(
+          "attention='gpu_paged' requires paged_num_blocks to be set. It is the pool's capacity, so "
+          "there is no safe default: too small silently caps concurrency, and too large fails at "
+          f"allocation. Pool tokens = paged_num_blocks * paged_page_size (currently {self.paged_page_size})."
+      )
+
+    # Derived rather than required, since max_target_length already states the
+    # longest sequence the deployment intends to serve.
+    if self.paged_max_context_len == 0:
+      self.paged_max_context_len = self.max_target_length
+
+    request_pages = -(-self.paged_max_context_len // self.paged_page_size)
+    if request_pages > self.paged_num_blocks:
+      raise ValueError(
+          f"a single paged_max_context_len={self.paged_max_context_len} request needs {request_pages} "
+          f"pages but paged_num_blocks is {self.paged_num_blocks}, so no request could ever finish. "
+          f"Raise paged_num_blocks or lower paged_max_context_len."
       )
     return self
 

@@ -20,67 +20,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import ast
-import importlib.util
-import pathlib
-import sys
 import unittest
 
 import numpy as np
 
-# Loaded straight from their files rather than through `maxtext.inference.kv_common`
-# on purpose. The neutral layer is meant to run with no accelerator and no
-# framework, but importing it by package path executes `maxtext/__init__.py`,
-# which pulls in the full config stack. Loading the modules directly is what
-# actually demonstrates the property, and it keeps these tests runnable in plain
-# CI. `_ImportRuleTest` below pins the rule statically.
-_KV_COMMON_DIR = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "src"
-    / "maxtext"
-    / "inference"
-    / "kv_common"
-)
+from maxtext.inference.kv_common import KvPageTableV1, KvStorageLayoutV1
 
-
-def _load(module_name: str):
-  path = _KV_COMMON_DIR / f"{module_name}.py"
-  spec = importlib.util.spec_from_file_location(f"_kv_common_{module_name}", path)
-  module = importlib.util.module_from_spec(spec)
-  sys.modules[spec.name] = module
-  spec.loader.exec_module(module)
-  return module
-
-
-KvStorageLayoutV1 = _load("storage_layout").KvStorageLayoutV1
-KvPageTableV1 = _load("page_table").KvPageTableV1
-
-_ALLOWED_IMPORTS = {
-    "numpy",
-    "dataclasses",
-    "annotations",  # from __future__
-    "__future__",
-    "ast",
-    "typing",
-    "math",
-    "enum",
-    "collections",
-    "hashlib",
-}
+# Imported by package path, which is cheap: `maxtext/__init__.py` resolves its
+# heavy exports through a lazy `__getattr__`, so reaching a submodule loads
+# neither jax nor the config stack. `kv_import_rule_test.py` is what holds that
+# true, statically over the whole layer and once against a fresh interpreter.
 
 
 class KvStorageLayoutTest(unittest.TestCase):
   """Pool geometry and sizing."""
 
   def _layout(self, **kw):
-    base = dict(
-        tokens_per_page=16,
-        num_pages=1024,
-        num_layers=32,
-        num_kv_heads=8,
-        head_dim=128,
-        dtype="bfloat16",
-    )
+    """A realistic pool geometry, overridable field by field."""
+    base = {
+        "tokens_per_page": 16,
+        "num_pages": 1024,
+        "num_layers": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+    }
     base.update(kw)
     return KvStorageLayoutV1(**base)
 
@@ -236,73 +200,6 @@ class KvPageTableTest(unittest.TestCase):
     )
     with self.assertRaises(ValueError):
       table.slot_mapping(tokens_per_page=16)
-
-
-class ImportRuleTest(unittest.TestCase):
-  """The neutral layer must stay free of framework and vendor dependencies.
-
-  Checked statically, so it holds without importing anything. A convention no
-  one can verify erodes, and this one is load-bearing: it is what makes the layer
-  CPU-testable today and mechanically extractable later.
-  """
-
-  FORBIDDEN_ROOTS = {"jax", "jaxlib", "flax", "torch", "jax_aiter"}
-  SELF_PACKAGE = "maxtext.inference.kv_common"
-
-  def _top_level_imports(self, path):
-    """Root packages imported by `path`, excluding intra-package imports.
-
-    An absolute import of kv_common's own modules is fine; anything else under
-    `maxtext.` is not, and is reported under its full name so the message is
-    actionable.
-    """
-    tree = ast.parse(path.read_text())
-    roots = set()
-    for node in ast.walk(tree):
-      if isinstance(node, ast.Import):
-        for alias in node.names:
-          if alias.name.startswith(self.SELF_PACKAGE):
-            continue
-          roots.add(alias.name.split(".")[0])
-      elif isinstance(node, ast.ImportFrom):
-        if node.level or not node.module:  # relative import stays in-package
-          continue
-        if node.module.startswith(self.SELF_PACKAGE):
-          continue
-        if node.module.startswith("maxtext"):
-          roots.add(node.module)  # full name: this is a rule violation
-          continue
-        roots.add(node.module.split(".")[0])
-    return roots
-
-  def test_modules_import_only_stdlib_and_numpy(self):
-    for path in sorted(_KV_COMMON_DIR.glob("*.py")):
-      roots = self._top_level_imports(path)
-      forbidden = roots & self.FORBIDDEN_ROOTS
-      self.assertEqual(
-          forbidden,
-          set(),
-          f"{path.name} imports {sorted(forbidden)}, which the kv_common import "
-          f"rule forbids",
-      )
-      unexpected = roots - _ALLOWED_IMPORTS
-      self.assertEqual(
-          unexpected,
-          set(),
-          f"{path.name} imports {sorted(unexpected)}; extend _ALLOWED_IMPORTS "
-          f"only if the addition is genuinely stdlib or numpy",
-      )
-
-  def test_package_init_only_reaches_into_kv_common(self):
-    """The package __init__ may re-export, but must not reach outside itself."""
-    init = _KV_COMMON_DIR / "__init__.py"
-    tree = ast.parse(init.read_text())
-    for node in ast.walk(tree):
-      if isinstance(node, ast.ImportFrom) and node.module:
-        self.assertTrue(
-            node.module.startswith("maxtext.inference.kv_common"),
-            f"__init__ imports from {node.module}, outside kv_common",
-        )
 
 
 if __name__ == "__main__":

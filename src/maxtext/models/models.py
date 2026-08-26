@@ -257,6 +257,16 @@ class TransformerLinenPure(nn.Module):
       # In vLLM, logits are computed separately after updating the KV cache.
       return hidden_state, kv_caches
 
+    if self.config.attention == "gpu_paged" and kv_caches is not None:
+      # The paged pool is donated into the step and comes back aliased, so the
+      # updated handles have to leave the model. Dropping them invalidates the
+      # caller's arrays and the next step reads a deleted buffer. Unlike the vLLM
+      # path this still returns logits, because MaxText's own serving loop
+      # samples inside the same jitted step rather than in a separate sampler.
+      # Gated on `kv_caches` so model init and the dry-run path, which thread no
+      # pool, keep the plain single-value return every other caller expects.
+      return logits, kv_caches
+
     return logits
 
 
@@ -615,5 +625,15 @@ class Transformer(nnx.Module):
     if self.config.attention in ("vllm_rpa", "vllm_batched_rpa"):
       # In vLLM, logits are computed separately after updating the KV cache.
       return hidden_state, kv_caches
+
+    if self.config.attention == "gpu_paged" and kv_caches is not None:
+      # The paged pool is donated into the step and comes back aliased, so the
+      # updated handles have to leave the model. Dropping them invalidates the
+      # caller's arrays and the next step reads a deleted buffer. Unlike the vLLM
+      # path this still returns logits, because MaxText's own serving loop
+      # samples inside the same jitted step rather than in a separate sampler.
+      # Gated on `kv_caches` so model init and the dry-run path, which thread no
+      # pool, keep the plain single-value return every other caller expects.
+      return logits, kv_caches
 
     return logits

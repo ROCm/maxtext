@@ -42,7 +42,11 @@ class KvPageTableV1:
             for decode; the uncached suffix length for prefill.
         write_positions: int32 [num_tokens] absolute token index within its own
             sequence for each new token, flattened in request order.
-        request_order: int32 [num_reqs] the order requests appear in the batch.
+        request_order: int32 [num_reqs] identity of each batch row, as the
+            producer's own index for the request occupying it. Batch position i
+            describes request request_order[i]. Kernels do not read it; it is
+            what lets a caller map a row of output back to a request without
+            keeping a parallel list in step with the batch.
     """
 
     page_ids: list[list[int]] = dataclasses.field(default_factory=list)
