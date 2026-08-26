@@ -1962,19 +1962,20 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
       )
 
     layout = build_storage_layout(self.config, self._mesh)
-    if layout.kv_head_shards > 1:
-      # `shard_map` gets the kernels running under TP -- the step no longer hangs
-      # and donation survives manual mode -- but the output is still wrong: at
-      # TP=8 the first sampled token already differs from both the single-device
-      # paged path and the TP=8 dense path, which agree with each other. So the
-      # fault is in how the sharded operands are described to the kernels, not in
-      # the sharding of the pool. Refusing until that is understood, because a
-      # wrong answer that runs is far worse than a refusal.
+    if layout.replication_factor() > 1:
+      # The clean partition -- num_kv_heads divisible by the shard count -- is
+      # supported and matches the dense path token for token. Replication is not,
+      # and the obstacle is the mesh rather than the kernels: `kv_pool_sharding`
+      # has to split the tensor axis into a head-selecting and a replicating part
+      # to place the copies, and it does that on a mesh of its own, while
+      # `shard_map` requires the pool and the activations on the *same* mesh.
+      # Until MaxText's own mesh carries that split there is nowhere to put such
+      # a pool, so refuse rather than mis-shard.
       raise ValueError(
-          f"attention='gpu_paged' does not yet support tensor parallelism: this mesh shards KV heads "
-          f"{layout.kv_head_shards} ways, and the sharded path does not yet reproduce the "
-          f"single-device result. Run the paged path on a single device, or use "
-          f"attention='dot_product' for a sharded run."
+          f"attention='gpu_paged' does not yet support tensor parallelism above the KV-head count: "
+          f"this mesh shards KV heads {layout.kv_head_shards} ways over {layout.num_kv_heads} heads, "
+          f"which replicates each head {layout.replication_factor()} times. Reduce tensor parallelism "
+          f"to at most num_kv_heads, or use attention='dot_product' for a wider mesh."
       )
     if layout.dtype not in ("bfloat16", "float16"):
       raise ValueError(

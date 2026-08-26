@@ -1218,7 +1218,25 @@ class Attention(nnx.Module):
         total_tokens=query.shape[0],
         max_seqlen_k=self.max_target_length,
     )
-    backend = getattr(self.config, "paged_attention_backend", "auto")
+    # `scale=1.0`, not 1/sqrt(head_dim). MaxText folds the depth scaling into the
+    # query projection's initializer (see `depth_scaling` in the kernel init) and
+    # applies `query_pre_attn_scalar` above, so the query arriving here is already
+    # scaled. forward_serve_vllm passes 1.0 for the same reason; letting the
+    # kernel apply its own default would scale twice.
+    #
+    # Built once and shared by both branches deliberately. Spelled out separately
+    # they drifted: the sharded branch omitted the scale, so every tensor-parallel
+    # run scaled the query a second time by 1/sqrt(head_dim), flattening the
+    # softmax towards uniform. That is a wrong answer rather than a crash, identical
+    # at every TP width because it has nothing to do with sharding, and no
+    # comparison of the sharded step against the single-device step can see it,
+    # because such a test passes the same scale to both sides. One dict is what
+    # makes the two paths structurally unable to disagree.
+    kernel_kwargs = dict(
+        backend=getattr(self.config, "paged_attention_backend", "auto"),
+        scale=1.0,
+        causal=True,
+    )
     axes = gpu_paged_attention.kv_head_axes(self.mesh)
     if axes:
       # Tensor parallelism: the kernels have to run in manual mode, because XLA
@@ -1232,23 +1250,10 @@ class Attention(nnx.Module):
           plan,
           mesh=self.mesh,
           axes=axes if len(axes) > 1 else axes[0],
-          backend=backend,
+          **kernel_kwargs,
       )
     return gpu_paged_attention.paged_attention_step(
-        query,
-        key,
-        value,
-        k_pool,
-        v_pool,
-        plan,
-        backend=backend,
-        # 1.0, not 1/sqrt(head_dim). MaxText folds the depth scaling into the
-        # query projection's initializer (see `depth_scaling` in the kernel init)
-        # and applies `query_pre_attn_scalar` above, so the query arriving here is
-        # already scaled. forward_serve_vllm passes 1.0 for the same reason;
-        # letting the kernel apply its own default would scale twice.
-        scale=1.0,
-        causal=True,
+        query, key, value, k_pool, v_pool, plan, **kernel_kwargs
     )
 
   def __call__(

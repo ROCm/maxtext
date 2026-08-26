@@ -2671,6 +2671,85 @@ class AttentionTest(parameterized.TestCase):
     )
 
   @pytest.mark.gpu_only
+  def test_gpu_paged_sharded_and_single_device_kernel_arguments_agree(self):
+    """Both branches of `forward_serve_gpu_paged` must configure the kernel alike.
+
+    The two branches -- `paged_attention_step` on one device and
+    `paged_attention_step_sharded` under `shard_map` -- are the same attention
+    and differ only in how the operands are partitioned. Any difference in
+    `scale`, `causal` or `backend` between them is a bug by construction.
+
+    This is not a hypothetical. The sharded branch was added spelling its own
+    arguments out, omitted `scale=1.0`, and so let the kernel apply its default
+    1/sqrt(head_dim) on top of a query MaxText had already scaled. Every
+    tensor-parallel run then produced a flattened softmax and a wrong token, at
+    every TP width identically, while single-device runs stayed correct.
+
+    `test_gpu_paged_matches_the_dense_path` cannot catch this -- it runs on an
+    unsharded mesh, so it only ever reaches the single-device branch -- and
+    neither can any comparison of the sharded step against the single-device
+    step, because such a test hands the same scale to both sides and the error
+    cancels. Asserting on the call site is what closes that gap, so this test
+    mocks the kernels away and inspects the arguments rather than the numbers.
+    """
+    # pylint: disable=import-outside-toplevel
+    from maxtext.inference.kv_common import KvPageTableV1
+    from maxtext.layers import gpu_paged_attention as gpa
+
+    seq_len = 128
+    tokens_per_page = 16
+    cfg = self._gpu_paged_config(seq_len, attention="gpu_paged")
+    paged = self._build_attention(cfg, seq_len, MODEL_MODE_PREFILL)
+
+    batch = self.global_batch_size
+    pages_per_request = seq_len // tokens_per_page
+    page_table = KvPageTableV1(
+        page_ids=[[1 + r * pages_per_request + p for p in range(pages_per_request)] for r in range(batch)],
+        seq_lens=np.full((batch,), seq_len, np.int32),
+        query_lens=np.full((batch,), seq_len, np.int32),
+        write_positions=np.tile(np.arange(seq_len, dtype=np.int32), batch),
+        request_order=np.arange(batch, dtype=np.int32),
+    )
+    pool_shape = (1 + batch * pages_per_request, tokens_per_page, cfg.num_kv_heads, cfg.head_dim)
+    pools = [jnp.zeros(pool_shape, cfg.dtype), jnp.zeros(pool_shape, cfg.dtype)]
+    qkv = jnp.ones((batch, seq_len, cfg.num_query_heads, cfg.head_dim), cfg.dtype)
+    kv = jnp.ones((batch, seq_len, cfg.num_kv_heads, cfg.head_dim), cfg.dtype)
+
+    captured = {}
+
+    def record(name):
+      def fake(query, *_args, **kwargs):
+        # Only the tuning knobs matter here; the operands differ between the two
+        # branches by design, since one is global and the other per-shard.
+        captured[name] = {k: kwargs[k] for k in ("backend", "scale", "causal") if k in kwargs}
+        return query, [pools[0], pools[1]]
+
+      return fake
+
+    with mock.patch.object(gpa, "paged_attention_step", record("single")), mock.patch.object(
+        gpa, "paged_attention_step_sharded", record("sharded")
+    ), mock.patch.object(gpa, "kv_head_axes", return_value=()):
+      paged.forward_serve_gpu_paged(qkv, kv, kv, kv_pools=pools, metadata=page_table)
+
+    with mock.patch.object(gpa, "paged_attention_step", record("single")), mock.patch.object(
+        gpa, "paged_attention_step_sharded", record("sharded")
+    ), mock.patch.object(gpa, "kv_head_axes", return_value=("tensor",)):
+      paged.forward_serve_gpu_paged(qkv, kv, kv, kv_pools=pools, metadata=page_table)
+
+    self.assertIn("single", captured, "the unsharded mesh must reach paged_attention_step")
+    self.assertIn("sharded", captured, "a KV-head-sharded mesh must reach paged_attention_step_sharded")
+    self.assertEqual(
+        captured["single"],
+        captured["sharded"],
+        "the sharded and single-device paged branches configure the kernel differently; "
+        "they are the same attention and must pass identical scale, causal and backend",
+    )
+    # Pin the scale itself, so the two branches cannot agree on a wrong value.
+    # MaxText has already folded depth scaling into the query projection.
+    self.assertEqual(captured["sharded"]["scale"], 1.0)
+    self.assertTrue(captured["sharded"]["causal"])
+
+  @pytest.mark.gpu_only
   def test_gpu_paged_dry_run_passes_through(self):
     """Model init and JIT tracing reach the branch with nothing to attend over."""
     seq_len = 128
