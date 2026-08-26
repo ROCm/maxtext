@@ -114,14 +114,20 @@ class KvStorageLayoutV1:
         """KV heads held by one shard.
 
         Two regimes, and conflating them mis-sizes the pool. When the head count
-        divides the shard count the heads are partitioned. When the shard count
-        exceeds the head count -- GQA at high TP, and MQA always -- each head is
-        *replicated*, so a shard still holds at least one whole head and the
-        total footprint is multiplied rather than divided.
+        divides the shard count the heads are partitioned, so a shard holds
+        ``num_kv_heads // kv_head_shards`` of them. When the shard count exceeds
+        the head count -- GQA at high TP, and MQA always -- there is nothing left
+        to divide, so each shard holds exactly one head and it is the *number of
+        copies* that grows. `replication_factor` reports that growth, and
+        `total_pool_bytes` multiplies by it.
+
+        The floor of one is what makes both regimes the same expression, and the
+        boundary case is the one worth stating: at ``kv_head_shards ==
+        num_kv_heads`` every shard holds a single head and nothing is replicated.
         """
-        if self.kv_head_shards >= self.num_kv_heads:
-            return max(self.num_kv_heads, 1) if self.num_kv_heads else 0
-        return self.num_kv_heads // self.kv_head_shards
+        if not self.num_kv_heads:
+            return 0
+        return max(self.num_kv_heads // self.kv_head_shards, 1)
 
     def replication_factor(self) -> int:
         """How many shards hold a copy of the same KV head."""

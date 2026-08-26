@@ -69,15 +69,37 @@ class KvStorageLayoutTest(unittest.TestCase):
     self.assertEqual(layout.heads_per_shard(), 2)
     self.assertEqual(layout.replication_factor(), 1)
 
+  def test_one_head_per_shard_at_the_boundary(self):
+    """`kv_head_shards == num_kv_heads` partitions exactly, it does not replicate.
+
+    The case an earlier version got wrong, and it is the common one: TP=8 on a
+    model with 8 KV heads. Returning the full head count here sized every shard's
+    pool a factor of TP too large, and disagreed with `replication_factor`, which
+    correctly reported 1.
+    """
+    layout = self._layout(num_kv_heads=8, kv_head_shards=8)
+    self.assertEqual(layout.heads_per_shard(), 1)
+    self.assertEqual(layout.replication_factor(), 1)
+    self.assertEqual(layout.total_pool_bytes(), layout.pool_bytes_per_shard() * 8)
+
   def test_replication_when_shards_exceed_heads(self):
     """GQA above its KV-head count replicates, multiplying the footprint.
 
-    This is the case a naive num_kv_heads // shards would get silently wrong.
+    Each rank computes a subset of the *query* heads and therefore needs exactly
+    the one KV head those map to -- not every head. So the shard holds one head
+    and it is the number of copies that grows, which is what
+    `replication_factor` reports and what `total_pool_bytes` multiplies by.
     """
     layout = self._layout(num_kv_heads=2, kv_head_shards=8)
-    self.assertEqual(layout.heads_per_shard(), 2)
+    self.assertEqual(layout.heads_per_shard(), 1)
     self.assertEqual(layout.replication_factor(), 4)
+    # 8 shards holding one head each is 4x the 2 logical heads, and the two ways
+    # of counting the footprint have to agree or pool sizing is wrong.
     self.assertEqual(layout.total_pool_bytes(), layout.pool_bytes_per_shard() * 8)
+    self.assertEqual(
+        layout.total_pool_bytes(),
+        layout.pool_bytes_per_shard() * layout.num_kv_heads * layout.replication_factor(),
+    )
 
   def test_mqa_replicates_everywhere(self):
     layout = self._layout(num_kv_heads=1, kv_head_shards=8)
