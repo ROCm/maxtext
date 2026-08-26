@@ -139,7 +139,12 @@ def main() -> int:
   parser.add_argument(
       "--prefix-cache",
       action="store_true",
-      help="share already-computed pages between requests with a common prefix (paged arm only)",
+      help=(
+          "share already-computed pages between requests with a common prefix (paged arm only). "
+          "Expect little or no saving here: this harness admits the whole trace at once, and a "
+          "request can only reuse pages another request has already finished with. Use "
+          "run_prefix_cache_benchmark.py to measure sharing"
+      ),
   )
   parser.add_argument("--requests", type=int, default=24)
   parser.add_argument("--mean-prompt", type=int, default=48)

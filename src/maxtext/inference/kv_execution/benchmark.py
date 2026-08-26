@@ -391,7 +391,10 @@ def run_paged(
       done.append(request)
 
   elapsed = time.perf_counter() - start
-  summary = _summarise(done, occupancy, elapsed, steps, allocator, page_size)
+  index = runtime.control_plane.prefix_index
+  summary = _summarise(
+      done, occupancy, elapsed, steps, allocator, page_size, retained_pages=index.num_cached_pages
+  )
   summary.update(_summarise_prefix_cache(done, runtime.control_plane))
 
   # Shape accounting, which is necessary but *not sufficient*: it sees bucketed
@@ -442,8 +445,15 @@ def run_repeated(engine, params, trace_factory, *, max_batch: int, warmed_shapes
   materially faster, and the ratio says so. A run is reportable when successive
   passes agree.
   """
+  plane = engine.paged_runtime.control_plane
   passes = []
   for _ in range(max(repeats, 1)):
+    # Each pass starts with a cold prefix cache. Otherwise a later pass finds the
+    # previous pass's pages waiting for it, which both inflates the reported
+    # saving past what this trace's own requests share with each other and makes
+    # the passes incomparable -- defeating the stability check, which is the
+    # whole reason for repeating.
+    plane.evict_cached(plane.prefix_index.num_cached_pages)
     summary = run_paged(
         engine, params, trace_factory(), max_batch=max_batch, warmed_shapes=warmed_shapes
     )
@@ -541,8 +551,16 @@ def _summarise(
     steps: int,
     allocator: Any,
     page_size: int,
+    retained_pages: int = 0,
 ) -> dict[str, Any]:
-  """Collapse a run into the reported schema."""
+  """Collapse a run into the reported schema.
+
+  `retained_pages` is what the prefix cache is deliberately still holding once
+  every request has finished. Those pages are allocated on purpose, so counting
+  them as leaked would report a leak on every run with sharing enabled -- and an
+  alarm that always fires is one nobody reads, which would hide the real leak
+  this metric exists to catch.
+  """
   output_tokens = sum(len(r.generated) for r in done)
   prompt_tokens = sum(r.prompt_len for r in done)
   itls = [gap for r in done for gap in r.inter_token_latencies()]
@@ -576,7 +594,8 @@ def _summarise(
         "series_live_tokens": live_tokens.tolist(),
     }
   if allocator is not None:
-    summary["pages_leaked"] = int(allocator.num_allocated_pages)
+    summary["pages_retained_by_cache"] = int(retained_pages)
+    summary["pages_leaked"] = int(allocator.num_allocated_pages) - int(retained_pages)
     summary["pool_capacity_tokens"] = allocator.capacity_pages * page_size
   return summary
 
@@ -601,17 +620,23 @@ def report(name: str, summary: dict[str, Any]) -> str:
     lines.append(f"  peak device memory {summary['peak_device_bytes'] / 2**30:.3f} GiB")
   occ = summary.get("occupancy")
   if occ:
+    ratio = occ["mean_overhead_ratio"]
+    # Below 1 means the pool is holding fewer tokens than the requests
+    # collectively address, which only happens when several of them are reading
+    # the same pages. Calling that "overhead" would report the benefit as a cost.
+    label = f"page overhead x{ratio:.3f}" if ratio >= 1 else f"sharing dividend x{1 / ratio:.3f}"
     lines.append(
         f"  pool tokens held max {occ['max_pool_tokens_held']}"
-        f"  vs live tokens max {occ['max_live_tokens']}"
-        f"  (page overhead x{occ['mean_overhead_ratio']:.3f})"
+        f"  vs live tokens max {occ['max_live_tokens']}  ({label})"
     )
     lines.append(
         f"  concurrency max {occ['max_concurrency']}  mean {occ['mean_concurrency']:.2f}"
         f"  of pool capacity {summary.get('pool_capacity_tokens')} tokens"
     )
   if "pages_leaked" in summary:
-    lines.append(f"  pages leaked {summary['pages_leaked']}")
+    retained = summary.get("pages_retained_by_cache", 0)
+    suffix = f"  (plus {retained} deliberately retained by the prefix cache)" if retained else ""
+    lines.append(f"  pages leaked {summary['pages_leaked']}{suffix}")
   if "distinct_shapes_total" in summary:
     lines.append(
         f"  shapes {summary['distinct_shapes_total']} total,"
