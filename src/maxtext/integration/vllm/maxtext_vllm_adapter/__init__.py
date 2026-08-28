@@ -12,29 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MaxText vLLM adapter package."""
+"""MaxText vLLM adapter package.
 
-from tpu_inference.logger import init_logger
-from tpu_inference.models.common.model_loader import register_model
+This package is platform-agnostic: it names no particular vLLM hardware plugin.
+It previously imported `tpu_inference` at module scope for a logger and a model
+registry, which made the adapter importable only on TPU even though the model it
+wraps is not TPU-specific.
+"""
+
+import logging
+
 from .adapter import MaxTextForCausalLM
 
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
+
+MODEL_NAME = "MaxTextForCausalLM"
+
+__all__ = ["MaxTextForCausalLM", "MODEL_NAME", "register"]
 
 
-def register():
-  """Register MaxTextForCausalLM model with tpu_inference and vllm.
+def register(register_model=None):
+  """Register MaxTextForCausalLM with a vLLM platform plugin's model registry.
 
-  Note, this function is invoked directly by the vLLM engine during startup. As such,
-  it leverages vLLM logging to report its status.
+  Note, this function is invoked directly by the vLLM engine during startup. As
+  such, it leverages vLLM logging to report its status.
+
+  Args:
+    register_model: The registry callable, taking (name, cls). Injected so the
+      same adapter serves either platform. When omitted, the TPU plugin's
+      registry is imported, preserving the previous behaviour for TPU callers.
   """
-  logger.info("Registering MaxTextForCausalLM model with tpu_inference and vllm.")
-  register_model("MaxTextForCausalLM", MaxTextForCausalLM)
+  using_tpu_registry = register_model is None
+  if using_tpu_registry:
+    # pylint: disable=import-outside-toplevel
+    from tpu_inference.models.common.model_loader import register_model
 
-  # Dynamically apply KVCacheManager patch when registering the adapter
-  # pylint: disable=import-outside-toplevel
-  from .adapter import patch_kv_cache_manager
+  logger.info("Registering %s.", MODEL_NAME)
+  register_model(MODEL_NAME, MaxTextForCausalLM)
 
-  patch_kv_cache_manager()
+  # The patch targets tpu_inference's KVCacheManager, so it is only meaningful
+  # for that platform. It degrades gracefully elsewhere, but skipping it keeps
+  # a GPU registration from logging a failure that is not one.
+  if using_tpu_registry:
+    # pylint: disable=import-outside-toplevel
+    from .adapter import patch_kv_cache_manager
 
-  logger.info("Successfully registered MaxTextForCausalLM model.")
+    patch_kv_cache_manager()
+
+  logger.info("Successfully registered %s.", MODEL_NAME)
