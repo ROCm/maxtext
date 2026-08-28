@@ -41,7 +41,12 @@ from maxtext.inference.kv_execution.bucketing import (
 )
 from maxtext.inference.kv_execution.engine_adapter import PagedRuntime
 from maxtext.inference.kv_execution.layout_builder import build_storage_layout, kv_head_shards
-from maxtext.inference.kv_execution.pool_ops import POISON_SENTINEL, poison_pages, scrub_pages
+from maxtext.inference.kv_execution.pool_ops import (
+    POISON_SENTINEL,
+    poison_pages,
+    scrub_pages,
+    scrub_pages_all_layers,
+)
 from maxtext.inference.kv_execution.step_view import build_step_view
 
 PAGE = 16
@@ -273,6 +278,52 @@ class PoolTest(unittest.TestCase):
     k, v = scrub_pages(pool.k_pages[0], pool.v_pages[0], [])
     self.assertTrue(bool((np.asarray(k) == 0).all()))
     self.assertTrue(bool((np.asarray(v) == 0).all()))
+
+  def test_scrubbing_every_layer_at_once_matches_the_per_layer_loop(self):
+    """The batched scrub must be the per-layer loop's answer, not merely close.
+
+    `scrub_pages_all_layers` exists for cost rather than for behaviour: the loop
+    it replaces issued one dispatch per layer, which is eighty on a 70B model and
+    lands on the critical path of every step that recycles a page. Cost changes
+    are exactly where a behaviour change slips in unnoticed, so this pins the two
+    against each other element by element rather than checking the batched one in
+    isolation.
+    """
+    layers, pages = 5, 8
+    batched = allocate_pool(_layout(num_pages=pages, num_layers=layers))
+    looped = allocate_pool(_layout(num_pages=pages, num_layers=layers))
+    for pool in (batched, looped):
+      for layer in range(layers):
+        k, v = poison_pages(pool.k_pages[layer], pool.v_pages[layer], [1, 2, 3, 4, 5])
+        pool.replace_layer(layer, k, v)
+
+    ks, vs = scrub_pages_all_layers(batched.k_pages, batched.v_pages, [2, 4, 5])
+    for layer, (k, v) in enumerate(zip(ks, vs)):
+      batched.replace_layer(layer, k, v)
+    for layer in range(layers):
+      k, v = scrub_pages(looped.k_pages[layer], looped.v_pages[layer], [2, 4, 5])
+      looped.replace_layer(layer, k, v)
+
+    for layer in range(layers):
+      np.testing.assert_array_equal(
+          np.asarray(batched.k_pages[layer]), np.asarray(looped.k_pages[layer])
+      )
+      np.testing.assert_array_equal(
+          np.asarray(batched.v_pages[layer]), np.asarray(looped.v_pages[layer])
+      )
+    # And it really did scrub: named pages zeroed, unnamed ones left poisoned.
+    scrubbed = np.asarray(batched.k_pages[layers - 1])
+    self.assertTrue(bool((scrubbed[[2, 4, 5]] == 0).all()))
+    self.assertTrue(bool((scrubbed[[1, 3]] == POISON_SENTINEL).all()))
+
+  def test_scrubbing_every_layer_with_nothing_pending_is_a_no_op(self):
+    """The common case on a pool that has not wrapped, and it must not dispatch."""
+    pool = allocate_pool(_layout(num_pages=8, num_layers=3))
+    ks, vs = scrub_pages_all_layers(pool.k_pages, pool.v_pages, [])
+    self.assertEqual(len(ks), 3)
+    self.assertEqual(len(vs), 3)
+    for layer in range(3):
+      self.assertTrue(bool((np.asarray(ks[layer]) == 0).all()))
 
   def test_an_odd_page_count_is_padded_idempotently(self):
     """Padding repeats a page already being written, so no mask is needed."""

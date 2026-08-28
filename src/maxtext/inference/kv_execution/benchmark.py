@@ -71,6 +71,11 @@ class Request:
   handle: Any = None
   token_ids: np.ndarray | None = None
   prefill_tokens: int = 0
+  # Preemption folds a request's generated tokens back into its prompt so the
+  # replay makes progress, which means a preempted request reports more prompt
+  # tokens and fewer output tokens than it really had. Counting preemptions is
+  # what stops that distortion being invisible in the throughput figures.
+  preemptions: int = 0
 
   def context_tokens(self) -> np.ndarray | None:
     """Prompt plus generated, which is what the prefix cache is offered."""
@@ -367,8 +372,28 @@ def run_paged(
       # Nothing published: preemption is trying to reclaim pages, and the cache
       # would hold onto whatever it adopted.
       engine.release(victim.handle)
-      victim.handle, victim.generated = None, []
-      waiting.insert(0, victim)
+      # **Keep the generated tokens**, exactly as `PagedDriver._preempt_newest`
+      # does, so the replay is a longer prompt rather than a restart. Discarding
+      # them -- which this did until it was caught livelocking a 70B sweep --
+      # makes the retry byte-identical to the attempt that just failed, so a pool
+      # that is overcommitted at admission never makes progress: admit, exhaust,
+      # preempt, re-prefill the same tokens, forever, at full GPU utilisation.
+      # The driver's own docstring calls keeping them "the price of not
+      # deadlocking"; the harness has to pay it too.
+      context = victim.context_tokens()
+      if context is not None:
+        victim.token_ids = context
+      victim.max_new_tokens = max(victim.max_new_tokens - len(victim.generated), 0)
+      victim.prompt_len += len(victim.generated)
+      victim.generated = []
+      victim.handle = None
+      victim.preemptions += 1
+      # A request preempted with nothing left to generate is finished, not
+      # requeued; requeuing it would ask for a zero-token step.
+      if victim.max_new_tokens == 0:
+        done.append(victim)
+      else:
+        waiting.insert(0, victim)
       continue
 
     steps += 1
@@ -573,6 +598,11 @@ def _summarise(
       "output_throughput_tok_per_s": output_tokens / elapsed if elapsed else 0.0,
       "request_throughput_per_s": len(done) / elapsed if elapsed else 0.0,
       "engine_steps": steps,
+      # Non-zero means the pool was overcommitted and requests were replayed.
+      # Prompt and output token counts are shifted for those requests, so a run
+      # with preemptions is a capacity result rather than a throughput one.
+      "preemptions": sum(r.preemptions for r in done),
+      "requests_preempted": sum(1 for r in done if r.preemptions),
       "ttft": _percentiles([r.ttft for r in done if r.ttft is not None]),
       "itl": _percentiles(itls),
       "peak_device_bytes": _peak_bytes(),

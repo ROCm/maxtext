@@ -41,7 +41,7 @@ import numpy as np
 from maxtext.inference.kv_control import NativeKvControlPlane, RequestDescriptor, RequestHandle
 from maxtext.inference.kv_execution.bucketing import StepShape, StepShapePlanner
 from maxtext.inference.kv_execution.pool_factory import PagedKvPool
-from maxtext.inference.kv_execution.pool_ops import poison_pages, scrub_pages
+from maxtext.inference.kv_execution.pool_ops import poison_pages, scrub_pages_all_layers
 from maxtext.inference.kv_execution.step_view import StepView, build_step_view
 
 
@@ -149,8 +149,13 @@ class PagedRuntime:
     pending = self.control_plane.pending_scrub()
     if not pending.size:
       return pending
-    for layer in range(self.pool.num_layers):
-      k, v = scrub_pages(self.pool.k_pages[layer], self.pool.v_pages[layer], pending)
+    # Every layer at once. The per-layer loop this replaces issued one dispatch
+    # per layer, which is eighty on a 70B model, on the critical path of every
+    # step that recycles a page -- invisible at four layers and dominant once the
+    # pool runs near full, which is precisely the condition a capacity sweep
+    # creates.
+    k_pages, v_pages = scrub_pages_all_layers(self.pool.k_pages, self.pool.v_pages, pending)
+    for layer, (k, v) in enumerate(zip(k_pages, v_pages)):
       self.pool.replace_layer(layer, k, v)
     self.control_plane.confirm_scrubbed(pending)
     return pending

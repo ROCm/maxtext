@@ -60,7 +60,7 @@ from maxtext.inference.kv_control import (
 )
 from maxtext.inference.kv_execution.bucketing import StepShape, StepShapePlanner
 from maxtext.inference.kv_execution.pool_factory import PagedKvPool
-from maxtext.inference.kv_execution.pool_ops import poison_pages, scrub_pages
+from maxtext.inference.kv_execution.pool_ops import poison_pages, scrub_pages_all_layers
 from maxtext.inference.kv_execution.step_view import StepView, build_step_view
 
 _DEFAULT_NAMESPACE = CacheNamespace()
@@ -360,8 +360,10 @@ class PagedDriver:
     pending = self.plane.pending_scrub()
     if not pending.size:
       return
-    for layer in range(self.pool.num_layers):
-      k, v = scrub_pages(self.pool.k_pages[layer], self.pool.v_pages[layer], pending)
+    # One dispatch for the whole pool rather than one per layer; see
+    # `scrub_pages_all_layers` for why that matters at real depth.
+    k_pages, v_pages = scrub_pages_all_layers(self.pool.k_pages, self.pool.v_pages, pending)
+    for layer, (k, v) in enumerate(zip(k_pages, v_pages)):
       self.pool.replace_layer(layer, k, v)
     self.plane.confirm_scrubbed(pending)
 

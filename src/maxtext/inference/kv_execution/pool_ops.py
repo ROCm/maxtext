@@ -77,6 +77,44 @@ def _fill(k_pages: jax.Array, v_pages: jax.Array, page_ids: jax.Array, value: ja
   return k_pages.at[page_ids].set(block), v_pages.at[page_ids].set(block)
 
 
+@functools.partial(jax.jit, donate_argnums=(0, 1))
+def _fill_all(k_pages: list, v_pages: list, page_ids: jax.Array, value: jax.Array):
+  """`_fill` over every layer at once.
+
+  One dispatch rather than one per layer, and at 80 layers that difference is
+  the whole point. Every layer's pool has the same shape and takes the same page
+  indices, so the per-layer loop was issuing eighty identical launches -- each
+  with its own donation bookkeeping across every device -- on the critical path
+  of any step that recycled a page. It costs nothing at the four-layer scale the
+  earlier measurements used and shows up as a throughput cliff at real depth,
+  which is exactly the shape of defect Section 6.4 exists to catch.
+
+  Taking lists rather than stacked arrays keeps the pool's per-layer identity, so
+  donation still aliases each layer's own buffer and nothing is repacked.
+  """
+  def fill(arr):
+    block = jnp.full((page_ids.shape[0],) + arr.shape[1:], value, dtype=arr.dtype)
+    return arr.at[page_ids].set(block)
+
+  return [fill(k) for k in k_pages], [fill(v) for v in v_pages]
+
+
+def scrub_pages_all_layers(
+    k_pages: Sequence[jax.Array],
+    v_pages: Sequence[jax.Array],
+    page_ids: Sequence[int] | np.ndarray,
+) -> tuple[list[jax.Array], list[jax.Array]]:
+  """Zero the named pages in every layer, in a single dispatch.
+
+  Returns the rebound arrays, which alias the inputs. A no-op for an empty list,
+  which is the common case on a pool that has not wrapped around yet.
+  """
+  pages = _pad_page_indices(page_ids)
+  if pages.size == 0:
+    return list(k_pages), list(v_pages)
+  return _fill_all(list(k_pages), list(v_pages), jnp.asarray(pages), jnp.zeros((), k_pages[0].dtype))
+
+
 def scrub_pages(
     k_pages: jax.Array,
     v_pages: jax.Array,

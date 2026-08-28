@@ -35,7 +35,12 @@ from maxtext.inference.kv_execution.bucketing import (
 from maxtext.inference.kv_execution.driver import PagedDriver, PagedRequest, StepOutcome
 from maxtext.inference.kv_execution.layout_builder import build_storage_layout
 from maxtext.inference.kv_execution.pool_factory import PagedKvPool, allocate_pool
-from maxtext.inference.kv_execution.pool_ops import POISON_SENTINEL, poison_pages, scrub_pages
+from maxtext.inference.kv_execution.pool_ops import (
+    POISON_SENTINEL,
+    poison_pages,
+    scrub_pages,
+    scrub_pages_all_layers,
+)
 from maxtext.inference.kv_execution.step_view import StepView, build_step_view
 
 __all__ = [
@@ -53,5 +58,6 @@ __all__ = [
     "build_storage_layout",
     "poison_pages",
     "scrub_pages",
+    "scrub_pages_all_layers",
     "token_ladder",
 ]
