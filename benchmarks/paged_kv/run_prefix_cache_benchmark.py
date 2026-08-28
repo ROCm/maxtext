@@ -109,60 +109,53 @@ def build_params(cfg, devices):
 def serve(engine, params, requests, *, max_batch: int, measure: bool):
   """One pass over the trace. Returns per-request TTFT and prefill token counts.
 
-  Requests are admitted greedily and every live request is advanced one token per
-  step, which is the same policy the driver and the A/B harness use.
+  Driven by `PagedDriver`, which owns admission and preemption. This used to be a
+  hand-rolled loop -- the *fifth* in the codebase -- and it carried its own copy of
+  the preemption bug: on backpressure it discarded the victim's generated tokens,
+  making the replay identical to the attempt that just failed. That livelocks an
+  overcommitted pool. The same defect was found and fixed in the A/B harness, and
+  having to fix it twice is the argument for one scheduler.
+
+  Namespaces are attached per request rather than passed per call, since the driver
+  reads them off `PagedRequest`.
   """
+  # pylint: disable=import-outside-toplevel
+  from maxtext.inference.kv_execution.driver import PagedDriver
+
   runtime = engine.paged_runtime
-  waiting, live = list(requests), []
-  ttfts, prefill_tokens = [], []
+  trace = list(requests)
+  for request in trace:
+    request.namespace = NAMESPACE
 
-  while waiting or live:
-    while waiting and len(live) < max_batch:
-      candidate = waiting[0]
-      tokens = candidate.token_ids
-      started = time.perf_counter()
-      handle, first = engine.prefill_paged(
-          params=params,
-          padded_tokens=jnp.asarray(tokens, jnp.int32),
-          true_length=int(tokens.size),
-          request_id=candidate.request_id,
-          max_new_tokens=candidate.max_new_tokens,
-          prompt_token_ids=tokens,
-          namespace=NAMESPACE,
-      )
-      if handle is None:
-        break
-      token = int(first.data[0, 0])  # blocks, so the timing is of real work
-      if measure:
-        ttfts.append(time.perf_counter() - started)
-        prefill_tokens.append(int(tokens.size) - runtime.cached_tokens(handle))
-      waiting.pop(0)
-      candidate.handle = handle
-      candidate.generated.append(token)
-      live.append(candidate)
+  driver = PagedDriver(
+      runtime.control_plane,
+      runtime.pool,
+      engine.paged_step_fn(params),
+      max_batch=max_batch,
+      runtime=runtime,
+  )
+  driver.submit(trace)
 
-    if not live:
-      raise RuntimeError("nothing is live and nothing could be admitted; the pool is too small")
+  started = {r.request_id: time.perf_counter() for r in trace}
+  ttft = {}
+  prefilled: dict[str, int] = {}
 
-    result, ok = engine.generate_paged(
-        params, [r.handle for r in live], next_tokens=jnp.asarray([r.generated[-1] for r in live], jnp.int32)
-    )
-    if not ok:
-      victim = live.pop()
-      engine.release(victim.handle)
-      victim.handle, victim.generated = None, []
-      waiting.insert(0, victim)
-      continue
+  while True:
+    outcome = driver.step()
+    if outcome is None:
+      break
+    now = time.perf_counter()
+    for request, query_len in zip(outcome.batch, outcome.query_lens):
+      if not outcome.is_decode:
+        # Accumulated, because a preempted request prefills more than once and
+        # every one of those is work the cache did not save.
+        prefilled[request.request_id] = prefilled.get(request.request_id, 0) + query_len
+      ttft.setdefault(request.request_id, now - started[request.request_id])
 
-    tokens_out = np.asarray(result.data[:, 0]).reshape(-1)
-    for row, request in enumerate(live):
-      request.generated.append(int(tokens_out[row]))
-    for request in [r for r in live if len(r.generated) >= r.max_new_tokens]:
-      engine.release(request.handle, request.context_tokens())
-      request.handle = None
-      live.remove(request)
-
-  return ttfts, prefill_tokens
+  if not measure:
+    return [], []
+  order = [r.request_id for r in driver.completed()]
+  return [ttft[r] for r in order if r in ttft], [prefilled.get(r, 0) for r in order]
 
 
 def run_arm(args, devices, prefix_cache: bool):
@@ -195,7 +188,7 @@ def run_arm(args, devices, prefix_cache: bool):
   ttfts, prefill_tokens = serve(engine, params, trace(), max_batch=args.max_batch, measure=True)
   duration = time.perf_counter() - start
 
-  prompted = sum(int(r.token_ids.size) for r in trace())
+  prompted = sum(int(r.prompt_len) for r in trace())
   return {
       "prefix_cache": prefix_cache,
       "duration_s": duration,

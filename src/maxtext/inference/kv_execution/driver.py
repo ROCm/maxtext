@@ -141,11 +141,13 @@ class StepOutcome:
   num_requests: int
   num_tokens: int
   preempted: int = 0
-  # The requests this step advanced, in the order their tokens were returned.
-  # Carried so an observer can attribute per-request timing -- which is what a
-  # serving harness needs for TTFT and ITL, and the reason it previously had to
-  # re-implement the scheduling loop to get it.
+  # The requests this step advanced, in the order their tokens were returned,
+  # with the query length each contributed. Carried so an observer can attribute
+  # per-request timing and per-request work -- which is what a serving harness
+  # needs for TTFT, ITL and "prefill tokens avoided", and the reason it previously
+  # had to re-implement the scheduling loop to get them.
   batch: tuple[PagedRequest, ...] = ()
+  query_lens: tuple[int, ...] = ()
 
 
 # Takes the padded page view, the assembled token-side operands and the pool;
@@ -173,6 +175,7 @@ class PagedDriver:
       max_batched_tokens: int | None = None,
       eos_ids: Iterable[int] = (),
       poison_on_free: bool = False,
+      runtime: PagedRuntime | None = None,
   ):
     layout = control_plane.layout
     self.plane = control_plane
@@ -181,12 +184,20 @@ class PagedDriver:
     self.max_batch = int(max_batch)
     self.eos_ids = frozenset(int(t) for t in eos_ids)
     self.poison_on_free = bool(poison_on_free)
-    self.planner = StepShapePlanner(
-        tokens_per_page=layout.tokens_per_page,
-        max_batch=max_batch,
-        max_context_len=control_plane.max_context_len,
-        pool_pages=layout.num_pages,
-        max_batched_tokens=max_batched_tokens,
+    # An existing runtime's planner wins. Building a second one would record
+    # shapes into a different `observed_shapes`, so a caller holding the first --
+    # the benchmark harness does, to report compile counts -- would see none of
+    # the shapes this driver actually traced.
+    self.planner = (
+        runtime.planner
+        if runtime is not None and runtime.planner is not None
+        else StepShapePlanner(
+            tokens_per_page=layout.tokens_per_page,
+            max_batch=max_batch,
+            max_context_len=control_plane.max_context_len,
+            pool_pages=layout.num_pages,
+            max_batched_tokens=max_batched_tokens,
+        )
     )
     # The driver owns *policy* -- the queue, the admission budget, recompute
     # preemption, prefill before decode -- and delegates the per-step mechanics
@@ -196,7 +207,12 @@ class PagedDriver:
     # decides what was recycled, and before the table, because the control plane
     # refuses to describe a page it still thinks is dirty. A second copy of that
     # order is a second place to get it wrong.
-    self.runtime = PagedRuntime(
+    #
+    # A caller that already has one -- `MaxEngine.paged_runtime` -- should pass it,
+    # so the pool, the shape bookkeeping and the prefix-cache accounting stay
+    # single-copy. Building a second over the same control plane and pool would
+    # split exactly the state a caller reads back.
+    self.runtime = runtime or PagedRuntime(
         control_plane=control_plane,
         pool=pool,
         planner=self.planner,
@@ -223,6 +239,14 @@ class PagedDriver:
   @property
   def num_live(self) -> int:
     return len(self._live)
+
+  def live_requests(self) -> list[PagedRequest]:
+    """Requests currently holding pages. A copy, so an observer cannot mutate the loop."""
+    return list(self._live)
+
+  def completed(self) -> list[PagedRequest]:
+    """Requests that have finished, in completion order. Also a copy."""
+    return list(self._done)
 
   def submit(self, requests: Sequence[PagedRequest]) -> None:
     """Queue requests, rejecting any the driver could not actually run.
@@ -394,6 +418,7 @@ class PagedDriver:
         num_tokens=sum(lens),
         preempted=preempted,
         batch=tuple(batch),
+        query_lens=tuple(lens),
     )
 
   def _slice_for(self, request: PagedRequest, query_len: int, *, is_decode: bool) -> RequestSlice:

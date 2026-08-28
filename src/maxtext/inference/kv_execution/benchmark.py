@@ -56,34 +56,30 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from maxtext.inference.kv_execution.driver import PagedDriver, PagedRequest
+
 
 @dataclasses.dataclass
-class Request:
-  """One synthetic request, and the timestamps the run collects for it."""
+class RequestMetrics:
+  """Timing for one request, held beside it rather than on it.
 
-  request_id: str
-  prompt_len: int
-  max_new_tokens: int
+  There used to be a `Request` here that was `PagedRequest` plus timestamps, and
+  the two drifted: the harness re-implemented scheduling to collect these, and its
+  copy of preemption discarded generated tokens where the driver's keeps them,
+  which livelocked a 70B sweep. The driver is now the only scheduler, so the
+  harness owns *measurement* and nothing else.
+
+  Keyed by `request_id` rather than by object identity, because `run_repeated`
+  deep-copies a trace between passes.
+  """
+
   arrival: float = 0.0
   first_token_at: float | None = None
   token_times: list[float] = dataclasses.field(default_factory=list)
-  generated: list[int] = dataclasses.field(default_factory=list)
-  handle: Any = None
-  token_ids: np.ndarray | None = None
+  # Tokens this request actually computed, summed over its prefill steps. Not
+  # derivable afterwards: `cached_tokens` is reset when the request is released,
+  # and a preempted request prefills more than once.
   prefill_tokens: int = 0
-  # Preemption folds a request's generated tokens back into its prompt so the
-  # replay makes progress, which means a preempted request reports more prompt
-  # tokens and fewer output tokens than it really had. Counting preemptions is
-  # what stops that distortion being invisible in the throughput figures.
-  preemptions: int = 0
-
-  def context_tokens(self) -> np.ndarray | None:
-    """Prompt plus generated, which is what the prefix cache is offered."""
-    if self.token_ids is None:
-      return None
-    if not self.generated:
-      return self.token_ids
-    return np.concatenate([self.token_ids, np.asarray(self.generated, dtype=np.int64)])
 
   @property
   def ttft(self) -> float | None:
@@ -99,6 +95,11 @@ class Request:
     return [b - a for a, b in zip(self.token_times, self.token_times[1:])]
 
 
+def _metrics_for(table: dict[str, RequestMetrics], request: PagedRequest) -> RequestMetrics:
+  """The metrics row for `request`, created on first sight."""
+  return table.setdefault(request.request_id, RequestMetrics())
+
+
 def synthetic_trace(
     num_requests: int,
     mean_prompt: int,
@@ -106,7 +107,7 @@ def synthetic_trace(
     *,
     seed: int = 0,
     length_spread: float = 0.6,
-) -> list[Request]:
+) -> list[PagedRequest]:
   """A batch of requests with varied lengths, all arriving at once.
 
   Lengths are what this plan's claims are about, so they vary; arrival times are
@@ -128,11 +129,11 @@ def synthetic_trace(
   # report a hit rate this workload does not represent -- the baseline has to be a
   # workload with nothing to share.
   return [
-      Request(
+      PagedRequest(
           request_id=f"r{i}",
           prompt_len=int(prompts[i]),
           max_new_tokens=int(outputs[i]),
-          token_ids=rng.integers(1, 30000, size=int(prompts[i]), dtype=np.int64),
+          prompt_tokens=rng.integers(1, 30000, size=int(prompts[i]), dtype=np.int64),
       )
       for i in range(num_requests)
   ]
@@ -147,7 +148,7 @@ def shared_prefix_trace(
     seed: int = 0,
     length_spread: float = 0.6,
     num_variants: int = 1,
-) -> list[Request]:
+) -> list[PagedRequest]:
   """Requests that begin with a common block, as a served system prompt does.
 
   This is the workload prefix sharing exists for, and the one where a paged
@@ -171,11 +172,11 @@ def shared_prefix_trace(
     tail = rng.integers(1, 30000, size=int(uniques[i]), dtype=np.int64)
     tokens = np.concatenate([prefixes[i % len(prefixes)], tail])
     requests.append(
-        Request(
+        PagedRequest(
             request_id=f"r{i}",
             prompt_len=int(tokens.size),
             max_new_tokens=int(outputs[i]),
-            token_ids=tokens,
+            prompt_tokens=tokens,
         )
     )
   return requests
@@ -302,125 +303,72 @@ def run_paged(
     max_batch: int,
     warmed_shapes: set | None = None,
 ) -> dict[str, Any]:
-  """Serve `requests` on the paged path, admitting greedily up to `max_batch`.
+  """Serve `requests` on the paged path, measuring what `PagedDriver` does.
 
-  Prefill one request at a time, then advance every live request by one token.
-  Prefill is preferred while there is room, which favours TTFT at some cost to
-  the ITL of requests already running -- the same deliberate policy the standalone
-  driver uses.
+  **The harness no longer schedules.** It used to run its own admission, its own
+  preemption and its own step order, which is how it drifted from the driver:
+  its preemption discarded a victim's generated tokens where the driver's keeps
+  them, so an overcommitted pool replayed the same failed attempt forever. That
+  livelocked a 70B capacity sweep at full GPU utilisation with zero progress.
+
+  Now the driver owns policy and this owns measurement. The loop is
+  timestamp-around-`driver.step()`, attributing per-request times through
+  `StepOutcome.batch`, which is exactly the information the harness previously
+  re-implemented a scheduler to obtain.
   """
   runtime = engine.paged_runtime
   allocator = runtime.control_plane.allocator
   page_size = runtime.control_plane.layout.tokens_per_page
 
-  waiting, live, done = list(requests), [], []
+  # The engine's runtime is passed in rather than letting the driver build one, so
+  # the pool, the shape bookkeeping and the prefix-cache accounting stay
+  # single-copy -- `runtime.observed_shapes` below is read back from it.
+  driver = PagedDriver(
+      runtime.control_plane,
+      runtime.pool,
+      engine.paged_step_fn(params),
+      max_batch=max_batch,
+      runtime=runtime,
+  )
+  metrics: dict[str, RequestMetrics] = {}
   occupancy: list[tuple[float, int, int, int]] = []
   steps = 0
   before = set(runtime.observed_shapes)
+
   start = time.perf_counter()
-  for request in waiting:
-    request.arrival = start
+  for request in requests:
+    _metrics_for(metrics, request).arrival = start
+  driver.submit(list(requests))
 
-  while waiting or live:
-    while waiting and len(live) < max_batch:
-      candidate = waiting[0]
-      prompt = (
-          candidate.token_ids
-          if candidate.token_ids is not None
-          else np.ones((candidate.prompt_len,), dtype=np.int64)
-      )
-      handle, result = engine.prefill_paged(
-          params=params,
-          padded_tokens=jnp.asarray(prompt, dtype=jnp.int32),
-          true_length=candidate.prompt_len,
-          request_id=candidate.request_id,
-          max_new_tokens=candidate.max_new_tokens,
-          prompt_token_ids=candidate.token_ids,
-      )
-      if handle is None:
-        break  # backpressure: the pool cannot take another request yet
-      # The tokens this prefill actually ran, which is the prompt minus whatever
-      # the cache supplied. Recorded per request so the saving can be reported as
-      # work avoided rather than inferred from a latency difference alone.
-      candidate.prefill_tokens = candidate.prompt_len - runtime.cached_tokens(handle)
-      waiting.pop(0)
-      candidate.handle = handle
-      candidate.generated.append(int(result.data[0, 0]))
-      now = time.perf_counter()
-      candidate.first_token_at = now
-      candidate.token_times.append(now)
-      live.append(candidate)
-      steps += 1
-
-    if not live:
-      if waiting:
-        raise RuntimeError(
-            f"{len(waiting)} requests are waiting but nothing is live and the pool is empty; "
-            f"the pool is too small for even one request in this trace"
-        )
+  while True:
+    outcome = driver.step()
+    if outcome is None:
       break
-
-    result, ok = engine.generate_paged(
-        params,
-        [r.handle for r in live],
-        next_tokens=jnp.asarray([r.generated[-1] for r in live], jnp.int32),
-    )
-    if not ok:
-      # Pool exhausted mid-decode. Give the newest request's pages back and let
-      # it be replayed, which is the same recompute-preemption the driver uses.
-      victim = live.pop()
-      # Nothing published: preemption is trying to reclaim pages, and the cache
-      # would hold onto whatever it adopted.
-      engine.release(victim.handle)
-      # **Keep the generated tokens**, exactly as `PagedDriver._preempt_newest`
-      # does, so the replay is a longer prompt rather than a restart. Discarding
-      # them -- which this did until it was caught livelocking a 70B sweep --
-      # makes the retry byte-identical to the attempt that just failed, so a pool
-      # that is overcommitted at admission never makes progress: admit, exhaust,
-      # preempt, re-prefill the same tokens, forever, at full GPU utilisation.
-      # The driver's own docstring calls keeping them "the price of not
-      # deadlocking"; the harness has to pay it too.
-      context = victim.context_tokens()
-      if context is not None:
-        victim.token_ids = context
-      victim.max_new_tokens = max(victim.max_new_tokens - len(victim.generated), 0)
-      victim.prompt_len += len(victim.generated)
-      victim.generated = []
-      victim.handle = None
-      victim.preemptions += 1
-      # A request preempted with nothing left to generate is finished, not
-      # requeued; requeuing it would ask for a zero-token step.
-      if victim.max_new_tokens == 0:
-        done.append(victim)
-      else:
-        waiting.insert(0, victim)
-      continue
-
     steps += 1
     now = time.perf_counter()
-    tokens = np.asarray(result.data[:, 0]).reshape(-1)
-    finished = []
-    for row, request in enumerate(live):
-      request.generated.append(int(tokens[row]))
-      request.token_times.append(now)
-      if len(request.generated) >= request.max_new_tokens:
-        finished.append(request)
 
+    for request, query_len in zip(outcome.batch, outcome.query_lens):
+      entry = _metrics_for(metrics, request)
+      if not outcome.is_decode:
+        # Tokens this prefill actually ran, which is the prompt minus whatever the
+        # cache supplied. Accumulated rather than assigned, because a preempted
+        # request prefills more than once and every one of those is real work.
+        entry.prefill_tokens += query_len
+      if entry.first_token_at is None:
+        entry.first_token_at = now
+      entry.token_times.append(now)
+
+    live = driver.live_requests()
     live_tokens = sum(r.prompt_len + len(r.generated) for r in live)
     occupancy.append((now - start, allocator.num_allocated_pages * page_size, live_tokens, len(live)))
 
-    for request in finished:
-      engine.release(request.handle, request.context_tokens())
-      request.handle = None
-      live.remove(request)
-      done.append(request)
-
   elapsed = time.perf_counter() - start
+  done = driver.completed()
   index = runtime.control_plane.prefix_index
   summary = _summarise(
-      done, occupancy, elapsed, steps, allocator, page_size, retained_pages=index.num_cached_pages
+      done, metrics, occupancy, elapsed, steps, allocator, page_size, retained_pages=index.num_cached_pages
   )
-  summary.update(_summarise_prefix_cache(done, runtime.control_plane))
+  summary.update(_summarise_prefix_cache(done, metrics, runtime.control_plane))
 
   # Shape accounting, which is necessary but *not sufficient*: it sees bucketed
   # `StepShape`s and is blind to eager host-side ops whose values enter a jaxpr as
@@ -438,7 +386,7 @@ def run_paged(
   return summary
 
 
-def _summarise_prefix_cache(requests: Sequence[Request], control_plane) -> dict[str, Any]:
+def _summarise_prefix_cache(requests, metrics, control_plane) -> dict[str, Any]:
   """What sharing avoided, in tokens rather than in seconds.
 
   Reported separately from latency because it is the direct measurement: a
@@ -447,7 +395,7 @@ def _summarise_prefix_cache(requests: Sequence[Request], control_plane) -> dict[
   that did not happen.
   """
   prompted = sum(r.prompt_len for r in requests)
-  prefilled = sum(r.prefill_tokens for r in requests)
+  prefilled = sum(metrics[r.request_id].prefill_tokens for r in requests if r.request_id in metrics)
   index = control_plane.prefix_index
   return {
       "prefix_cache_enabled": index.enabled,
@@ -514,7 +462,7 @@ def is_stable(durations: Sequence[float], tolerance: float = 1.15) -> bool:
   return stability_ratio(durations) < tolerance
 
 
-def run_dense(engine, params, requests: Sequence[Request], *, max_batch: int) -> dict[str, Any]:
+def run_dense(engine, params, requests: Sequence[PagedRequest], *, max_batch: int) -> dict[str, Any]:
   """Serve `requests` on the dense two-region cache, for the A/B.
 
   Deliberately the ordinary MaxText path -- `prefill`, `init_decode_state`,
@@ -522,14 +470,21 @@ def run_dense(engine, params, requests: Sequence[Request], *, max_batch: int) ->
   not against an idealised dense implementation. Its batch is a fixed set of
   slots, and every slot advances in lockstep whether or not it holds a request,
   which is the behaviour under examination rather than an inefficiency to correct.
+
+  This keeps its own loop rather than driving `PagedDriver`, and that is not an
+  oversight: the driver's whole subject is page allocation, which the dense
+  two-region cache does not have. A slot here is fixed for a request's lifetime,
+  there is nothing to reserve, recycle or preempt, and forcing it through a paged
+  scheduler would measure the scheduler instead of the cache.
   """
   waiting, done = list(requests), []
+  metrics: dict[str, RequestMetrics] = {}
   start = time.perf_counter()
   for request in waiting:
-    request.arrival = start
+    _metrics_for(metrics, request).arrival = start
 
   decode_state = engine.init_decode_state()
-  slots: dict[int, Request] = {}
+  slots: dict[int, PagedRequest] = {}
   steps = 0
 
   while waiting or slots:
@@ -547,8 +502,11 @@ def run_dense(engine, params, requests: Sequence[Request], *, max_batch: int) ->
       decode_state = engine.insert(prefix, decode_state, slot=free)
       candidate.generated.append(int(result.data[0, 0]))
       now = time.perf_counter()
-      candidate.first_token_at = now
-      candidate.token_times.append(now)
+      entry = _metrics_for(metrics, candidate)
+      entry.first_token_at = now
+      entry.token_times.append(now)
+      # The dense path has no prefix cache, so every prompt token is computed.
+      entry.prefill_tokens += candidate.prompt_len
       slots[free] = candidate
       steps += 1
 
@@ -560,17 +518,18 @@ def run_dense(engine, params, requests: Sequence[Request], *, max_batch: int) ->
     now = time.perf_counter()
     for slot, request in list(slots.items()):
       request.generated.append(int(result.data[slot, 0]))
-      request.token_times.append(now)
+      _metrics_for(metrics, request).token_times.append(now)
       if len(request.generated) >= request.max_new_tokens:
         del slots[slot]
         done.append(request)
 
   elapsed = time.perf_counter() - start
-  return _summarise(done, [], elapsed, steps, None, 0)
+  return _summarise(done, metrics, [], elapsed, steps, None, 0)
 
 
 def _summarise(
-    done: Sequence[Request],
+    done,
+    metrics: dict[str, RequestMetrics],
     occupancy: Sequence[tuple[float, int, int, int]],
     elapsed: float,
     steps: int,
@@ -588,7 +547,8 @@ def _summarise(
   """
   output_tokens = sum(len(r.generated) for r in done)
   prompt_tokens = sum(r.prompt_len for r in done)
-  itls = [gap for r in done for gap in r.inter_token_latencies()]
+  timings = [metrics[r.request_id] for r in done if r.request_id in metrics]
+  itls = [gap for entry in timings for gap in entry.inter_token_latencies()]
 
   summary: dict[str, Any] = {
       "completed_requests": len(done),
@@ -603,7 +563,7 @@ def _summarise(
       # with preemptions is a capacity result rather than a throughput one.
       "preemptions": sum(r.preemptions for r in done),
       "requests_preempted": sum(1 for r in done if r.preemptions),
-      "ttft": _percentiles([r.ttft for r in done if r.ttft is not None]),
+      "ttft": _percentiles([e.ttft for e in timings if e.ttft is not None]),
       "itl": _percentiles(itls),
       "peak_device_bytes": _peak_bytes(),
   }
