@@ -101,6 +101,47 @@ class KvStorageLayoutTest(unittest.TestCase):
         layout.pool_bytes_per_shard() * layout.num_kv_heads * layout.replication_factor(),
     )
 
+  def test_replication_from_a_non_kv_mesh_axis_is_counted(self):
+    """The only replicated layout MaxText can actually build, and it was mis-sized.
+
+    MaxText refuses a model whose KV heads are sharded more ways than it has
+    heads, so `kv_head_shards > num_kv_heads` is unreachable through it. The
+    reachable route is surplus parallelism on an axis that does not shard KV
+    heads -- `tensor=4, fsdp=2` on eight devices with four KV heads -- where the
+    pool partitions four ways and is replicated across the other two.
+
+    Counting only `kv_head_shards` reports half the memory that is really
+    committed, which is the naive calculation the milestone warns against.
+    Measured on the running model: 8 MiB per shard, 8 addressable shards, so
+    64 MiB physical where the old arithmetic said 32.
+    """
+    layout = self._layout(num_kv_heads=4, kv_head_shards=4, pool_replicas=2)
+    self.assertEqual(layout.heads_per_shard(), 1, "each device holds exactly one head")
+    self.assertEqual(layout.replication_factor(), 2, "two devices hold each head")
+    self.assertEqual(
+        layout.total_pool_bytes(),
+        layout.pool_bytes_per_shard() * 8,
+        "eight devices each hold a shard, so eight shards are paid for",
+    )
+    # The unique KV is half of that; budgeting against it is the mis-sizing.
+    self.assertEqual(
+        layout.total_pool_bytes(),
+        layout.pool_bytes_per_shard() * layout.num_kv_heads * layout.replication_factor(),
+    )
+
+  def test_replication_sources_multiply(self):
+    """Over-sharded heads and a replicating mesh axis are independent."""
+    layout = self._layout(num_kv_heads=2, kv_head_shards=8, pool_replicas=2)
+    self.assertEqual(layout.replication_factor(), 8, "4x from over-sharding, 2x from the axis")
+    self.assertEqual(layout.total_pool_bytes(), layout.pool_bytes_per_shard() * 16)
+
+  def test_no_replicas_leaves_the_footprint_unchanged(self):
+    """The default has to be inert, or every existing deployment is re-sized."""
+    plain = self._layout(num_kv_heads=8, kv_head_shards=8)
+    explicit = self._layout(num_kv_heads=8, kv_head_shards=8, pool_replicas=1)
+    self.assertEqual(plain.total_pool_bytes(), explicit.total_pool_bytes())
+    self.assertEqual(plain.replication_factor(), 1)
+
   def test_mqa_replicates_everywhere(self):
     layout = self._layout(num_kv_heads=1, kv_head_shards=8)
     self.assertEqual(layout.heads_per_shard(), 1)

@@ -50,6 +50,25 @@ def kv_head_shards(mesh: Any | None) -> int:
   return max(shards, 1)
 
 
+def pool_replicas(mesh: Any | None) -> int:
+    """Devices holding a copy of each KV-head shard, from the non-KV mesh axes.
+
+    The pool's `PartitionSpec` names only the KV-head axes, so it is replicated
+    across every other axis of the mesh -- one copy per device on them. That is
+    the only route to a replicated KV footprint that MaxText permits, since it
+    refuses to build a model whose KV heads are sharded more ways than it has
+    heads. On eight devices with four KV heads, `tensor=4, fsdp=2` gives four
+    shards and two replicas, and every device holds exactly one head.
+    """
+    if mesh is None:
+        return 1
+    devices = int(getattr(mesh, "size", 0) or 0)
+    if devices <= 0:
+        return 1
+    shards = kv_head_shards(mesh)
+    return max(devices // max(shards, 1), 1)
+
+
 def kv_pool_sharding(mesh: Any | None, layout: KvStorageLayoutV1) -> Any | None:
   """Where each KV head of the pool lives, as a `NamedSharding`.
 
@@ -82,16 +101,26 @@ def kv_pool_sharding(mesh: Any | None, layout: KvStorageLayoutV1) -> Any | None:
   if mesh is None or shards <= 1:
     return None
 
-  replication = layout.replication_factor()
-  if replication == 1:
-    # Clean partition, and the common case. The model's own mesh already
-    # expresses it, so use that rather than a private one: `shard_map` needs the
-    # pool and the activations on the *same* mesh, and a second mesh over the
-    # same devices is not the same mesh as far as it is concerned.
+  # The head axis is what decides whether the model's own mesh can express this,
+  # and it is *not* the same question as whether the pool ends up replicated.
+  # Naming only the KV-head axes in the spec leaves the pool replicated across
+  # every other mesh axis automatically, which is exactly the layout wanted when
+  # surplus parallelism sits on `fsdp` -- four shards over `tensor`, two copies
+  # over `fsdp`, one head per device. Branching on `replication_factor()` instead
+  # sends that perfectly ordinary case down the private-mesh path and fails.
+  if not layout.num_kv_heads or shards <= layout.num_kv_heads:
+    # The model's own mesh already expresses it, so use that rather than a
+    # private one: `shard_map` needs the pool and the activations on the *same*
+    # mesh, and a second mesh over the same devices is not the same mesh as far
+    # as it is concerned.
     axes = tuple(a for a in _KV_HEAD_MESH_AXES if int(dict(mesh.shape).get(a, 1)) > 1)
     spec = jax.sharding.PartitionSpec(None, None, axes if len(axes) > 1 else axes[0], None)
     return jax.sharding.NamedSharding(mesh, spec)
 
+  # Only reachable when the head axis itself is over-sharded, which MaxText
+  # refuses to build a model for. Kept because this counts mesh axes directly
+  # while MaxText counts them through the logical axis rules.
+  replication = layout.replication_factor()
   devices = np.asarray(getattr(mesh, "devices", None))
   if devices.size != shards:
     raise ValueError(
@@ -138,5 +167,6 @@ def build_storage_layout(config: Any, mesh: Any | None = None) -> KvStorageLayou
       head_dim=head_dim,
       dtype=dtype,
       kv_head_shards=kv_head_shards(mesh),
+      pool_replicas=pool_replicas(mesh),
       padding_page_id=0,
   )

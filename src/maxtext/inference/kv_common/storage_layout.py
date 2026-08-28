@@ -64,6 +64,15 @@ class KvStorageLayoutV1:
         head_dim: per-head dimension.
         dtype: numpy dtype name of the stored K/V.
         kv_head_shards: tensor-parallel width the pool is sharded over.
+        pool_replicas: how many devices hold a copy of each KV-head shard,
+            because they sit on mesh axes that do not shard KV heads. This is
+            not a refinement: MaxText refuses to build a model whose KV heads
+            are sharded more ways than it has heads, so the *only* route to a
+            replicated KV footprint is surplus parallelism on another axis --
+            `tensor=4, fsdp=2` on eight devices with four KV heads. Counting
+            only `kv_head_shards` then understates the physical footprint by
+            exactly this factor, which is the mis-sizing the milestone warns
+            about arriving by a different door than expected.
         padding_page_id: page reserved as a padding target and never allocated.
             This buys safe targets for padded rows and simpler invalid-page
             handling. It is emphatically *not* a security mechanism: stale KV in a
@@ -78,6 +87,7 @@ class KvStorageLayoutV1:
     head_dim: int = 0
     dtype: str = "bfloat16"
     kv_head_shards: int = 1
+    pool_replicas: int = 1
     padding_page_id: int = 0
 
     def __post_init__(self):
@@ -85,6 +95,8 @@ class KvStorageLayoutV1:
             raise ValueError(f"tokens_per_page must be positive, got {self.tokens_per_page}")
         if self.kv_head_shards <= 0:
             raise ValueError(f"kv_head_shards must be positive, got {self.kv_head_shards}")
+        if self.pool_replicas <= 0:
+            raise ValueError(f"pool_replicas must be positive, got {self.pool_replicas}")
         if self.num_kv_heads and self.kv_head_shards > self.num_kv_heads:
             if self.kv_head_shards % self.num_kv_heads != 0:
                 raise ValueError(
@@ -130,10 +142,18 @@ class KvStorageLayoutV1:
         return max(self.num_kv_heads // self.kv_head_shards, 1)
 
     def replication_factor(self) -> int:
-        """How many shards hold a copy of the same KV head."""
+        """How many devices hold a copy of the same KV head.
+
+        Two independent sources, and they multiply. Over-sharding the head axis
+        replicates when `kv_head_shards` exceeds `num_kv_heads`; and any mesh
+        axis that does not shard KV heads replicates the whole pool across
+        itself, which `pool_replicas` carries. Only the second is reachable
+        through MaxText, since it rejects the first when the model is built.
+        """
+        over_sharded = 1
         if self.num_kv_heads and self.kv_head_shards > self.num_kv_heads:
-            return self.kv_head_shards // self.num_kv_heads
-        return 1
+            over_sharded = self.kv_head_shards // self.num_kv_heads
+        return over_sharded * max(self.pool_replicas, 1)
 
     def bytes_per_page(self) -> int:
         """Bytes of one page of one of K or V, for one layer, on one shard.
@@ -157,8 +177,15 @@ class KvStorageLayoutV1:
         return 2 * self.num_layers * self.num_pages * self.bytes_per_page()
 
     def total_pool_bytes(self) -> int:
-        """Pool bytes summed over shards, including any replication."""
-        return self.pool_bytes_per_shard() * self.kv_head_shards
+        """Physical pool bytes across the whole mesh, replication included.
+
+        `pool_bytes_per_shard * kv_head_shards` counts the *unique* KV once and
+        is what a naive sizing reaches for. Every device that holds a copy pays
+        for it, so the count has to include `pool_replicas` too -- otherwise a
+        `tensor=4, fsdp=2` deployment budgets half the memory it will actually
+        consume, and finds out at allocation time on the largest model it runs.
+        """
+        return self.pool_bytes_per_shard() * self.kv_head_shards * max(self.pool_replicas, 1)
 
     def max_tokens(self) -> int:
         """Live tokens the pool can hold, excluding the padding page."""

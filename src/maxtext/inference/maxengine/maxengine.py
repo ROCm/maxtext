@@ -1962,20 +1962,29 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
       )
 
     layout = build_storage_layout(self.config, self._mesh)
-    if layout.replication_factor() > 1:
-      # The clean partition -- num_kv_heads divisible by the shard count -- is
-      # supported and matches the dense path token for token. Replication is not,
-      # and the obstacle is the mesh rather than the kernels: `kv_pool_sharding`
-      # has to split the tensor axis into a head-selecting and a replicating part
-      # to place the copies, and it does that on a mesh of its own, while
-      # `shard_map` requires the pool and the activations on the *same* mesh.
-      # Until MaxText's own mesh carries that split there is nowhere to put such
-      # a pool, so refuse rather than mis-shard.
+    if layout.num_kv_heads and layout.kv_head_shards > layout.num_kv_heads:
+      # Over-sharding the head axis itself is the one layout with nowhere to go:
+      # `kv_pool_sharding` has to split the tensor axis into a head-selecting and
+      # a replicating part to place the copies, and it does that on a mesh of its
+      # own, while `shard_map` needs the pool and the activations on one mesh.
+      #
+      # It should already be unreachable, because MaxText refuses to build a
+      # model whose KV heads are sharded more ways than it has heads -- attention
+      # heads are atomic under tensor parallelism. Checked anyway, because this
+      # counts mesh axes directly while MaxText counts them through the logical
+      # axis rules, and the two could disagree.
+      #
+      # Note what is deliberately *not* refused: a replicated KV footprint
+      # reached by putting surplus parallelism on an axis that does not shard KV
+      # heads, which is the only route MaxText permits. `tensor=4, fsdp=2` on
+      # eight devices with four KV heads gives every device one head and pairs of
+      # devices the same head, entirely on MaxText's own mesh, and matches the
+      # dense path token for token.
       raise ValueError(
-          f"attention='gpu_paged' does not yet support tensor parallelism above the KV-head count: "
-          f"this mesh shards KV heads {layout.kv_head_shards} ways over {layout.num_kv_heads} heads, "
-          f"which replicates each head {layout.replication_factor()} times. Reduce tensor parallelism "
-          f"to at most num_kv_heads, or use attention='dot_product' for a wider mesh."
+          f"attention='gpu_paged' cannot shard KV heads more ways than there are heads: this mesh "
+          f"shards them {layout.kv_head_shards} ways over {layout.num_kv_heads} heads. Reduce the "
+          f"tensor-parallel width to at most num_kv_heads and put any surplus parallelism on an axis "
+          f"that does not shard KV heads, such as fsdp."
       )
     if layout.dtype not in ("bfloat16", "float16"):
       raise ValueError(
