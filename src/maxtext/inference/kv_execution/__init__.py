@@ -41,6 +41,7 @@ from maxtext.inference.kv_execution.pool_ops import (
     scrub_pages,
     scrub_pages_all_layers,
 )
+from maxtext.inference.kv_execution.step_inputs import RequestSlice, StepInputs, build_step_inputs
 from maxtext.inference.kv_execution.step_view import StepView, build_step_view
 
 __all__ = [
@@ -48,12 +49,15 @@ __all__ = [
     "PagedDriver",
     "PagedKvPool",
     "PagedRequest",
+    "RequestSlice",
+    "StepInputs",
     "StepOutcome",
     "StepShape",
     "StepView",
     "allocate_pool",
     "batch_ladder",
     "bucket_up",
+    "build_step_inputs",
     "build_step_view",
     "build_storage_layout",
     "poison_pages",

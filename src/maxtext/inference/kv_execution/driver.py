@@ -62,6 +62,7 @@ from maxtext.inference.kv_execution.bucketing import StepShape, StepShapePlanner
 from maxtext.inference.kv_execution.engine_adapter import PagedRuntime
 from maxtext.inference.kv_execution.pool_factory import PagedKvPool
 from maxtext.inference.kv_execution.pool_ops import poison_pages
+from maxtext.inference.kv_execution.step_inputs import RequestSlice, StepInputs, build_step_inputs
 from maxtext.inference.kv_execution.step_view import StepView
 
 _DEFAULT_NAMESPACE = CacheNamespace()
@@ -140,11 +141,23 @@ class StepOutcome:
   num_requests: int
   num_tokens: int
   preempted: int = 0
+  # The requests this step advanced, in the order their tokens were returned.
+  # Carried so an observer can attribute per-request timing -- which is what a
+  # serving harness needs for TTFT and ITL, and the reason it previously had to
+  # re-implement the scheduling loop to get it.
+  batch: tuple[PagedRequest, ...] = ()
 
 
-# Takes the padded view and the pool; returns one token per *active* request and
-# the rebound pool arrays, which alias the ones passed in.
-StepFn = Callable[[StepView, PagedKvPool], np.ndarray]
+# Takes the padded page view, the assembled token-side operands and the pool;
+# returns one token per *active* request. The pool arrives so an implementation
+# can pass it to an aliasing forward pass; the rebound arrays come back through
+# the pool object rather than the return value.
+#
+# `StepInputs` is here because a `StepView` describes *pages* and a forward pass
+# also needs tokens, absolute positions, segment ids and a sample index. Without
+# it a step function cannot drive a model, which is why nothing connected the
+# driver to `MaxEngine` for several milestones.
+StepFn = Callable[[StepView, StepInputs, PagedKvPool], np.ndarray]
 
 
 class PagedDriver:
@@ -212,6 +225,27 @@ class PagedDriver:
     return len(self._live)
 
   def submit(self, requests: Sequence[PagedRequest]) -> None:
+    """Queue requests, rejecting any the driver could not actually run.
+
+    `prompt_tokens` is validated here rather than at the step that needs it. The
+    driver assembles the tokens it feeds the model, so a request without them
+    cannot run -- but discovering that mid-run means the pool already holds pages
+    for it and other requests have already been scheduled around it. Failing at
+    the boundary tells the caller while the caller can still do something.
+
+    Note this is *not* the prefix cache's opt-in. That is a config switch on the
+    control plane; `prompt_tokens` being present used to double as an implicit
+    second switch, which is a coincidence rather than a design.
+    """
+    missing = [r.request_id for r in requests if r.token_ids() is None]
+    if missing:
+      # Named but capped: a whole trace missing the field is a single mistake, and
+      # printing six hundred ids buries the message that explains it.
+      shown = ", ".join(missing[:5]) + (f", ... and {len(missing) - 5} more" if len(missing) > 5 else "")
+      raise ValueError(
+          f"{len(missing)} of {len(requests)} submitted requests have no prompt_tokens, so the driver "
+          f"has nothing to feed the model: {shown}. Set PagedRequest.prompt_tokens on every request."
+      )
     self._waiting.extend(requests)
 
   def run(self, max_steps: int = 100_000) -> list[PagedRequest]:
@@ -343,7 +377,12 @@ class PagedDriver:
       )
 
     shape = view.shape
-    next_tokens = np.asarray(self.step_fn(view, self.pool)).reshape(-1)
+    inputs = build_step_inputs(
+        [self._slice_for(request, lens[i], is_decode=is_decode) for i, request in enumerate(batch)],
+        shape,
+        is_decode=is_decode,
+    )
+    next_tokens = np.asarray(self.step_fn(view, inputs, self.pool)).reshape(-1)
     if next_tokens.size < len(batch):
       raise ValueError(f"the step function returned {next_tokens.size} tokens for {len(batch)} requests")
 
@@ -354,6 +393,44 @@ class PagedDriver:
         num_requests=len(batch),
         num_tokens=sum(lens),
         preempted=preempted,
+        batch=tuple(batch),
+    )
+
+  def _slice_for(self, request: PagedRequest, query_len: int, *, is_decode: bool) -> RequestSlice:
+    """This request's contribution to the step: what to feed and where it sits.
+
+    The driver's half of the one position rule. A step feeds
+    `token_ids[start : start + query_len]` at absolute positions
+    `start .. start + query_len - 1`, and the phases differ only in `start`:
+
+      * prefill runs the context the cache did not supply, so it starts at
+        `cached_tokens` -- zero for a fresh request, and past the shared prefix
+        after a hit. Starting at zero on a hit would rotate the suffix as though
+        it began the sequence, which RoPE does not forgive.
+      * decode runs the single token the previous step produced, which sits at
+        the end of the recorded context.
+
+    A replay after preemption needs no special case: the driver retains
+    `generated`, so `token_ids()` and `prefill_len()` already describe the longer
+    prompt.
+    """
+    context = request.token_ids()
+    if context is None:
+      # `submit` rejects these, so reaching here means a request arrived by some
+      # other route. Kept as an invariant guard rather than the primary check,
+      # because inventing tokens would produce fluent output from garbage.
+      raise ValueError(
+          f"request {request.request_id!r} has no prompt_tokens, so this step has nothing to feed the "
+          f"model. Every request must carry them; `submit` normally catches this."
+      )
+    if is_decode:
+      start = request.prompt_len + len(request.generated) - 1
+    else:
+      start = request.cached_tokens
+    return RequestSlice(
+        tokens=np.asarray(context).reshape(-1)[start : start + query_len],
+        start=start,
+        query_len=query_len,
     )
 
   def _preempt_newest(self, batch: list[PagedRequest]) -> None:

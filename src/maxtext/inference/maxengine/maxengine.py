@@ -2064,6 +2064,7 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
       kv_page_indices: jax.Array,
       kv_last_page_lens: jax.Array,
       cu_seqlens_q: jax.Array,
+      sample_rows: jax.Array,
       sample_at: jax.Array,
       rng: PRNGKeyType,
       model_mode: str,
@@ -2125,12 +2126,18 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
             attention_metadata=plan,
         )
 
-    # One row per request, each sampled at its own index: for prefill that is the
-    # last prompt token, for decode the single new token. Doing it with a gather
+    # One logit row per request, gathered at its own (row, position). A gather
     # rather than a slice is what lets a decode batch hold requests at different
     # positions, which is the whole point of paging.
-    rows = jnp.arange(logits.shape[0])
-    selected = logits[rows, sample_at][:, None, :]
+    #
+    # Both indices are supplied because the two phases lay a batch out along
+    # different axes: decode batches along rows and samples position 0 of each,
+    # while prefill *packs* requests into one row and samples several positions
+    # within it. An earlier version derived the rows as `arange(logits.shape[0])`,
+    # which is correct for decode and silently returns a single token for a packed
+    # multi-request prefill -- the driver batches prefill, so that was a live trap
+    # rather than a hypothetical.
+    selected = logits[sample_rows, sample_at][:, None, :]
     selected = jax.lax.with_sharding_constraint(selected, self.replicated_sharding)
 
     rng, sample_rng = jax.random.split(rng)
@@ -2143,6 +2150,82 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
         temperature=temperature if temperature is not None else self.config.decode_sampling_temperature,
     )
     return sampled, selected, updated_pools
+
+  def paged_step(
+      self,
+      *,
+      params: Params,
+      view,
+      inputs,
+      is_decode: bool,
+      rng: PRNGKeyType | None = None,
+      algorithm: str | None = None,
+      topk: int | None = None,
+      nucleus_topp: float | None = None,
+      temperature: float | None = None,
+  ):
+    """One paged forward pass over an already-reserved step. No policy, no admission.
+
+    The seam the scheduler plugs into. `view` is the page bookkeeping from
+    `PagedRuntime.prepare_step`; `inputs` is the token side from
+    `build_step_inputs`. Everything this needs has already been decided, which is
+    what makes it usable by both `PagedDriver` -- which has admitted and reserved
+    itself -- and by `prefill_paged` / `generate_paged`, which wrap it in their own
+    admission and bookkeeping.
+
+    Returns `(sampled, selected)`: the tokens, and the logit rows they came from.
+    The logits are returned rather than dropped because `return_log_prob` needs
+    them, and building `ResultTokens` stays with the callers since it is a
+    JetStream-shaped concern the driver has no use for.
+
+    The pool is rebound as a side effect, since the forward pass donates it.
+    """
+    if rng is None:
+      if self.rng is None:
+        self.rng = jax.random.PRNGKey(0)
+      self.rng, rng = jax.random.split(self.rng)
+
+    sampled, selected, updated = self._paged_forward_jit(
+        params=params,
+        kv_caches=self._paged_pool_arrays(),
+        tokens=jnp.asarray(inputs.tokens),
+        positions=jnp.asarray(inputs.positions),
+        segment_ids=None if inputs.segment_ids is None else jnp.asarray(inputs.segment_ids),
+        slot_mapping=view.slot_mapping,
+        kv_indptr=view.kv_indptr,
+        kv_page_indices=view.kv_page_indices,
+        kv_last_page_lens=view.kv_last_page_lens,
+        cu_seqlens_q=view.cu_seqlens_q,
+        sample_rows=jnp.asarray(inputs.sample_rows),
+        sample_at=jnp.asarray(inputs.sample_at),
+        rng=rng,
+        model_mode=MODEL_MODE_AUTOREGRESSIVE if is_decode else MODEL_MODE_PREFILL,
+        max_seqlen_k=view.shape.max_seqlen_k,
+        is_decode=is_decode,
+        algorithm=algorithm,
+        topk=topk,
+        nucleus_topp=nucleus_topp,
+        temperature=temperature,
+    )
+    self._rebind_paged_pool(updated)
+    return sampled, selected
+
+  def paged_step_fn(self, params: Params, **kwargs):
+    """A `PagedDriver` step function bound to this engine.
+
+    The driver's contract is `(view, inputs, pool) -> tokens`. The pool arrives
+    for implementations that need it; this one does not, because the engine
+    already holds the pool it donates and rebinds.
+    """
+
+    def step(view, inputs, pool):
+      del pool
+      sampled, _ = self.paged_step(
+          params=params, view=view, inputs=inputs, is_decode=view.shape.is_decode, **kwargs
+      )
+      return np.asarray(sampled).reshape(-1)[: inputs.sample_at.size]
+
+    return step
 
   def _paged_result_tokens(self, sampled: jax.Array, selected: jax.Array, step: int):
     """Wrap sampled tokens in the same `ResultTokens` shape the dense path returns."""
@@ -2231,46 +2314,31 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
     # are what RoPE encodes, so restarting them at zero would rotate the suffix
     # as though it began the sequence and produce K/V that does not belong after
     # the cached prefix -- a wrong answer rather than a slow one.
-    width = view.shape.num_tokens
-    prompt = np.asarray(padded_tokens, dtype=np.int32).reshape(-1)[cached : cached + width]
-    token_row = np.zeros((1, width), np.int32)
-    token_row[0, : prompt.size] = prompt
-    index = np.arange(width, dtype=np.int32)
-    tokens = jnp.asarray(token_row)
-    positions = jnp.asarray((index + cached)[None, :])
-    segment_ids = jnp.asarray(
-        np.where(index < query_len, DECODING_ACTIVE_SEQUENCE_INDICATOR, 0).astype(np.int32)[None, :]
-    )
+    # Assembled by the shared seam rather than here, so the absolute-position
+    # arithmetic -- which a prefix hit and a preemption replay both perturb -- has
+    # exactly one implementation. `start=cached` is what makes the suffix rotate
+    # as a suffix; RoPE is not translation invariant, and getting it wrong yields
+    # plausible text rather than an error.
+    # pylint: disable=import-outside-toplevel
+    from maxtext.inference.kv_execution.step_inputs import RequestSlice, build_step_inputs
 
-    if rng is None:
-      if self.rng is None:
-        self.rng = jax.random.PRNGKey(0)
-      self.rng, rng = jax.random.split(self.rng)
-
-    sampled, selected, updated = self._paged_forward_jit(
-        params=params,
-        kv_caches=self._paged_pool_arrays(),
-        tokens=tokens,
-        positions=positions,
-        segment_ids=segment_ids,
-        slot_mapping=view.slot_mapping,
-        kv_indptr=view.kv_indptr,
-        kv_page_indices=view.kv_page_indices,
-        kv_last_page_lens=view.kv_last_page_lens,
-        cu_seqlens_q=view.cu_seqlens_q,
-        # Indexed within the query window, not the sequence: the logits this step
-        # produces cover only the tokens it ran.
-        sample_at=jnp.asarray([query_len - 1], jnp.int32),
-        rng=rng,
-        model_mode=MODEL_MODE_PREFILL,
-        max_seqlen_k=view.shape.max_seqlen_k,
+    prompt = np.asarray(padded_tokens, dtype=np.int64).reshape(-1)
+    inputs = build_step_inputs(
+        [RequestSlice(tokens=prompt[cached : cached + query_len], start=cached, query_len=query_len)],
+        view.shape,
         is_decode=False,
+    )
+    sampled, selected = self.paged_step(
+        params=params,
+        view=view,
+        inputs=inputs,
+        is_decode=False,
+        rng=rng,
         algorithm=algorithm,
         topk=topk,
         nucleus_topp=nucleus_topp,
         temperature=temperature,
     )
-    self._rebind_paged_pool(updated)
     runtime.track(handle, slot=slot)
     return handle, self._paged_result_tokens(sampled, selected, step=0)
 
@@ -2304,55 +2372,41 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
       raise ValueError("generate_paged needs at least one live request")
 
     # Read before reserving: this is each request's position for the token about
-    # to be written, and reserving advances the recorded length past it.
-    positions = [runtime.control_plane.page_map.seq_len(h) for h in handles]
+    # to be written, and reserving advances the recorded length past it. The
+    # driver avoids this ordering constraint entirely by deriving positions from
+    # the request; here the caller supplies only the token, so the page map is the
+    # only thing that knows where it goes.
+    positions = [int(runtime.control_plane.page_map.seq_len(h)) for h in handles]
 
     view = runtime.prepare_step(handles, [1] * len(handles), is_decode=True)
     if view is None:
       return None, False
 
-    # numpy for the same reason as `prefill_paged`: padding a variable-length
-    # array with `jnp` compiles once per distinct live-request count, and the
-    # live count changes constantly under continuous batching.
-    width = view.shape.num_requests
-    token_col = np.zeros((width, 1), np.int32)
-    supplied = np.asarray(next_tokens, dtype=np.int32).reshape(-1)[:width]
-    token_col[: supplied.size, 0] = supplied
-    position_col = np.zeros((width, 1), np.int32)
-    recorded = np.asarray(positions, dtype=np.int32).reshape(-1)[:width]
-    position_col[: recorded.size, 0] = recorded
-    tokens = jnp.asarray(token_col)
-    pos = jnp.asarray(position_col)
+    # One token per request at its own absolute position. Nothing else is needed:
+    # a slice carries what the step feeds, not the context behind it.
+    # pylint: disable=import-outside-toplevel
+    from maxtext.inference.kv_execution.step_inputs import RequestSlice, build_step_inputs
 
-    if rng is None:
-      if self.rng is None:
-        self.rng = jax.random.PRNGKey(0)
-      self.rng, rng = jax.random.split(self.rng)
-
-    sampled, selected, updated = self._paged_forward_jit(
-        params=params,
-        kv_caches=self._paged_pool_arrays(),
-        tokens=tokens,
-        positions=pos,
-        # None, not zeros: the model refuses segment ids in autoregressive mode,
-        # where every token is by definition in the active sequence.
-        segment_ids=None,
-        slot_mapping=view.slot_mapping,
-        kv_indptr=view.kv_indptr,
-        kv_page_indices=view.kv_page_indices,
-        kv_last_page_lens=view.kv_last_page_lens,
-        cu_seqlens_q=view.cu_seqlens_q,
-        sample_at=jnp.zeros((width,), jnp.int32),
-        rng=rng,
-        model_mode=MODEL_MODE_AUTOREGRESSIVE,
-        max_seqlen_k=view.shape.max_seqlen_k,
+    supplied = np.asarray(next_tokens, dtype=np.int64).reshape(-1)[: len(handles)]
+    inputs = build_step_inputs(
+        [
+            RequestSlice(tokens=np.asarray([token], np.int64), start=position, query_len=1)
+            for position, token in zip(positions, supplied.tolist())
+        ],
+        view.shape,
         is_decode=True,
+    )
+    sampled, selected = self.paged_step(
+        params=params,
+        view=view,
+        inputs=inputs,
+        is_decode=True,
+        rng=rng,
         algorithm=algorithm,
         topk=topk,
         nucleus_topp=nucleus_topp,
         temperature=temperature,
     )
-    self._rebind_paged_pool(updated)
     return self._paged_result_tokens(sampled, selected, step=1), True
 
   def get_prefix_destination_sharding(self) -> Any:

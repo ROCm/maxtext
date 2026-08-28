@@ -300,7 +300,12 @@ class _TracingStep:
 
     self._jitted = jax.jit(body, static_argnames=("max_seqlen_q", "max_seqlen_k", "is_decode"))
 
-  def __call__(self, view, pool):
+  def __call__(self, view, inputs, pool):
+    # `inputs` carries the tokens and positions a real forward pass would consume.
+    # This fake synthesises its own activations instead, because what it measures
+    # is retrace count against the page shapes -- but it takes the argument so it
+    # matches the contract every real step function implements.
+    del inputs
     seq_lens = np.asarray(view.seq_lens)
     self.raw_shapes.add(
         (
@@ -343,16 +348,18 @@ class CompileCountTest(parameterized.TestCase):
     driver = PagedDriver(plane, allocate_pool(layout), step, max_batch=4, max_batched_tokens=64)
 
     rng = np.random.default_rng(0)
-    driver.submit(
-        [
-            PagedRequest(
-                request_id=f"r{i}",
-                prompt_len=int(rng.integers(4, 48)),
-                max_new_tokens=int(rng.integers(1, 12)),
-            )
-            for i in range(24)
-        ]
-    )
+
+    def churning(index):
+      prompt_len = int(rng.integers(4, 48))
+      return PagedRequest(
+          request_id=f"r{index}",
+          prompt_len=prompt_len,
+          max_new_tokens=int(rng.integers(1, 12)),
+          # Required now: the driver assembles the tokens it feeds the model.
+          prompt_tokens=rng.integers(1, 30000, size=prompt_len, dtype=np.int64),
+      )
+
+    driver.submit([churning(i) for i in range(24)])
     done = driver.run()
 
     self.assertEqual(len(done), 24)
@@ -384,11 +391,13 @@ class CompileCountTest(parameterized.TestCase):
     step = _TracingStep()
     driver = PagedDriver(plane, allocate_pool(layout), step, max_batch=2, max_batched_tokens=64)
 
-    driver.submit([PagedRequest(request_id="a", prompt_len=20, max_new_tokens=10)])
+    driver.submit([PagedRequest(request_id="a", prompt_len=20, max_new_tokens=10,
+                                prompt_tokens=np.arange(20, dtype=np.int64))])
     driver.run()
     after_first = step.traces
 
-    driver.submit([PagedRequest(request_id="b", prompt_len=20, max_new_tokens=10)])
+    driver.submit([PagedRequest(request_id="b", prompt_len=20, max_new_tokens=10,
+                                prompt_tokens=np.arange(20, dtype=np.int64))])
     driver.run()
     self.assertEqual(step.traces, after_first, "an identical second request retraced")
 

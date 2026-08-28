@@ -371,6 +371,131 @@ class GpuPagedDecodeParityTest(parameterized.TestCase):
     paged = self._paged_rollout(_config(**_PAGED), params_state)
     self._verify_tokens_are_argmax(_config(**_DENSE), params_state, paged)
 
+  def test_the_driver_reproduces_the_engine_entry_points(self):
+    """`PagedDriver` driving the engine must match `prefill_paged`/`generate_paged`.
+
+    The equivalence that licenses the refactor. Both now go through the same
+    `build_step_inputs` and `paged_step`, but they reach them differently: the
+    entry points admit one request and assemble a slice from their arguments,
+    while the driver schedules a queue and assembles slices from `PagedRequest`.
+    A divergence here means the driver's half of the position rule disagrees with
+    the engine's, which is precisely the failure a shared seam is meant to make
+    impossible -- so it is worth checking rather than assuming.
+    """
+    # pylint: disable=import-outside-toplevel
+    from maxtext.inference.kv_execution.driver import PagedDriver, PagedRequest
+
+    cfg = _config(**_PAGED)
+    params_state = self._build_params(cfg)
+    reference = self._paged_rollout(cfg, params_state, steps=STEPS)
+
+    engine = maxengine.MaxEngine(cfg, _devices())
+    params = engine.load_params(params=params_state)
+    runtime = engine.init_paged_runtime()
+    driver = PagedDriver(
+        runtime.control_plane,
+        runtime.pool,
+        engine.paged_step_fn(params),
+        max_batch=1,
+        max_batched_tokens=cfg.max_prefill_predict_length,
+    )
+    # The driver counts its own generated tokens, so it wants exactly as many as
+    # the reference produced: one from prefill plus STEPS decodes.
+    driver.submit(
+        [
+            PagedRequest(
+                request_id="driven",
+                prompt_len=len(PROMPT),
+                max_new_tokens=STEPS + 1,
+                prompt_tokens=np.asarray(PROMPT, dtype=np.int64),
+            )
+        ]
+    )
+    done = driver.run()
+
+    self.assertEqual(len(done), 1)
+    self._assert_same_tokens(reference, done[0].generated, "driver against the engine entry points")
+    self.assertEqual(
+        runtime.control_plane.allocator.num_allocated_pages, 0, "the driver must release what it took"
+    )
+
+  def test_a_batched_prefill_samples_every_request(self):
+    """Two requests in one prefill step must each get their own token.
+
+    New capability, and the reason it needs its own test: prefill packs requests
+    along the sequence axis at batch one, so before `sample_rows` existed the
+    gather was `logits[arange(batch), sample_at]` and returned a *single* token
+    however many requests were packed. The driver has always batched prefill, so
+    that was a live trap rather than a hypothetical -- and a wrong-length result is
+    the good case, because a driver that receives one token for two requests
+    assigns the wrong token to the second.
+
+    Compared against prefilling the same two prompts separately, which is the only
+    reference that distinguishes "packed correctly" from "packed consistently".
+    """
+    # pylint: disable=import-outside-toplevel
+    from maxtext.inference.kv_execution.step_inputs import RequestSlice, build_step_inputs
+
+    cfg = _config(**_PAGED)
+    params_state = self._build_params(cfg)
+
+    # Two distinct prompts, so a swap or a duplicate is visible.
+    first, second = PROMPT[:6], PROMPT[2:10]
+    self.assertNotEqual(first, second, "the two prompts must differ for this test to mean anything")
+
+    separate = []
+    for index, prompt in enumerate((first, second)):
+      engine = maxengine.MaxEngine(cfg, _devices())
+      params = engine.load_params(params=params_state)
+      engine.init_paged_runtime()
+      padded = jnp.asarray(
+          list(prompt) + [0] * (cfg.max_prefill_predict_length - len(prompt)), dtype=jnp.int32
+      )
+      handle, result = engine.prefill_paged(
+          params=params, padded_tokens=padded, true_length=len(prompt), request_id=f"solo{index}"
+      )
+      self.assertIsNotNone(handle)
+      separate.append(int(result.data[0, 0]))
+      engine.release(handle)
+
+    # Now both in one packed step, driven at the seam rather than through the
+    # single-request entry point.
+    engine = maxengine.MaxEngine(cfg, _devices())
+    params = engine.load_params(params=params_state)
+    # Two rows explicitly: `init_paged_runtime` defaults to the dense batch width,
+    # which is one here, and a one-row page map cannot hold a two-request batch.
+    runtime = engine.init_paged_runtime(
+        max_requests=2, max_batched_tokens=cfg.max_prefill_predict_length
+    )
+    handles = [
+        runtime.admit(request_id=f"packed{i}", prompt_len=len(p), max_new_tokens=1)
+        for i, p in enumerate((first, second))
+    ]
+    self.assertTrue(all(h is not None for h in handles), "the pool refused a two-request batch")
+
+    query_lens = [len(first), len(second)]
+    view = runtime.prepare_step(handles, query_lens, is_decode=False, num_requests=2)
+    self.assertIsNotNone(view, "the pool could not back a two-request prefill")
+    inputs = build_step_inputs(
+        [
+            RequestSlice(tokens=np.asarray(p, np.int64), start=0, query_len=len(p))
+            for p in (first, second)
+        ],
+        view.shape,
+        is_decode=False,
+    )
+    self.assertEqual(inputs.sample_at.size, 2, "one sample index per packed request")
+    sampled, _ = engine.paged_step(params=params, view=view, inputs=inputs, is_decode=False)
+
+    packed = np.asarray(sampled).reshape(-1)[:2].tolist()
+    self.assertEqual(
+        packed,
+        separate,
+        "a packed prefill must give each request the token it would have got alone",
+    )
+    for handle in handles:
+      engine.release(handle)
+
   def test_the_paged_path_allocates_no_dense_cache(self):
     """A dense cache alongside the pool would waste gigabytes at real sizes."""
     cfg = _config(**_PAGED)
