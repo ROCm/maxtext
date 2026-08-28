@@ -59,9 +59,10 @@ from maxtext.inference.kv_control import (
     pages_for_tokens,
 )
 from maxtext.inference.kv_execution.bucketing import StepShape, StepShapePlanner
+from maxtext.inference.kv_execution.engine_adapter import PagedRuntime
 from maxtext.inference.kv_execution.pool_factory import PagedKvPool
-from maxtext.inference.kv_execution.pool_ops import poison_pages, scrub_pages_all_layers
-from maxtext.inference.kv_execution.step_view import StepView, build_step_view
+from maxtext.inference.kv_execution.pool_ops import poison_pages
+from maxtext.inference.kv_execution.step_view import StepView
 
 _DEFAULT_NAMESPACE = CacheNamespace()
 
@@ -174,10 +175,28 @@ class PagedDriver:
         pool_pages=layout.num_pages,
         max_batched_tokens=max_batched_tokens,
     )
+    # The driver owns *policy* -- the queue, the admission budget, recompute
+    # preemption, prefill before decode -- and delegates the per-step mechanics
+    # to the runtime. Reserve, scrub, build and bucket used to exist twice, once
+    # inline here and once as `PagedRuntime.prepare_step`, and that order is what
+    # enforces the dirty-page gate: scrub after reservation, because reservation
+    # decides what was recycled, and before the table, because the control plane
+    # refuses to describe a page it still thinks is dirty. A second copy of that
+    # order is a second place to get it wrong.
+    self.runtime = PagedRuntime(
+        control_plane=control_plane,
+        pool=pool,
+        planner=self.planner,
+        poison_on_free=self.poison_on_free,
+    )
     self._waiting: list[PagedRequest] = []
     self._live: list[PagedRequest] = []
     self._done: list[PagedRequest] = []
-    self.observed_shapes: set[StepShape] = set()
+
+  @property
+  def observed_shapes(self) -> set[StepShape]:
+    """Shapes traced so far. Recorded by the runtime, since it picks them."""
+    return self.runtime.observed_shapes
 
   @property
   def num_distinct_shapes(self) -> int:
@@ -297,8 +316,12 @@ class PagedDriver:
     batch = list(requests)
     lens = list(query_lens)
     preempted = 0
+    view = None
 
-    while batch and not self.plane.reserve([r.handle for r in batch], lens):
+    while batch:
+      view = self.runtime.prepare_step([r.handle for r in batch], lens, is_decode=is_decode)
+      if view is not None:
+        break
       if not is_decode:
         # A prefill batch was budgeted against the free pool, so a failure here
         # means the budget was wrong rather than that the pool is under pressure.
@@ -319,24 +342,7 @@ class PagedDriver:
           preempted=preempted,
       )
 
-    self._scrub_recycled_pages()
-
-    handles = [r.handle for r in batch]
-    table = self.plane.build_page_table(handles, lens)
-    max_seq_len = int(table.seq_lens.max()) if table.num_requests else 1
-    shape = (
-        self.planner.decode_shape(len(batch), max_seq_len)
-        if is_decode
-        else self.planner.extend_shape(sum(lens), max_seq_len)
-    )
-    self.observed_shapes.add(shape)
-
-    view = build_step_view(
-        table,
-        shape,
-        tokens_per_page=self.plane.layout.tokens_per_page,
-        padding_page_id=self.plane.layout.padding_page_id,
-    )
+    shape = view.shape
     next_tokens = np.asarray(self.step_fn(view, self.pool)).reshape(-1)
     if next_tokens.size < len(batch):
       raise ValueError(f"the step function returned {next_tokens.size} tokens for {len(batch)} requests")
@@ -349,23 +355,6 @@ class PagedDriver:
         num_tokens=sum(lens),
         preempted=preempted,
     )
-
-  def _scrub_recycled_pages(self) -> None:
-    """Zero every page this step recycled, then say so.
-
-    Both halves matter. Without the write a later read sees the previous
-    occupant's KV; without the confirmation the control plane refuses to build
-    the table, which is the mechanism that stops the write being forgotten.
-    """
-    pending = self.plane.pending_scrub()
-    if not pending.size:
-      return
-    # One dispatch for the whole pool rather than one per layer; see
-    # `scrub_pages_all_layers` for why that matters at real depth.
-    k_pages, v_pages = scrub_pages_all_layers(self.pool.k_pages, self.pool.v_pages, pending)
-    for layer, (k, v) in enumerate(zip(k_pages, v_pages)):
-      self.pool.replace_layer(layer, k, v)
-    self.plane.confirm_scrubbed(pending)
 
   def _preempt_newest(self, batch: list[PagedRequest]) -> None:
     """Return the newest request's pages to the pool and requeue it.
