@@ -79,9 +79,15 @@ class PagedInferenceWorker:
 
     self.engine = MaxEngine(self.config, self.devices)
     self.params = self.engine.load_params(params=params, rng=self.rng)
-    if self.eos_ids is None and self.tokenizer is None:
-      self.tokenizer = self.engine.build_tokenizer(self.engine.get_tokenizer())
+    if self.tokenizer is None:
+      self.tokenizer = self._build_tokenizer()
     if self.eos_ids is None:
+      if self.tokenizer is None:
+        raise ValueError(
+            "no tokenizer and no eos_ids: the worker cannot tell when a request has finished, so every "
+            "one would generate to its length cap. Pass eos_ids for a token-in, token-out caller, or a "
+            "tokenizer_path for text."
+        )
       self.eos_ids = [self.tokenizer.eos_id]
 
     self.runtime = self.engine.init_paged_runtime(
@@ -94,6 +100,47 @@ class PagedInferenceWorker:
         f"Paged inference worker ready: pool {self.runtime.pool.k_pages[0].shape}, "
         f"{self.max_batch} concurrent requests"
     )
+
+  def _build_tokenizer(self):
+    """A tokenizer for this config, without JetStream and without torch.
+
+    Order of preference, and each fallback is a real narrowing rather than a
+    stylistic one:
+
+    1. Nothing, when `eos_ids` was supplied and no `tokenizer_path` is set. A
+       token-in, token-out caller -- the benchmark harnesses, the parity tests --
+       needs no tokenizer at all, and building one would demand a path it has no
+       reason to have.
+    2. `hf_tokenizer.build_tokenizer`, which reads `tokenizer.json` through the
+       `tokenizers` package. No JetStream, and no torch, which matters because
+       `transformers` imports torch when it finds it and a second HIP runtime
+       aborts RCCL clique setup above one device.
+    3. `MaxEngine.build_tokenizer`, the JetStream route, only if asked for a
+       tokenizer type this cannot serve. It raises a clear message under
+       `DECOUPLE_GCLOUD=TRUE`, which is the honest outcome: that path genuinely
+       needs a package that was archived in February 2026.
+    """
+    path = getattr(self.config, "tokenizer_path", "") or ""
+    if not path:
+      return None
+
+    # `.value` first: `tokenizer_type` is a `TokenizerType` enum, whose `str()` is
+    # "TokenizerType.HUGGINGFACE" rather than "huggingface". Comparing the string
+    # form silently matched nothing and fell through to the JetStream branch.
+    declared = getattr(self.config, "tokenizer_type", "") or ""
+    tokenizer_type = str(getattr(declared, "value", declared)).lower()
+    if tokenizer_type in ("", "huggingface"):
+      # pylint: disable=import-outside-toplevel
+      from maxtext.inference import hf_tokenizer
+
+      eos = self.eos_ids[0] if self.eos_ids else None
+      return hf_tokenizer.build_tokenizer(path, eos_id=eos)
+
+    max_logging.log(
+        f"tokenizer_type={tokenizer_type!r} is not served by the torch-free loader; falling back to "
+        f"MaxEngine.build_tokenizer, which requires JetStream."
+    )
+    return self.engine.build_tokenizer(self.engine.get_tokenizer())
 
   def update_params(self, params: Any) -> None:
     """Update the model weights. The pool is unaffected and is not reallocated."""
