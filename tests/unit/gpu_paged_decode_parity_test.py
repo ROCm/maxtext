@@ -496,6 +496,87 @@ class GpuPagedDecodeParityTest(parameterized.TestCase):
     for handle in handles:
       engine.release(handle)
 
+  def test_offline_engine_selects_the_paged_worker_and_agrees_with_the_engine(self):
+    """`OfflineEngine.batch_inference` is the production entry point, so wire it.
+
+    Until the step seam existed there was no paged worker to select, and this is
+    the check that selecting one produces the same answer. Several prompts at
+    once, so it exercises the continuous batching that a single-request rollout
+    cannot: requests at different positions sharing one pool.
+
+    The reference is the engine's own paged entry points rather than the dense
+    worker, and that is a container limitation rather than a choice -- the dense
+    `_prefill_jit` returns a `ResultTokens` from inside `jit`, which has to be a
+    registered pytree, and the `DECOUPLE_GCLOUD` stub is a plain class. The parity
+    tests above already tie those entry points to dense, so agreement here is
+    transitive.
+    """
+    # pylint: disable=import-outside-toplevel
+    import jax.numpy as jnp
+
+    from maxtext.inference import offline_engine
+
+    prompts = [list(range(3, 15)), list(range(40, 48)), list(range(90, 106))]
+    cfg = _config(**_PAGED, return_log_prob=True)
+
+    # Reference: one request at a time through the entry points.
+    reference = {}
+    engine = maxengine.MaxEngine(cfg, _devices())
+    params_state = self._build_params(cfg)
+    params = engine.load_params(params=params_state)
+    engine.init_paged_runtime(max_requests=4, max_batched_tokens=cfg.max_prefill_predict_length)
+    budget = cfg.max_target_length - cfg.max_prefill_predict_length
+    for index, prompt in enumerate(prompts):
+      padded = jnp.asarray(
+          list(prompt) + [0] * (cfg.max_prefill_predict_length - len(prompt)), jnp.int32
+      )
+      handle, first = engine.prefill_paged(
+          params=params, padded_tokens=padded, true_length=len(prompt), request_id=f"ref{index}"
+      )
+      self.assertIsNotNone(handle)
+      tokens = [int(first.data[0, 0])]
+      for _ in range(min(budget, cfg.paged_max_context_len - len(prompt)) - 1):
+        result, ok = engine.generate_paged(
+            params, [handle], next_tokens=jnp.asarray([tokens[-1]], jnp.int32)
+        )
+        if not ok:
+          break
+        tokens.append(int(result.data[0, 0]))
+      engine.release(handle)
+      reference[f"p{index}"] = tokens
+
+    # Through OfflineEngine, which must pick the paged worker off the attention
+    # setting. `eos_ids` is supplied so no tokenizer is needed -- these prompts are
+    # token ids, and a tokenizer would need JetStream.
+    offline = offline_engine.OfflineEngine(
+        config=cfg, params=params_state, tokenizer=object(), eos_ids=[-1]
+    )
+    self.assertEqual(
+        type(offline.worker).__name__,
+        "PagedInferenceWorker",
+        "attention='gpu_paged' must select the paged worker",
+    )
+    outputs = offline.batch_inference(
+        [
+            offline_engine.InputData(id=f"p{i}", tokens=np.asarray(p, np.int32), true_length=len(p))
+            for i, p in enumerate(prompts)
+        ]
+    )
+
+    self.assertEqual(len(outputs), len(prompts))
+    for out in outputs:
+      expected = reference[out.index]
+      actual = np.asarray(out.token_ids).tolist()
+      self._assert_same_tokens(expected[: len(actual)], actual[: len(expected)], f"{out.index}")
+      # Logprobs are part of the contract and `_validate_config` insists on them,
+      # so an empty array would satisfy the token check and still be wrong.
+      self.assertEqual(
+          np.asarray(out.logprobs).size,
+          len(actual),
+          "one log probability per returned token",
+      )
+      self.assertEqual(out.prompt_length, len(prompts[int(out.index[1:])]))
+
   def test_the_paged_path_allocates_no_dense_cache(self):
     """A dense cache alongside the pool would waste gigabytes at real sizes."""
     cfg = _config(**_PAGED)
