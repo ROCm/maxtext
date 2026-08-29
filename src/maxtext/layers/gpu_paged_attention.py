@@ -241,7 +241,21 @@ def paged_attention_step(query, key, value, k_pool, v_pool, plan, *, backend="au
   return out, [k_pool, v_pool]
 
 
-def kv_head_axes(mesh: Any, candidates: tuple[str, ...] = ("tensor", "tensor_transpose", "tensor_sequence")):
+KV_HEAD_MESH_AXES = (
+    # MaxText's own mesh, as named in configs/base.yml.
+    "tensor",
+    "tensor_transpose",
+    "tensor_sequence",
+    # The vLLM serving mesh, as named in configs/inference/vllm.yml, whose
+    # logical rules map `paged_kv_heads` onto ['expert', 'model']. The two
+    # namings are disjoint, so accepting both cannot mis-detect either: a mesh
+    # carrying 'model' never carries 'tensor'.
+    "model",
+    "expert",
+)
+
+
+def kv_head_axes(mesh: Any, candidates: tuple[str, ...] = KV_HEAD_MESH_AXES):
   """The mesh axes that actually shard KV heads, or () when nothing does."""
   if mesh is None:
     return ()

@@ -29,8 +29,14 @@ import numpy as np
 from maxtext.inference.kv_common import KvStorageLayoutV1
 
 # MaxText spells the KV-head tensor-parallel axes several ways depending on the
-# model; these are the ones that shard `num_kv_heads`.
-_KV_HEAD_MESH_AXES = ("tensor", "tensor_transpose", "tensor_sequence")
+# model; these are the ones that shard `num_kv_heads`. The last two belong to the
+# vLLM serving mesh rather than MaxText's own, and the two namings are disjoint,
+# so accepting both cannot mis-detect either. Kept in step with
+# `gpu_paged_attention.KV_HEAD_MESH_AXES`, which the kernels read; a pool sharded
+# on axes the attention step does not know about would be silently wrong. Stated
+# literally rather than imported because this module is deliberately jax-free at
+# import time and that one is not.
+_KV_HEAD_MESH_AXES = ("tensor", "tensor_transpose", "tensor_sequence", "model", "expert")
 
 # Axis names for the pool's own mesh. Deliberately not MaxText's: the pool needs
 # the tensor-parallel axis split into the part that selects a KV head and the
