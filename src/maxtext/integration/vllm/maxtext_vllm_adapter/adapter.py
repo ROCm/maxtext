@@ -61,6 +61,38 @@ def next_power_of_two(x: int) -> int:
   return 1 << (x - 1).bit_length()
 
 
+def tpu_num_lanes() -> int | None:
+  """The TPU's vector lane count, or None when this process has no TPU.
+
+  Only the GMM_v2 padding below needs it, and that kernel is TPU-only, so a
+  non-TPU platform driving this adapter wants the padding skipped rather than
+  an exception. `get_tpu_info` raises on any other device kind.
+  """
+  try:
+    return pltpu.get_tpu_info().num_lanes
+  except (ValueError, RuntimeError, AttributeError):
+    return None
+
+
+def vllm_sharding_degrees(vllm_config: VllmConfig) -> tuple[int, int, int]:
+  """Tensor, expert and attention-data parallel degrees, as (tp, ep, attn_dp).
+
+  `sharding_config` is attached to the vLLM config by the TPU platform plugin
+  rather than by vLLM itself, so it is absent under any other platform. Those
+  fall back to `parallel_config`, which vLLM always populates.
+  """
+  sharding_config = getattr(vllm_config, "sharding_config", None)
+  if sharding_config is not None:
+    return (sharding_config.tp_size, sharding_config.expert_size, sharding_config.attn_dp_size)
+
+  parallel_config = vllm_config.parallel_config
+  return (
+      parallel_config.tensor_parallel_size,
+      getattr(parallel_config, "expert_parallel_size", 1) or 1,
+      1,
+  )
+
+
 def generate_maxtext_config(vllm_config: VllmConfig) -> pyconfig.HyperParameters:
   """Generates a MaxText configuration from a vLLM configuration.
 
@@ -99,10 +131,7 @@ def generate_maxtext_config(vllm_config: VllmConfig) -> pyconfig.HyperParameters
   argv_list = ["", str(base_config_path)]
 
   # Gather sharding information from vLLM config to determine transformations to apply
-  sharding_config = vllm_config.sharding_config
-  tp = sharding_config.tp_size
-  ep = sharding_config.expert_size
-  attn_dp = sharding_config.attn_dp_size
+  tp, ep, attn_dp = vllm_sharding_degrees(vllm_config)
 
   # Calculate the maximum TP size across attention and MLP dimensions
   kv_tp_size = tp * ep
@@ -116,7 +145,7 @@ def generate_maxtext_config(vllm_config: VllmConfig) -> pyconfig.HyperParameters
       else vllm_config.model_config.hf_config
   )
   hidden_size = getattr(hf_config, "moe_intermediate_size", None)
-  num_lanes = pltpu.get_tpu_info().num_lanes
+  num_lanes = tpu_num_lanes()
   num_kv_heads = hf_config.num_key_value_heads
 
   # Number of KV heads in global attention layers (None if the field is absent or unset).
@@ -147,7 +176,7 @@ def generate_maxtext_config(vllm_config: VllmConfig) -> pyconfig.HyperParameters
   # The GMM_v2 kernel requires the MLP dimension per expert to be at least 2x the number of TPU lanes
   # to ensure efficient execution. See the validate_inputs() method in the following file for more details:
   # https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/megablox/gmm_v2.py
-  if hidden_size is not None and (hidden_size // moe_mlp_tp_size) % (2 * num_lanes) != 0:
+  if num_lanes is not None and hidden_size is not None and (hidden_size // moe_mlp_tp_size) % (2 * num_lanes) != 0:
     padded_hidden_size = next_power_of_two(hidden_size)
     while (padded_hidden_size // moe_mlp_tp_size) < (2 * num_lanes):
       padded_hidden_size = next_power_of_two(padded_hidden_size + 1)

@@ -107,6 +107,7 @@ def validate_attention_kernel(s: str) -> None:
       "cudnn_flash_jax",
       "vllm_rpa",
       "vllm_batched_rpa",
+      "gpu_paged",
   )
   if s not in valid_attention_kernels:  # currently supported attention
     raise ValueError("Invalid attention kernel was passed. Valid options ", valid_attention_kernels)

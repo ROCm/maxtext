@@ -446,7 +446,11 @@ class MaxTextGenerator:
           stream.finished = True
           if is_eos or stop_sequence_found:
             stream.finish_reason = "stop"
-          if getattr(self.config, "attention", "") == "paged":
+          # "paged" is the vestigial value that never allocated a pool; "gpu_paged"
+          # is the one that does. Both are listed rather than the guard being
+          # replaced, because release_pages is a no-op without a paged runtime and
+          # dropping "paged" here would be a behaviour change unrelated to this work.
+          if getattr(self.config, "attention", "") in ("paged", "gpu_paged"):
             self.engine.release_pages(slot=slot_idx)
 
     return decode_state

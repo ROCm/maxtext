@@ -440,7 +440,7 @@ class Attention(nnx.Module):
         self.init_kv_caches(inputs_kv_shape=inputs_kv_shape)
         if self.model_mode != MODEL_MODE_TRAIN
         and base_kv_cache
-        and config.attention not in ("vllm_rpa", "vllm_batched_rpa")
+        and config.attention not in ("vllm_rpa", "vllm_batched_rpa", "gpu_paged")
         else None
     )
 
@@ -1180,6 +1180,82 @@ class Attention(nnx.Module):
     )
     return output, kv_cache
 
+  def forward_serve_gpu_paged(
+      self,
+      query: Array,
+      key: Array,
+      value: Array,
+      kv_pools: list[Array] | None = None,
+      metadata: Any = None,
+  ) -> tuple[Array, list[Array]]:
+    """Forward function for paged serving on GPU.
+
+    `kv_pools` is `[k_pool, v_pool]`, each NHD
+    `[num_pages, tokens_per_page, num_kv_heads, head_dim]`. The step writes this
+    token's K/V into the pool and then attends over it, so prefill and decode
+    read exactly the pages append wrote.
+
+    Everything vendor-specific lives in `gpu_paged_attention`; this method only
+    flattens to the ragged layout and hands over.
+    """
+    # pylint: disable=import-outside-toplevel
+    from maxtext.layers import gpu_paged_attention
+
+    query = query.reshape(-1, query.shape[2], query.shape[3]).astype(self.dtype)
+    key = key.reshape(-1, key.shape[2], key.shape[3]).astype(self.dtype)
+    value = value.reshape(-1, value.shape[2], value.shape[3]).astype(self.dtype)
+
+    if not kv_pools or metadata is None:
+      # Dry run: model initialization and JIT tracing reach here with nothing to
+      # attend over. Mirrors forward_serve_vllm; without it, init breaks rather
+      # than inference, which is a confusing way to fail.
+      return query, []
+
+    k_pool, v_pool = kv_pools[0], kv_pools[1]
+    plan = gpu_paged_attention.build_plan(
+        metadata,
+        tokens_per_page=k_pool.shape[1],
+        total_tokens=query.shape[0],
+        max_seqlen_k=self.max_target_length,
+    )
+    # `scale=1.0`, not 1/sqrt(head_dim). MaxText folds the depth scaling into the
+    # query projection's initializer (see `depth_scaling` in the kernel init) and
+    # applies `query_pre_attn_scalar` above, so the query arriving here is already
+    # scaled. forward_serve_vllm passes 1.0 for the same reason; letting the
+    # kernel apply its own default would scale twice.
+    #
+    # Built once and shared by both branches deliberately. Spelled out separately
+    # they drifted: the sharded branch omitted the scale, so every tensor-parallel
+    # run scaled the query a second time by 1/sqrt(head_dim), flattening the
+    # softmax towards uniform. That is a wrong answer rather than a crash, identical
+    # at every TP width because it has nothing to do with sharding, and no
+    # comparison of the sharded step against the single-device step can see it,
+    # because such a test passes the same scale to both sides. One dict is what
+    # makes the two paths structurally unable to disagree.
+    kernel_kwargs = dict(
+        backend=getattr(self.config, "paged_attention_backend", "auto"),
+        scale=1.0,
+        causal=True,
+    )
+    axes = gpu_paged_attention.kv_head_axes(self.mesh)
+    if axes:
+      # Tensor parallelism: the kernels have to run in manual mode, because XLA
+      # cannot partition the FFI call they go through.
+      return gpu_paged_attention.paged_attention_step_sharded(
+          query,
+          key,
+          value,
+          k_pool,
+          v_pool,
+          plan,
+          mesh=self.mesh,
+          axes=axes if len(axes) > 1 else axes[0],
+          **kernel_kwargs,
+      )
+    return gpu_paged_attention.paged_attention_step(
+        query, key, value, k_pool, v_pool, plan, **kernel_kwargs
+    )
+
   def __call__(
       self,
       inputs_q: Array,
@@ -1330,6 +1406,14 @@ class Attention(nnx.Module):
       batch, seq_len, num_heads, head_dim = query.shape
       attn_out, updated_kv = self.forward_serve_vllm(
           query, key, value, rpa_kv_cache=kv_cache, rpa_metadata=attention_metadata
+      )
+      out = attn_out.reshape(batch, seq_len, num_heads, head_dim)
+      kv_cache = updated_kv
+
+    elif self.config.attention == "gpu_paged" and model_mode != MODEL_MODE_TRAIN:
+      batch, seq_len, num_heads, head_dim = query.shape
+      attn_out, updated_kv = self.forward_serve_gpu_paged(
+          query, key, value, kv_pools=kv_cache, metadata=attention_metadata
       )
       out = attn_out.reshape(batch, seq_len, num_heads, head_dim)
       kv_cache = updated_kv

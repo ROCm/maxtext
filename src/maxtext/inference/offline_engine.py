@@ -54,8 +54,11 @@ from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 
 from maxtext.inference.maxengine.maxengine import MaxEngine
-from maxtext.input_pipeline.packing.prefill_packing import PrefillProcessor
-from maxtext.input_pipeline.packing.prefill_packing import BatchedPrefillProcessor
+# `prefill_packing` is imported lazily, inside `PrefillHelper`, because it is a
+# dense-path concern that hard-refuses to import without JetStream. Importing it
+# here made the whole module unimportable in a paged-only deployment -- including
+# the paged worker, which needs none of it -- so the paged path could not be
+# reached at all under `DECOUPLE_GCLOUD=TRUE`.
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 
@@ -159,6 +162,13 @@ class PrefillHelper:
         batch_prefill_max_batch_size: Maximum number of prompts in one packed
             sequence for batch prefill
     """
+    # Imported here rather than at module scope: this refuses to import without
+    # JetStream, and a paged deployment needs none of it. At module scope it made
+    # `offline_engine` unimportable in a paged-only container, which took the
+    # paged worker down with it.
+    # pylint: disable=import-outside-toplevel
+    from maxtext.input_pipeline.packing.prefill_packing import BatchedPrefillProcessor, PrefillProcessor
+
     self._type = prefill_type
     self.engine = engine
     self.prefill_lengths = sorted(prefill_lengths)
@@ -810,21 +820,43 @@ class OfflineEngine:
     if not self.mesh:
       self.mesh = OfflineEngine.create_mesh(jax.devices(), self.config)
 
-    self.worker = InferenceWorker(
-        config=self.config,
-        params=self.params,
-        min_decode_steps=self.min_decode_steps,
-        enable_batch_prefill=self.enable_batch_prefill,
-        mesh=self.mesh,
-        devices=self.mesh.devices.flatten(),
-        tokenizer=self.tokenizer,
-        eos_ids=self.eos_ids,
-        prefill_lengths=self.prefill_lengths,
-        max_decode_length=self.max_decode_length,
-        batch_prefill_max_batch_size=self.batch_prefill_max_batch_size,
-        rng=self.rng,
-        debug=self.debug,
-    )
+    if self.config.attention == "gpu_paged":
+      # A separate worker rather than a flag on the dense one, because the two are
+      # organised around different notions of ownership: a decode *slot* fixed for
+      # a request's lifetime, against a varying set of pages. Scheduling is
+      # delegated to `PagedDriver`, which already owns admission, reservation,
+      # recycled-page scrubbing and recompute preemption.
+      # pylint: disable=import-outside-toplevel
+      from maxtext.inference.paged_offline_worker import PagedInferenceWorker
+
+      self.worker = PagedInferenceWorker(
+          config=self.config,
+          params=self.params,
+          devices=self.mesh.devices.flatten(),
+          tokenizer=self.tokenizer,
+          eos_ids=self.eos_ids,
+          max_decode_length=self.max_decode_length,
+          max_batched_tokens=self.max_prefill_length,
+          rng=self.rng,
+          mesh=self.mesh,
+          debug=self.debug,
+      )
+    else:
+      self.worker = InferenceWorker(
+          config=self.config,
+          params=self.params,
+          min_decode_steps=self.min_decode_steps,
+          enable_batch_prefill=self.enable_batch_prefill,
+          mesh=self.mesh,
+          devices=self.mesh.devices.flatten(),
+          tokenizer=self.tokenizer,
+          eos_ids=self.eos_ids,
+          prefill_lengths=self.prefill_lengths,
+          max_decode_length=self.max_decode_length,
+          batch_prefill_max_batch_size=self.batch_prefill_max_batch_size,
+          rng=self.rng,
+          debug=self.debug,
+      )
 
     self.tokenizer = self.worker.tokenizer
 
