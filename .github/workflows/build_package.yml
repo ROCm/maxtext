@@ -36,7 +36,8 @@ permissions:
 jobs:
   build_and_upload:
     name: Build Wheel
-    runs-on: linux-x86-n4-16-buildkit
+    # The ROCm fork (vars.ROCM_ONLY) has no Google runners.
+    runs-on: ${{ vars.ROCM_ONLY == 'true' && 'amd-do-linux.jax.gpu.gfx950.4' || 'linux-x86-n4-16-buildkit' }}
     timeout-minutes: 15
     container: python:3.12-slim-trixie
     outputs:
