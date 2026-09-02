@@ -1,0 +1,41 @@
+# ROCm fork: tests without a hardware marker (upstream auto-marks them cpu_only) that fail on ROCm without
+# testing GPU functionality. On ROCm, tests/conftest.py marks these auto_cpu_only instead of running them,
+# and the rocm flavors in run_tests_coordinator.yml select `not auto_cpu_only`. Every other unmarked test
+# runs on ROCm. Tests marked cpu_only explicitly never run there, so they don't belong in this list.
+#
+# One node ID per line: a file, a class, or a single test (parameterized cases match by prefix).
+# Text after `#` is the reason. Drop an entry once the cause is fixed upstream.
+
+# Asserts JAX wrote a persistent cache entry, but JAX skips compilations faster than
+# jax_persistent_cache_min_compile_time_secs (1s) and this host compiles the deliberately tiny model in
+# ~0.7s. It runs its subprocess under JAX_PLATFORMS=cpu, so it covers no ROCm code.
+tests/unit/compile_cache_test.py::test_train_step_cache_hit
+
+# Asserts the CPU device has no slice_index; GPU devices have one, and _count_slices is right on them.
+tests/unit/m3/sharding_test.py::CountSlicesTest::test_devices_without_the_attribute_count_as_one_slice
+
+# Builds an nnx.Linear with param_dtype=float8_e4m3fn just for its param shapes; Flax's initializer runs
+# truncated_normal in fp8, which has no erf lowering on GPU. The test is about checkpoint loading.
+tests/unit/checkpointing_test.py::FP8DequantizeOnLoadTest::test_load_fp8_checkpoint_into_fp8_nnx_model
+
+# Splash (a TPU kernel) mask construction and validation; the decoupled lock's tokamax 0.0.12 lacks the
+# SplashConfig options attention_op.py passes (AI-Hypercomputer/maxtext#5983).
+tests/unit/attention_test.py::HCAStaticMaskTest::test_compressed_flash_missing_or_invalid_compress_ratio_raises
+tests/unit/attention_test.py::HCAStaticMaskTest::test_csa_flash_requires_indexer_mask
+tests/unit/attention_test.py::HCAStaticMaskTest::test_hca_flash_constructs_hcastaticmask
+
+# Checks that named Splash residuals let the remat policy skip recomputation (structure); same tokamax pin.
+tests/unit/cp_halo_attention_test.py::CpHaloAttentionTest::test_residual_checkpoint_name_enables_context_remat_policy
+
+# Scan-vs-unroll and scanned-vs-external-KV equivalence at CPU-tuned tolerances (1e-5); on GPU one element
+# in hundreds lands ~1.2e-5 away, which is float reassociation, not a GPU bug.
+tests/unit/nnx_decoders_test.py::TestQwen3_5ScannableBlock::test_nested_scan_matches_sequential_unroll
+tests/unit/nnx_decoders_test.py::TestQwen3NextScannableBlock::test_nested_scan_matches_sequential_unroll
+tests/unit/nnx_decoders_test.py::TestNNXDecoderDeepseekAndGemma4::test_gemma4_block_external_kv_cache_matches_scanned_path
+
+# Runs its 8-device check in a JAX_PLATFORMS=cpu subprocess but compares against a loss the parent computed
+# on the GPU (0.16% apart).
+tests/unit/m3/granitemoe_test.py::GraniteMoeConformanceTest::test_check8_multi_mesh_zero_expert_all_gather_and_8dev_compound_parity
+
+# Self-test of the conformance checker (it must catch an injected mismatch); not GPU functionality.
+tests/unit/m3/conformance/conformance_test.py::ConformanceTest::test_check_8_negative_detection

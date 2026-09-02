@@ -148,6 +148,33 @@ def _has_tpu_backend_support() -> bool:
     return False
 
 
+def _is_rocm_backend(devices) -> bool:
+  """Whether the accelerator is ROCm. `device.platform` is "gpu" for CUDA and ROCm alike."""
+  try:
+    return any("rocm" in (d.client.platform_version or "").lower() for d in devices)
+  except Exception:  # pragma: no cover  pylint: disable=broad-exception-caught
+    return False
+
+
+def _on_rocm_backend() -> bool:
+  """Whether this pytest process runs on a ROCm accelerator."""
+  try:
+    return _is_rocm_backend(jax.devices())
+  except Exception:  # pragma: no cover  pylint: disable=broad-exception-caught
+    return False
+
+
+def _load_rocm_auto_cpu_only() -> tuple[str, ...]:
+  """Returns the node IDs listed in tests/rocm_auto_cpu_only.txt; text after `#` is a comment."""
+  path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rocm_auto_cpu_only.txt")
+  try:
+    with open(path, encoding="utf-8") as f:
+      entries = (line.split("#", 1)[0].strip() for line in f)
+      return tuple(entry for entry in entries if entry)
+  except OSError:
+    return ()
+
+
 def pytest_collection_modifyitems(config, items):
   """Customize pytest collection behavior.
 
@@ -203,10 +230,17 @@ def pytest_collection_modifyitems(config, items):
       item.add_marker(pytest.mark.decoupled)
 
   # Auto-mark remaining tests as cpu_only unless explicitly marked with hardware target markers.
+  # On ROCm, which has no cpu-unit job to hand them to, they stay unmarked and run, except the ones
+  # listed in tests/rocm_auto_cpu_only.txt, which are marked auto_cpu_only instead.
+  on_rocm = _on_rocm_backend()
+  rocm_auto_cpu_only = _load_rocm_auto_cpu_only() if on_rocm else ()
   for item in remaining:
     cur_test_markers = {m.name for m in item.iter_markers()}
     if cur_test_markers.isdisjoint(HARDWARE_MARKERS):
-      item.add_marker(pytest.mark.cpu_only)
+      if not on_rocm:
+        item.add_marker(pytest.mark.cpu_only)
+      elif any(item.nodeid == p or item.nodeid.startswith((p + "::", p + "[")) for p in rocm_auto_cpu_only):
+        item.add_marker(pytest.mark.auto_cpu_only)
 
 
 def pytest_addoption(parser):
@@ -220,6 +254,7 @@ def pytest_configure(config):
       "gpu_only: tests that require GPU hardware",
       "tpu_only: tests that require TPU hardware",
       "cpu_only: tests that require CPU-only environment (skipped on active accelerator hardware)",
+      "auto_cpu_only: ROCm only; unmarked tests listed in tests/rocm_auto_cpu_only.txt (skipped there)",
       "tpu_backend: tests that require a TPU-enabled JAX install (TPU PJRT plugin), but not TPU hardware",
       "external_serving: JetStream / serving / decode server components",
       "external_training: goodput integrations",
@@ -309,6 +344,13 @@ def handle_cpu_only(request):
       has_accelerator = False
     if has_accelerator:
       pytest.skip("Skipped: cpu_only test bypassed on hardware accelerator testbeds")
+
+
+@pytest.fixture(autouse=True)
+def handle_auto_cpu_only(request):
+  """Skips the tests that tests/rocm_auto_cpu_only.txt lists; the marker is only applied on ROCm."""
+  if request.node.get_closest_marker("auto_cpu_only"):
+    pytest.skip("Skipped on ROCm: listed in tests/rocm_auto_cpu_only.txt")
 
 
 @pytest.fixture(autouse=True)
