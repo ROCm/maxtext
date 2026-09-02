@@ -145,6 +145,14 @@ def _has_tpu_backend_support() -> bool:
     return False
 
 
+def _is_rocm_backend(devices) -> bool:
+  """Whether the accelerator is ROCm. `device.platform` is "gpu" for CUDA and ROCm alike."""
+  try:
+    return any("rocm" in (d.client.platform_version or "").lower() for d in devices)
+  except Exception:  # pragma: no cover  pylint: disable=broad-exception-caught
+    return False
+
+
 def pytest_collection_modifyitems(config, items):
   """Customize pytest collection behavior.
 
@@ -257,10 +265,17 @@ def handle_cpu_only(request):
   """Dynamically skip cpu_only tests on TPU or GPU hardware."""
   if request.node.get_closest_marker("cpu_only"):
     try:
-      has_accelerator = any(d.platform in ("tpu", "gpu") for d in jax.devices())
+      devices = jax.devices()
+      has_accelerator = any(d.platform in ("tpu", "gpu") for d in devices)
+      # These tests are hardware-agnostic; skipping them on an accelerator only moves them to the
+      # CPU job that runs them instead. A ROCm-only pipeline has no such job, so skipping here
+      # would drop them altogether, and running them against the ROCm backend is what catches
+      # backend regressions in ordinary model code.
+      is_rocm = _is_rocm_backend(devices)
     except Exception:  # pylint: disable=broad-exception-caught
       has_accelerator = False
-    if has_accelerator:
+      is_rocm = False
+    if has_accelerator and not is_rocm:
       pytest.skip("Skipped: cpu_only test bypassed on hardware accelerator testbeds")
 
 
