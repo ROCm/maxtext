@@ -43,12 +43,18 @@ on:
       GEMINI_API_KEY:
         required: false
   workflow_dispatch:
+    inputs:
+      rocm_only:
+        description: 'Run only ROCm jobs (manual runs only)'
+        type: boolean
+        required: false
+        default: false
   schedule:
-    # Run the job every 4 hours
-    - cron:  '0 */4 * * *'
+    - cron: '0 3 * * *'  # Daily 03:00 UTC
 
 concurrency:
-  # Dedup pull requests (canceling previous runs of the same workflow for same PR) and queue overlapping scheduled runs.
+  # Dedup pull requests (canceling previous runs of the same workflow for same PR) and queue overlapping scheduled runs;
+  # manual runs are deduped per (branch + actor).
   # A run triggered by adding or removing an unrelated label (any label other than `scheduled-only` and
   # `skip-ci-tests`, the labels that the entry jobs accept) gets its own group, so it never cancels a test
   # run in progress.
@@ -59,6 +65,7 @@ concurrency:
           github.event.label.name == 'scheduled-only' || github.event.label.name == 'skip-ci-tests') &&
         format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) ||
       github.event_name == 'schedule' && format('{0}-schedule', github.workflow) ||
+      github.event_name == 'workflow_dispatch' && format('{0}-manual-{1}-{2}', github.workflow, github.ref, github.actor) ||
       github.run_id
     }}
   cancel-in-progress: ${{ github.event_name != 'schedule' }}
@@ -172,10 +179,10 @@ jobs:
   build_and_upload_maxtext_package:
     name: Build MaxText Package
     needs: [analyze_code_changes, code_quality_check, docs_build_check, dev_tests]
-    # Run if either tests or notebooks need to run; on PRs, gate on code quality, docs, and dev tests passing
+    # Run if either tests or notebooks need to run (or ROCM_ONLY); on PRs, gate on code quality, docs, and dev tests passing
     if: |
       !cancelled() &&
-      (needs.analyze_code_changes.outputs.run_tests == 'true' || needs.analyze_code_changes.outputs.run_notebooks == 'true') &&
+      (vars.ROCM_ONLY == 'true' || needs.analyze_code_changes.outputs.run_tests == 'true' || needs.analyze_code_changes.outputs.run_notebooks == 'true') &&
       (github.event_name != 'pull_request' || (
         needs.code_quality_check.result == 'success' &&
         needs.docs_build_check.result == 'success' &&
@@ -194,7 +201,8 @@ jobs:
       needs.analyze_code_changes.outputs.run_heavy_tests == 'true' &&
       needs.build_and_upload_maxtext_package.result == 'success' &&
       (github.event_name != 'pull_request' ||
-        (github.event.pull_request.head.repo.fork == false && github.actor != 'dependabot[bot]'))
+        (github.event.pull_request.head.repo.fork == false && github.actor != 'dependabot[bot]')) &&
+      vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only)
     uses: ./.github/workflows/run_jupyter_notebooks.yml
     strategy:
         fail-fast: false
@@ -239,7 +247,8 @@ jobs:
       !cancelled() &&
       needs.gate_test_run.result == 'success' &&
       needs.analyze_code_changes.outputs.run_pretrain_tests == 'true' &&
-      needs.analyze_code_changes.outputs.run_heavy_tests == 'true'
+      needs.analyze_code_changes.outputs.run_heavy_tests == 'true' &&
+      vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only)
     uses: ./.github/workflows/run_tests_coordinator.yml
     strategy:
       fail-fast: false
@@ -258,7 +267,8 @@ jobs:
       !cancelled() &&
       needs.gate_test_run.result == 'success' &&
       needs.analyze_code_changes.outputs.run_posttrain_tests == 'true' &&
-      needs.analyze_code_changes.outputs.run_heavy_tests == 'true'
+      needs.analyze_code_changes.outputs.run_heavy_tests == 'true' &&
+      vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only)
     uses: ./.github/workflows/run_tests_coordinator.yml
     strategy:
       fail-fast: false
@@ -270,7 +280,6 @@ jobs:
       is_scheduled_run: ${{ github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'scheduled-only') }}
       maxtext_sha: ${{ needs.gate_test_run.outputs.maxtext_sha }}
 
-
   tpu7x-tests:
     name: TPU7X Tests
     needs: [gate_test_run, analyze_code_changes]
@@ -279,7 +288,8 @@ jobs:
       needs.gate_test_run.result == 'success' &&
       needs.analyze_code_changes.outputs.run_heavy_tests == 'true' &&
       (github.event_name != 'pull_request' ||
-        contains(github.event.pull_request.labels.*.name, 'scheduled-only'))
+        contains(github.event.pull_request.labels.*.name, 'scheduled-only')) &&
+      vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only)
     uses: ./.github/workflows/run_tests_coordinator.yml
     strategy:
       fail-fast: false
@@ -298,7 +308,8 @@ jobs:
       !cancelled() &&
       needs.gate_test_run.result == 'success' &&
       needs.analyze_code_changes.outputs.run_gpu_tests == 'true' &&
-      needs.analyze_code_changes.outputs.run_heavy_tests == 'true'
+      needs.analyze_code_changes.outputs.run_heavy_tests == 'true' &&
+      vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only)
     strategy:
       fail-fast: false
       matrix:
@@ -316,7 +327,8 @@ jobs:
     if: |
       !cancelled() &&
       needs.gate_test_run.result == 'success' &&
-      needs.analyze_code_changes.outputs.run_pretrain_tests == 'true'
+      needs.analyze_code_changes.outputs.run_pretrain_tests == 'true' &&
+      vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only)
     uses: ./.github/workflows/run_tests_coordinator.yml
     strategy:
       fail-fast: false
@@ -334,7 +346,8 @@ jobs:
     if: |
       !cancelled() &&
       needs.gate_test_run.result == 'success' &&
-      needs.analyze_code_changes.outputs.run_posttrain_tests == 'true'
+      needs.analyze_code_changes.outputs.run_posttrain_tests == 'true' &&
+      vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only)
     uses: ./.github/workflows/run_tests_coordinator.yml
     strategy:
       fail-fast: false
@@ -353,7 +366,8 @@ jobs:
       !cancelled() &&
       needs.gate_test_run.result == 'success' &&
       needs.analyze_code_changes.outputs.run_pathways_tests == 'true' &&
-      needs.analyze_code_changes.outputs.run_heavy_tests == 'true'
+      needs.analyze_code_changes.outputs.run_heavy_tests == 'true' &&
+      vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only)
     uses: ./.github/workflows/run_pathways_tests.yml
     strategy:
         fail-fast: false
@@ -381,7 +395,8 @@ jobs:
       !cancelled() &&
       needs.gate_test_run.result == 'success' &&
       needs.analyze_code_changes.outputs.run_pathways_tests == 'true' &&
-      needs.analyze_code_changes.outputs.run_heavy_tests == 'true'
+      needs.analyze_code_changes.outputs.run_heavy_tests == 'true' &&
+      vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only)
     uses: ./.github/workflows/run_pathways_tests.yml
     strategy:
         fail-fast: false
@@ -398,12 +413,48 @@ jobs:
       is_scheduled_run: ${{ github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'scheduled-only') }}
       maxtext_sha: ${{ needs.gate_test_run.outputs.maxtext_sha }}
 
+  rocm-tests:
+    name: rocm-unit tests
+    needs: [analyze_code_changes, build_and_upload_maxtext_package]
+    if: |
+      !cancelled() &&
+      needs.build_and_upload_maxtext_package.result == 'success' &&
+      vars.ROCM_ONLY != 'true' && needs.analyze_code_changes.outputs.run_tests == 'true'
+    uses: ./.github/workflows/run_tests_coordinator.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [rocm-unit]
+    with:
+      flavor: ${{ matrix.flavor }}
+      base_image: 'rocm-placeholder'
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
+  rocm-decoupled-tests:
+    name: rocm-decoupled tests
+    needs: [analyze_code_changes, build_and_upload_maxtext_package]
+    if: |
+      !cancelled() &&
+      needs.build_and_upload_maxtext_package.result == 'success' &&
+      (vars.ROCM_ONLY == 'true' || (github.event_name == 'workflow_dispatch' && inputs.rocm_only) || needs.analyze_code_changes.outputs.run_tests == 'true')
+    uses: ./.github/workflows/run_tests_coordinator.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [rocm-decoupled]
+    with:
+      flavor: ${{ matrix.flavor }}
+      base_image: 'rocm-placeholder'
+      is_scheduled_run: ${{ github.event_name == 'schedule' }}
+      maxtext_sha: ${{ needs.build_and_upload_maxtext_package.outputs.maxtext_sha }}
+
   all_tests_passed:
     # auto_label_pr.yml and Copybara match this check name; Copybara imports a "pull ready" PR once any run of it
     # passed on the PR's head commit. The check below matches the names of this job and of the Code Quality job in
     # this workflow's runs; keep them in sync.
     name: All Required Tests Passed
-    needs: [analyze_code_changes, build_and_upload_maxtext_package, dev_tests, gate_test_run, tpu-pretrain-tests, tpu-posttrain-tests, tpu7x-tests, gpu-tests, cpu-pretrain-tests, cpu-posttrain-tests, maxtext_tpu_pathways_unit_tests, maxtext_tpu_pathways_integration_tests, code_quality_check, docs_build_check]
+    needs: [analyze_code_changes, build_and_upload_maxtext_package, dev_tests, gate_test_run, tpu-pretrain-tests, tpu-posttrain-tests, tpu7x-tests, gpu-tests, cpu-pretrain-tests, cpu-posttrain-tests, maxtext_tpu_pathways_unit_tests, maxtext_tpu_pathways_integration_tests, rocm-tests, rocm-decoupled-tests, code_quality_check, docs_build_check]
     if: always()  # must fail, not skip, on cancel: skipped required checks count as passing
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -428,6 +479,8 @@ jobs:
           echo "CPU Posttrain Tests result: ${NEEDS_CPU_POSTTRAIN_TESTS_RESULT}"
           echo "Pathways Unit result: ${NEEDS_MAXTEXT_TPU_PATHWAYS_UNIT_TESTS_RESULT}"
           echo "Pathways Integration result: ${NEEDS_MAXTEXT_TPU_PATHWAYS_INTEGRATION_TESTS_RESULT}"
+          echo "ROCm Tests (Matrix) result: ${NEEDS_ROCM_TESTS_RESULT}"
+          echo "ROCm Decoupled Tests (Matrix) result: ${NEEDS_ROCM_DECOUPLED_TESTS_RESULT}"
 
           # Fail only if any job failed or was cancelled (skipped is OK)
           if [ "${{ contains(needs.*.result, 'failure') }}" == "true" ] || [ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]; then
@@ -520,6 +573,8 @@ jobs:
           NEEDS_GPU_TESTS_RESULT: ${{ needs.gpu-tests.result }}
           NEEDS_MAXTEXT_TPU_PATHWAYS_UNIT_TESTS_RESULT: ${{ needs.maxtext_tpu_pathways_unit_tests.result }}
           NEEDS_MAXTEXT_TPU_PATHWAYS_INTEGRATION_TESTS_RESULT: ${{ needs.maxtext_tpu_pathways_integration_tests.result }}
+          NEEDS_ROCM_TESTS_RESULT: ${{ needs.rocm-tests.result }}
+          NEEDS_ROCM_DECOUPLED_TESTS_RESULT: ${{ needs.rocm-decoupled-tests.result }}
 
   all_notebooks_passed:
     name: All Notebooks Passed
@@ -527,7 +582,7 @@ jobs:
     # Skipped in runs for unrelated labels (analyze_code_changes was skipped): they run no notebook, and Copybara
     # imports a "pull ready" PR once any run of this check passed. Otherwise it must fail, not skip, on cancel
     # (see all_tests_passed); if this check ever becomes required on GitHub, repeat the full run like that job does.
-    if: always() && needs.analyze_code_changes.result != 'skipped'
+    if: ${{ vars.ROCM_ONLY != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.rocm_only) && always() && needs.analyze_code_changes.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
