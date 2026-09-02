@@ -1,0 +1,97 @@
+name: Build ROCm MaxText Image (downstream)
+
+# Downstream-only (ROCm/maxtext). Manually triggered — run this AFTER syncing rocm-main with
+# upstream. Builds the ROCm MaxText image from the current rocm-main HEAD and pushes it to GHCR.
+# Runs on the shared AMD gfx950 runners, so trigger it when it won't contend with the ROCm CI /
+# weekly TE build / jax-ml/jax ROCm jobs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_suffix:
+        description: 'Optional suffix appended to the image tag'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build_and_push:
+    name: Build and push ROCm image to GHCR
+    if: ${{ vars.ROCM_ONLY == 'true' }}
+    runs-on: amd-do-linux.jax.gpu.gfx950.1
+    env:
+      IMAGE: ghcr.io/rocm/maxtext
+      DOCKER_BUILDKIT: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Preflight — Docker / BuildKit availability
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== docker version ==="; docker version
+          echo "=== buildx ==="; docker buildx version || echo "WARNING: buildx not available"
+          # The Dockerfile uses BuildKit-only features (# syntax, --mount=type=cache);
+          # DOCKER_BUILDKIT=1 must be honored by this docker.
+          echo "DOCKER_BUILDKIT=${DOCKER_BUILDKIT}"
+
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUFFIX="${{ inputs.image_suffix }}"
+          {
+            echo "nightly=rocm_jax_nightly${SUFFIX:+_${SUFFIX}}"
+            echo "date=$(date -u +%Y-%m-%d)"
+            echo "sha=maxtext_$(git rev-parse --short HEAD)_$(date -u +%Y%m%d)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download latest ROCm Transformer Engine wheel (mi355) into build context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: python3 .github/workflows/utils/install_te_rocm_wheel.py
+
+      - name: Build image (local tags, no push yet)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Building ${IMAGE} tags: ${{ steps.tags.outputs.nightly }}, ${{ steps.tags.outputs.date }}, ${{ steps.tags.outputs.sha }}"
+          docker build \
+            -f src/dependencies/dockerfiles/maxtext_rocm_dependencies.Dockerfile \
+            -t "${IMAGE}:${{ steps.tags.outputs.nightly }}" \
+            -t "${IMAGE}:${{ steps.tags.outputs.date }}" \
+            -t "${IMAGE}:${{ steps.tags.outputs.sha }}" \
+            .
+
+      - name: Smoke test the built image (on GPU)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Run the freshly-built image on the runner's GPUs (same device/isolation flags as CI)
+          # and confirm the ROCm/JAX + TE + MaxText stack imports and sees a device.
+          docker run --rm \
+            --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined \
+            --group-add video --shm-size 64G \
+            --env-file /etc/podinfo/gha-gpu-isolation-settings \
+            "${IMAGE}:${{ steps.tags.outputs.sha }}" \
+            python3 -c 'import jax, transformer_engine, maxtext; d=jax.devices(); print("jax", jax.__version__, "devices:", d); assert d, "no JAX devices visible in the image"; print("transformer_engine", getattr(transformer_engine, "__version__", "?")); print("smoke test OK")'
+
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${{ steps.tags.outputs.nightly }}"
+          docker push "${IMAGE}:${{ steps.tags.outputs.date }}"
+          docker push "${IMAGE}:${{ steps.tags.outputs.sha }}"
