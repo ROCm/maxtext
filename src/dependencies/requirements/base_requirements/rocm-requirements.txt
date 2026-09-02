@@ -1,0 +1,4 @@
+-r requirements.txt
+# jax is pinned through rocm-constraints.txt rather than resolved from a generated lock because
+# seed-env has no ROCm hardware target; the decoupled lock path applies the same file.
+-c rocm-constraints.txt
