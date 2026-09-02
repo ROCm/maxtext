@@ -29,7 +29,9 @@ on:
             tpu7x-post-training-unit, tpu7x-post-training-integration,
             gpu-unit, gpu-integration,
             cpu-unit, cpu-integration,
-            cpu-post-training-unit, cpu-post-training-integration
+            cpu-post-training-unit, cpu-post-training-integration,
+            rocm-unit,
+            rocm-decoupled
           )
         required: true
         type: string
@@ -126,12 +128,19 @@ jobs:
             CALC_OUTPUT=$(python3 tools/dev/calculate_workers.py --flavor "$FLAVOR")
           fi
 
+          # ROCm runs its whole selection on 4-GPU runners and has no entry in the upstream baseline, so its
+          # class-level split (tests/utils/class_split.py) is balanced from ROCm nightly durations instead.
+          if [[ "$FLAVOR" == rocm-* ]]; then
+            CALC_OUTPUT=$'total_workers=2\nworker_groups=[1, 2]'
+            cp .github/workflows/utils/rocm_test_durations.json .test_durations
+          fi
+
           echo "${CALC_OUTPUT}"
           echo "${CALC_OUTPUT}" | grep -E '^(total_workers|worker_groups)=' >> "$GITHUB_OUTPUT"
 
       - name: Upload Converted Test Durations
         id: upload-durations
-        if: steps.download-baseline.outputs.downloaded == 'true'
+        if: steps.download-baseline.outputs.downloaded == 'true' || startsWith(inputs.flavor, 'rocm-')
         uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
         with:
           name: test-durations-${{ github.run_id }}-${{ inputs.flavor }}
@@ -167,7 +176,9 @@ jobs:
           "cpu-unit": "cpu",
           "cpu-integration": "cpu",
           "cpu-post-training-unit": "cpu",
-          "cpu-post-training-integration": "cpu"
+          "cpu-post-training-integration": "cpu",
+          "rocm-unit": "rocm",
+          "rocm-decoupled": "rocm"
         }')[inputs.flavor] }}
 
       device_name: >-
@@ -185,7 +196,9 @@ jobs:
           "cpu-unit": "X64",
           "cpu-integration": "X64",
           "cpu-post-training-unit": "X64",
-          "cpu-post-training-integration": "X64"
+          "cpu-post-training-integration": "X64",
+          "rocm-unit": "mi355",
+          "rocm-decoupled": "mi355"
         }')[inputs.flavor] }}
 
       cloud_runner: >-
@@ -203,9 +216,16 @@ jobs:
           "cpu-unit": "linux-x86-n4-32",
           "cpu-integration": "linux-x86-n4-32",
           "cpu-post-training-unit": "linux-x86-n4-32",
-          "cpu-post-training-integration": "linux-x86-n4-32"
+          "cpu-post-training-integration": "linux-x86-n4-32",
+          "rocm-unit": "amd-do-linux.maxtext.gpu.gfx950.4",
+          "rocm-decoupled": "amd-do-linux.maxtext.gpu.gfx950.4"
         }')[inputs.flavor] }}
       # Pytest Marker Mapping
+      # On ROCm, conftest does not auto-mark tests without a hardware marker as cpu_only (upstream
+      # leaves that bulk to the cpu-unit job, which ROCM_ONLY disables), so they run here and
+      # `not cpu_only` excludes only the tests their authors marked cpu_only. The unmarked tests that
+      # fail here without testing GPU functionality are listed in tests/rocm_auto_cpu_only.txt and
+      # marked auto_cpu_only; add new ones there rather than as --deselect.
       pytest_marker: >-
         ${{ fromJSON('{
             "tpu-unit": "not cpu_only and not gpu_only and not integration_test and not post_training",
@@ -221,7 +241,9 @@ jobs:
             "cpu-unit": "cpu_only and not post_training and not integration_test",
             "cpu-integration": "cpu_only and not post_training and integration_test",
             "cpu-post-training-unit": "cpu_only and post_training",
-            "cpu-post-training-integration": "cpu_only and post_training and integration_test"
+            "cpu-post-training-integration": "cpu_only and post_training and integration_test",
+            "rocm-unit": "not tpu_only and not post_training and not decoupled and not cpu_only and not auto_cpu_only",
+            "rocm-decoupled": "not tpu_only and not post_training and decoupled and not cpu_only and not auto_cpu_only"
           }')[inputs.flavor] }}
 
       pytest_addopts: >-
@@ -239,7 +261,9 @@ jobs:
             "cpu-unit": "",
             "cpu-integration": "",
             "cpu-post-training-unit": "tests/post_training/unit tests/unit",
-            "cpu-post-training-integration": "tests/post_training/integration"
+            "cpu-post-training-integration": "tests/post_training/integration",
+            "rocm-unit": "",
+            "rocm-decoupled": ""
           }')[inputs.flavor] }}
 
       pytest_extra_args: >-
@@ -257,17 +281,44 @@ jobs:
             "cpu-unit": "--ignore=tests/post_training",
             "cpu-integration": "--ignore=tests/post_training",
             "cpu-post-training-unit": "",
-            "cpu-post-training-integration": ""
+            "cpu-post-training-integration": "",
+            "rocm-unit": "--ignore=tests/post_training",
+            "rocm-decoupled": "--ignore=tests/post_training"
           }')[inputs.flavor] }}
 
       # Resource Scaling
-      xla_python_client_mem_fraction: "${{ contains(inputs.flavor, 'gpu') && '0.65' || '0.75' }}"
-      tf_force_gpu_allow_growth: "${{ contains(inputs.flavor, 'gpu') && 'true' || 'false' }}"
+      xla_python_client_mem_fraction: >-
+        ${{ fromJSON('{
+            "gpu-unit": "0.65",
+            "gpu-integration": "0.65",
+            "rocm-unit": "0.9",
+            "rocm-decoupled": "0.9"
+          }')[inputs.flavor] || '0.75' }}
 
+      tf_force_gpu_allow_growth: >-
+        ${{ fromJSON('{
+            "gpu-unit": "true",
+            "gpu-integration": "true",
+            "rocm-unit": "true",
+            "rocm-decoupled": "true"
+          }')[inputs.flavor] || 'false' }}
+
+      # The ROCm options mirror jax-ml/jax's pytest_rocm.yml and deliberately omit --privileged:
+      # the env-file gives each job its own GPU isolation, which --privileged would defeat.
       container_resource_option: >-
-        ${{ contains(inputs.flavor, 'gpu')
+        ${{ contains(inputs.flavor, 'rocm')
+            && '--init --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --shm-size 64G --env-file /etc/podinfo/gha-gpu-isolation-settings'
+            || contains(inputs.flavor, 'gpu')
             && '--init --shm-size 2g --runtime=nvidia --gpus all --privileged'
             || '--init --privileged' }}
+
+      # ROCm-specific parameters
+      decoupled_mode: ${{ contains(inputs.flavor, 'decoupled') }}
+      requirements_file: >-
+        ${{ fromJSON('{
+            "rocm-unit": "src/dependencies/requirements/base_requirements/rocm-requirements.txt",
+            "rocm-decoupled": "src/dependencies/requirements/generated_requirements/decoupled-requirements.txt"
+          }')[inputs.flavor] || '' }}
 
       # Metadata
       repository_name: ${{ inputs.repository_name }}
