@@ -21,7 +21,7 @@ from unittest import mock
 from absl.testing import parameterized
 import jax
 
-from tests.conftest import pytest_collection_modifyitems
+from tests.conftest import _is_rocm_backend, pytest_collection_modifyitems
 
 
 class FakeMarker:
@@ -70,16 +70,21 @@ class MarkerPropagationTest(parameterized.TestCase):
   )
   def test_parameterized_cpu_only_marker_propagation(self, unused):
     """Verifies cpu_only marker above @parameterized propagates to generated methods."""
-    has_tpu = any(d.platform == "tpu" for d in jax.devices())
-    has_gpu = any(d.platform == "gpu" for d in jax.devices())
+    devices = jax.devices()
+    has_tpu = any(d.platform == "tpu" for d in devices)
+    # ROCm is exempt from the cpu_only skip (see handle_cpu_only), so there the marker having
+    # propagated is not observable this way and only the TPU half of the check applies.
+    has_gpu = any(d.platform == "gpu" for d in devices) and not _is_rocm_backend(devices)
     assert not has_tpu, "cpu_only parameterized test accidentally executed on TPU hardware"
     assert not has_gpu, "cpu_only parameterized test accidentally executed on GPU hardware"
 
   @dummy_decorator
   def test_standard_decorator_cpu_only_marker_propagation(self):
     """Verifies cpu_only marker above standard decorators propagates correctly."""
-    has_tpu = any(d.platform == "tpu" for d in jax.devices())
-    has_gpu = any(d.platform == "gpu" for d in jax.devices())
+    devices = jax.devices()
+    has_tpu = any(d.platform == "tpu" for d in devices)
+    # See the note above: the ROCm exemption makes the GPU half unobservable there.
+    has_gpu = any(d.platform == "gpu" for d in devices) and not _is_rocm_backend(devices)
     assert not has_tpu, "cpu_only standard decorated test accidentally executed on TPU hardware"
     assert not has_gpu, "cpu_only standard decorated test accidentally executed on GPU hardware"
 
