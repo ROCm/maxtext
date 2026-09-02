@@ -1,0 +1,7 @@
+# The jax every ROCm stack runs on. Applied as a constraint on top of upstream's locks (which only
+# give lower bounds) and pulled in by rocm-requirements.txt. It must have a jax-rocm10-pjrt/plugin
+# build for the container's ROCm SDK (see .github/workflows/utils/install_jax_rocm_plugin.sh);
+# bump it and the image together. A constraint, not an override, so an upstream floor above this
+# version fails the install instead of being silently downgraded.
+jax==0.12.0
+jaxlib==0.12.0
