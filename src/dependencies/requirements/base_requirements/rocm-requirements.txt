@@ -1,0 +1,5 @@
+-r requirements.txt
+# jax is pinned here rather than resolved from a generated lock because seed-env has no ROCm
+# hardware target. It must equal the jax-rocm10-pjrt/plugin version built against the ROCm SDK the
+# container ships, so bump it and those wheels together.
+jax==0.11.1
