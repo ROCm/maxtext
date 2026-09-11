@@ -167,6 +167,33 @@ class PageMap:
     self._pages[row, start:end] = pages
     self._num_pages[row] = end
 
+  def repoint_pages(self, handle: RequestHandle, page_ids: Sequence[int] | np.ndarray) -> np.ndarray:
+    """Replace the request's page list without changing its recorded length.
+
+    What a tier needs when a request comes back from somewhere else. Offloading
+    only extends capacity if the pages are actually *freed*, so the pages a
+    request returns to are not the pages it left from -- the allocator will have
+    handed the originals to somebody else. The sequence is unchanged; only which
+    physical pages hold it.
+
+    The count must match, because sequence position `p` still lives in page slot
+    `p // tokens_per_page`. A shorter list would leave the tail of the sequence
+    pointing at whatever the row held before, which reads as valid KV.
+
+    Returns the page list being replaced, so a caller can free or account for it.
+    """
+    row = self._row(handle)
+    pages = np.asarray(page_ids, dtype=np.int32).reshape(-1)
+    held = int(self._num_pages[row])
+    if pages.size != held:
+      raise ValueError(
+          f"request {handle.request_id!r} holds {held} pages but repoint was given "
+          f"{pages.size}; the sequence length is unchanged, so the count must be too"
+      )
+    previous = self._pages[row, :held].copy()
+    self._pages[row, :held] = pages
+    return previous
+
   def seq_len(self, handle: RequestHandle) -> int:
     return int(self._seq_lens[self._row(handle)])
 

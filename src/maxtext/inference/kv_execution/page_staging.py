@@ -85,18 +85,23 @@ def pad_page_indices(page_ids: Sequence[int] | np.ndarray) -> np.ndarray:
 
 
 def host_sharding_like(pool_sharding: Any | None, device: Any | None = None) -> Any:
-  """The pool's sharding, restated in host memory.
+  """The pool's sharding, restated in host memory for the stacked blob.
 
   Keeping the pool's `PartitionSpec` matters under tensor parallelism: each
-  device offloads the head shard it owns, so the slab is host memory *per
+  device offloads the head shard it owns, so the staged copy is host memory *per
   device* rather than one host copy gathered from all of them. Gathering would
   turn an offload into a collective.
+
+  A leading axis is prepended because the blob stacks every layer's K and V into
+  one array; that axis is not sharded, so the pool's own spec is simply shifted
+  right by one.
   """
   if pool_sharding is None:
     target = device if device is not None else jax.devices()[0]
     return jax.sharding.SingleDeviceSharding(target, memory_kind=HOST_MEMORY_KIND)
+  spec = jax.sharding.PartitionSpec(None, *pool_sharding.spec)
   return jax.sharding.NamedSharding(
-      pool_sharding.mesh, pool_sharding.spec, memory_kind=HOST_MEMORY_KIND
+      pool_sharding.mesh, spec, memory_kind=HOST_MEMORY_KIND
   )
 
 
@@ -120,51 +125,61 @@ def _gather_fn(num_layers: int, host: Any):
   freshly built `jax.jit` on each offload would retrace every time, which is the
   opposite of what bucketing the page count is for.
 
-  One dispatch across all layers, for `pool_ops._fill_all`'s reason: at 80
-  layers a per-layer loop issues eighty launches on the critical path of every
-  offload. That costs nothing at test depth and is a cliff at real depth.
+  **The stack is not a convenience, it is the difference between offload being
+  usable and being pointless.** Returning a list left one host transfer per layer
+  per K/V -- 64 of them for a 32-layer model, about a megabyte each -- and
+  measured 0.3 GB/s against the 19 GB/s a single contiguous slab achieves on the
+  same hardware. Per-transfer overhead, not bandwidth. Stacking on device first
+  turns the whole eviction into one DMA.
+
+  The layer axis leads, so a layer's slice stays contiguous and the reload can
+  index it without a gather.
   """
+  del num_layers  # part of the cache key: depth changes the traced program
   return jax.jit(
-      lambda k, v, idx: ([jnp.take(x, idx, axis=0) for x in k],
-                         [jnp.take(x, idx, axis=0) for x in v]),
-      out_shardings=([host] * num_layers, [host] * num_layers),
+      lambda k, v, idx: jnp.stack(
+          [jnp.take(x, idx, axis=0) for x in k] + [jnp.take(x, idx, axis=0) for x in v]
+      ),
+      out_shardings=host,
   )
 
 
 @functools.partial(jax.jit, donate_argnums=(0, 1))
-def _scatter_all_layers(k_pages: list, v_pages: list, page_ids: jax.Array,
-                        k_staged: list, v_staged: list):
-  """Write the staged pages back into every layer, in one dispatch.
+def _scatter_all_layers(k_pages: list, v_pages: list, page_ids: jax.Array, blob: jax.Array):
+  """Write the staged blob back into every layer, in one dispatch.
 
   Donated so the write aliases the pool rather than replacing it; the caller
-  must rebind from the returned handles.
+  must rebind from the returned handles. The blob's leading axis is layers, K
+  first then V, matching how the gather stacked it.
   """
-  return ([k.at[page_ids].set(s) for k, s in zip(k_pages, k_staged)],
-          [v.at[page_ids].set(s) for v, s in zip(v_pages, v_staged)])
+  depth = len(k_pages)
+  return ([k.at[page_ids].set(blob[i]) for i, k in enumerate(k_pages)],
+          [v.at[page_ids].set(blob[depth + i]) for i, v in enumerate(v_pages)])
 
 
 class StagedPages:
-  """One offload's worth of pages, resident in host memory.
+  """One offload's worth of pages, resident in host memory as a single array.
+
+  One array rather than a list per layer, because the transfer cost is dominated
+  by the number of transfers rather than their size -- see `_gather_fn`.
 
   Carries the padded index array it was gathered with, because the scatter has
-  to use the identical one: the padded rows only round-trip consistently if both
-  directions agree on which page each row came from.
+  to agree with it: the padded rows only round-trip consistently if both
+  directions know which page each row came from.
   """
 
-  __slots__ = ("k", "v", "page_ids", "num_live")
+  __slots__ = ("blob", "page_ids", "num_live", "num_layers")
 
-  def __init__(self, k: list, v: list, page_ids: np.ndarray, num_live: int) -> None:
-    self.k = k
-    self.v = v
+  def __init__(self, blob: Any, page_ids: np.ndarray, num_live: int, num_layers: int) -> None:
+    self.blob = blob
     self.page_ids = page_ids
     self.num_live = num_live
-
-  @property
-  def num_layers(self) -> int:
-    return len(self.k)
+    self.num_layers = num_layers
 
   def nbytes(self) -> int:
-    return sum(int(a.size) * int(a.dtype.itemsize) for a in self.k + self.v)
+    if self.blob is None:
+      return 0
+    return int(self.blob.size) * int(self.blob.dtype.itemsize)
 
 
 def offload_pages(pool: Any, page_ids: Sequence[int] | np.ndarray,
@@ -178,15 +193,16 @@ def offload_pages(pool: Any, page_ids: Sequence[int] | np.ndarray,
   live = np.asarray(page_ids, dtype=np.int32).reshape(-1)
   padded = pad_page_indices(live)
   if padded.size == 0:
-    return StagedPages([], [], padded, 0)
+    return StagedPages(None, padded, 0, pool.num_layers)
 
   host = host_sharding_like(pool_sharding)
   gather = _gather_fn(pool.num_layers, host)
-  k_staged, v_staged = gather(pool.k_pages, pool.v_pages, jnp.asarray(padded))
-  return StagedPages(k_staged, v_staged, padded, int(live.size))
+  blob = gather(pool.k_pages, pool.v_pages, jnp.asarray(padded))
+  return StagedPages(blob, padded, int(live.size), pool.num_layers)
 
 
-def reload_pages(pool: Any, staged: StagedPages, pool_sharding: Any | None = None) -> None:
+def reload_pages(pool: Any, staged: StagedPages, pool_sharding: Any | None = None,
+                 dest_page_ids: Sequence[int] | np.ndarray | None = None) -> None:
   """Write a staged copy back into the pool, in place.
 
   The pool arrays are donated, so `pool.replace_layer` is not optional -- the
@@ -195,19 +211,38 @@ def reload_pages(pool: Any, staged: StagedPages, pool_sharding: Any | None = Non
   Two steps rather than one because a scatter cannot take a host-resident
   operand: XLA rejects it at compile time rather than inserting the copy itself,
   so the move back to device is explicit here.
+
+  `dest_page_ids` defaults to the pages the copy came from, which is the case
+  where nothing was freed. A tier that freed the originals to extend capacity
+  passes the *new* pages instead: the allocator will have handed the old ones to
+  someone else, so writing them back would corrupt whoever holds them now. The
+  padding stays consistent because it is a function of the count alone, and both
+  lists have the same count -- so the repeated row still names row zero's
+  destination and remains idempotent.
   """
   if staged.num_live == 0:
     return
 
+  if dest_page_ids is None:
+    targets = staged.page_ids
+  else:
+    live = np.asarray(dest_page_ids, dtype=np.int32).reshape(-1)
+    if live.size != staged.num_live:
+      raise ValueError(
+          f"staged {staged.num_live} pages but was given {live.size} destinations"
+      )
+    targets = pad_page_indices(live)
+
   device = (device_sharding_like(host_sharding_like(pool_sharding))
             if pool_sharding is not None
             else jax.sharding.SingleDeviceSharding(
-                next(iter(staged.k[0].sharding.device_set)), memory_kind=DEVICE_MEMORY_KIND))
+                next(iter(staged.blob.sharding.device_set)), memory_kind=DEVICE_MEMORY_KIND))
 
-  k_device = [jax.device_put(a, device) for a in staged.k]
-  v_device = [jax.device_put(a, device) for a in staged.v]
   k_pages, v_pages = _scatter_all_layers(
-      list(pool.k_pages), list(pool.v_pages), jnp.asarray(staged.page_ids), k_device, v_device
+      list(pool.k_pages),
+      list(pool.v_pages),
+      jnp.asarray(targets),
+      jax.device_put(staged.blob, device),
   )
   for layer in range(pool.num_layers):
     pool.replace_layer(layer, k_pages[layer], v_pages[layer])

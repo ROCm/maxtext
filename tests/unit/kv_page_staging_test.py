@@ -103,8 +103,17 @@ class PageStagingTest(unittest.TestCase):
 
     staged = offload_pages(pool, [2, 3])
 
-    for array in staged.k + staged.v:
-      self.assertEqual(array.sharding.memory_kind, HOST_MEMORY_KIND)
+    self.assertEqual(staged.blob.sharding.memory_kind, HOST_MEMORY_KIND)
+
+  def test_the_whole_eviction_is_one_array_not_one_per_layer(self):
+    """The property that makes offload usable rather than merely correct. A list
+    per layer measured 0.3 GB/s against 19 GB/s for a single contiguous
+    transfer, because the cost is dominated by the number of transfers."""
+    pool = a_pool()
+
+    staged = offload_pages(pool, [2, 3])
+
+    self.assertEqual(staged.blob.shape, (2 * LAYERS, 2, PAGE, 2, 4))
 
   def test_pages_come_back_byte_identical(self):
     pool = a_pool()
@@ -176,6 +185,23 @@ class PageStagingTest(unittest.TestCase):
 
     expected = 2 * LAYERS * 2 * PAGE * 2 * 4 * 4  # k+v, layers, pages, tokens, heads, dim, f32
     self.assertEqual(staged.nbytes(), expected)
+
+  def test_v_pages_do_not_come_back_as_k_pages(self):
+    """K and V share one blob, K first. An off-by-`depth` in the unstack would
+    swap them, which produces plausible attention rather than an error."""
+    pool = a_pool()
+    paint(pool, [6], 2.0)  # k gets 2.0, v gets 2.5
+    staged = offload_pages(pool, [6])
+    paint(pool, [6], 0.0)
+
+    reload_pages(pool, staged)
+
+    np.testing.assert_array_equal(
+        np.asarray(pool.k_pages[0])[6], np.full((PAGE, 2, 4), 2.0, np.float32)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(pool.v_pages[0])[6], np.full((PAGE, 2, 4), 2.5, np.float32)
+    )
 
 
 if __name__ == "__main__":

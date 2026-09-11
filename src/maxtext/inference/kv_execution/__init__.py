@@ -34,6 +34,13 @@ from maxtext.inference.kv_execution.bucketing import (
 )
 from maxtext.inference.kv_execution.driver import PagedDriver, PagedRequest, StepOutcome
 from maxtext.inference.kv_execution.layout_builder import build_storage_layout
+from maxtext.inference.kv_execution.offload_tier import HostOffloadTier, TierCapacityError
+from maxtext.inference.kv_execution.page_staging import (
+    StagedPages,
+    offload_pages,
+    pad_page_indices,
+    reload_pages,
+)
 from maxtext.inference.kv_execution.pool_factory import PagedKvPool, allocate_pool
 from maxtext.inference.kv_execution.pool_ops import (
     POISON_SENTINEL,
@@ -46,21 +53,27 @@ from maxtext.inference.kv_execution.step_view import StepView, build_step_view
 
 __all__ = [
     "POISON_SENTINEL",
+    "HostOffloadTier",
     "PagedDriver",
     "PagedKvPool",
     "PagedRequest",
     "RequestSlice",
+    "StagedPages",
     "StepInputs",
     "StepOutcome",
     "StepShape",
     "StepView",
+    "TierCapacityError",
     "allocate_pool",
     "batch_ladder",
     "bucket_up",
     "build_step_inputs",
     "build_step_view",
     "build_storage_layout",
+    "offload_pages",
+    "pad_page_indices",
     "poison_pages",
+    "reload_pages",
     "scrub_pages",
     "scrub_pages_all_layers",
     "token_ladder",
