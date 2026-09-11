@@ -56,6 +56,7 @@ from maxtext.inference.kv_control.prefix_index import (
 )
 from maxtext.inference.kv_control.protocols import KvControlPlane
 from maxtext.inference.kv_control.request import RequestDescriptor, RequestHandle, RequestState
+from maxtext.inference.kv_control.residency import NotResidentError, PageResidency, Tier
 
 __all__ = [
     "DirtyPageError",
@@ -63,8 +64,10 @@ __all__ = [
     "KvControlPlane",
     "LogicalBlock",
     "NativeKvControlPlane",
+    "NotResidentError",
     "PageCapacityError",
     "PageMap",
+    "PageResidency",
     "PageState",
     "PageStateError",
     "PagedBlockAllocator",
@@ -77,6 +80,7 @@ __all__ = [
     "RequestState",
     "SharedPageWriteError",
     "StaleRequestHandleError",
+    "Tier",
     "block_hash",
     "build_decode_table",
     "build_page_table",

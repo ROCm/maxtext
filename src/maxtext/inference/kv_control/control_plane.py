@@ -62,6 +62,7 @@ from maxtext.inference.kv_control.logical_block import new_pages_for_extend, pag
 from maxtext.inference.kv_control.page_map import PageCapacityError, PageMap
 from maxtext.inference.kv_control.prefix_index import PrefixIndex, PrefixMatch, PrefixNode
 from maxtext.inference.kv_control.request import RequestDescriptor, RequestHandle
+from maxtext.inference.kv_control.residency import NotResidentError, PageResidency, Tier
 
 _DEFAULT_NAMESPACE = CacheNamespace()
 
@@ -117,6 +118,9 @@ class NativeKvControlPlane:
     # it on would make that someone else's problem to discover.
     self.prefix_index = PrefixIndex(layout.tokens_per_page, enabled=enable_prefix_cache)
     self._prefix_state: dict[RequestHandle, _PrefixState] = {}
+    # Every page starts on device, so a deployment that never offloads pays one
+    # array and one `!=` per table build and behaves exactly as before.
+    self.residency = PageResidency(layout.num_pages)
 
     # Caught here rather than as a mid-serving allocation failure, which would
     # look like ordinary backpressure and never resolve.
@@ -343,18 +347,32 @@ class NativeKvControlPlane:
       handles: Sequence[RequestHandle],
       query_lens: Sequence[int] | np.ndarray,
   ) -> KvPageTableV1:
-    """Describe this step, refusing to describe a page that is still dirty.
+    """Describe this step, refusing pages that are dirty or not on the device.
 
     The check is over the table's own page list, so it covers exactly the extent
     a kernel is about to read -- no more, since pages trimmed as beyond the
     current length are not readable this step, and no less.
+
+    Two refusals rather than one, and they catch opposite mistakes. A dirty page
+    holds someone *else's* KV. A non-resident page holds *nothing* -- its bytes
+    are in the host slab -- so a kernel reading it attends over stale or scrubbed
+    memory. Both produce fluent wrong output rather than an error, which is why
+    each is enforced here instead of being left to the caller's discipline.
     """
     table = metadata.build_page_table(self.page_map, handles, query_lens)
-    unscrubbed = self.allocator.dirty_among(table.flat_page_indices())
+    pages = table.flat_page_indices()
+    unscrubbed = self.allocator.dirty_among(pages)
     if unscrubbed.size:
       raise DirtyPageError(
           f"pages {unscrubbed[:8].tolist()} still hold a previous request's KV and would be readable "
           f"by this step. Scrub the pages from pending_scrub() and call confirm_scrubbed() before "
+          f"building the table."
+      )
+    absent = self.residency.non_resident_among(pages)
+    if absent.size:
+      raise NotResidentError(
+          f"pages {absent[:8].tolist()} are not on the device -- they are offloaded or mid-eviction -- "
+          f"and would be read by this step. Reload them and call residency.confirm_resident() before "
           f"building the table."
       )
     if self.debug_mode and self._prefix_state:
