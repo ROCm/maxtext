@@ -87,6 +87,49 @@ class Quantization:
     """Placeholder for einsum implementation in subclasses."""
 
 
+class JaxBlockScaledDotGeneral(nn.Module):
+  """Stateless JAX MX contraction exposed through MaxText's Linen/NNX bridge."""
+
+  mode: str
+
+  @nn.compact
+  def __call__(
+      self,
+      lhs: jax.Array,
+      rhs: jax.Array,
+      dimension_numbers: jax.lax.DotDimensionNumbers,
+      precision: jax.lax.PrecisionLike = None,
+      preferred_element_type: jax.typing.DTypeLike | None = None,
+      *,
+      out_sharding=None,
+  ) -> jax.Array:
+    # Block-scaled arithmetic is selected by the configuration, not lax.Precision.
+    del precision
+    output_dtype = jnp.result_type(lhs, rhs) if preferred_element_type is None else preferred_element_type
+    configs = [jax.nn.get_scaled_dot_general_config(self.mode) for _ in range(3)]
+    output = jax.nn.scaled_dot_general(
+        lhs, rhs, dimension_numbers, preferred_element_type=output_dtype, configs=configs
+    )
+    if out_sharding is not None:
+      output = jax.lax.with_sharding_constraint(output, out_sharding)
+    return output
+
+
+@dataclass(unsafe_hash=True)
+class JaxBlockScaledQuantization(Quantization):
+  """MXFP8 or MXFP4 for dense forward and both quantized backward contractions."""
+
+  mode: str
+  quant_mode: str = "train"
+
+  def get_block_size(self):
+    return 32
+
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+    del mesh_axes
+    return functools.partial(JaxBlockScaledDotGeneral, mode=self.mode)
+
+
 def _tiling_fn(lhs, rhs, dimension_numbers, tile_size):
   """apply tiling function"""
   del lhs, rhs
@@ -630,6 +673,8 @@ def _get_quant_config(config):
   """Set quantization params based on user configuration."""
   if not config.quantization or config.quantization == "":
     return None
+  if config.quantization in ("jax_mxfp8", "jax_mxfp4"):
+    return config.quantization
   if config.quantization == "int8":
     return _get_int8_quant_config(config)
   if config.quantization == "intmp":
@@ -687,7 +732,9 @@ def configure_quantization(config: Config, quant_mode_str: str = "train"):
     return None
   quant_cfg = _get_quant_config(config)
   if quant_cfg:
-    if quant_cfg == "fp8":
+    if quant_cfg in ("jax_mxfp8", "jax_mxfp4"):
+      return JaxBlockScaledQuantization(mode=quant_cfg.removeprefix("jax_"))
+    elif quant_cfg == "fp8":
       return Fp8Quantization()
     elif quant_cfg == "nanoo_fp8":
       return NANOOFp8Quantization()

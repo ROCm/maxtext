@@ -206,7 +206,10 @@ class DenseGeneral(nnx.Module):
     if quant:
       dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes)
       dot_general_linen = dot_general_cls()
-      quant_dot_general = nnx_wrappers.ToNNX(dot_general_linen, rngs=rngs)
+      # JAX MX is deterministic and stateless. Forking the shared RNG here
+      # would change subsequent parameter initialization relative to BF16.
+      quant_rngs = None if isinstance(quant, quantizations.JaxBlockScaledQuantization) else rngs
+      quant_dot_general = nnx_wrappers.ToNNX(dot_general_linen, rngs=quant_rngs)
       self._quant_dot_general_name = f"{type(dot_general_linen).__name__}_0"
       setattr(self, self._quant_dot_general_name, quant_dot_general)
       block_size = getattr(quant, "get_block_size", lambda: 1)()  # needed for TE MXFP8

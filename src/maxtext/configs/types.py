@@ -98,6 +98,8 @@ class QuantizationType(str, Enum):
   TE_FP8_DS = "te_fp8_delayedscaling"
   TE_FP8_CS = "te_fp8_currentscaling"
   TE_MXFP8 = "te_mxfp8"
+  JAX_MXFP8 = "jax_mxfp8"
+  JAX_MXFP4 = "jax_mxfp4"
   TE_NVFP4 = "te_nvfp4"
   TE_NVFP4_NO_RHT = "te_nvfp4_no_rht"
 
@@ -3583,6 +3585,8 @@ class MaxTextConfig(
       if self.quantization not in (
           "fp8",
           "nanoo_fp8",
+          "jax_mxfp8",
+          "jax_mxfp4",
       ) and not self.quantization.startswith("te_"):
         logger.warning(
             "WARNING: AQT quantization is deprecated and will be removed in a future release. "
