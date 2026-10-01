@@ -26,15 +26,18 @@ def grouped_gemm_mxfp8_experts(
 ) -> jax.Array:
   """One per-expert matmul of the MoE FFN, contracted in MXFP8. Differentiable.
 
-  Two layout notes. MaxText stores every expert kernel contracting-dim-first --
-  wi_* as [E, D, M] and wo as [E, M, D] -- while the kernel declares its weights
-  free-dim-first, so each one is transposed on the way in. And the grouped GEMM
-  writes each group and nothing else, so when the token buffer has more rows
-  than the groups fill, as it does whenever ragged_buffer_factor gives a
-  fixed-capacity receiver, the tail holds whatever the allocator left there.
-  Masking it here rather than at the far end of the FFN keeps that garbage from
-  reaching the next quantizer, which would otherwise pick its block scales off
-  values no expert ever produced.
+  MaxText stores every expert kernel contracting-dim-first -- wi_* as [E, D, M]
+  and wo as [E, M, D] -- which is the layout the op takes, so the weight goes
+  through untouched. Turning it here instead would cost a full copy of it on
+  every step: the op needs both orientations anyway and turns the narrower fp8
+  payload internally.
+
+  The grouped GEMM writes each group and nothing else, so when the token buffer
+  has more rows than the groups fill, as it does whenever ragged_buffer_factor
+  gives a fixed-capacity receiver, the tail holds whatever the allocator left
+  there. Masking it here rather than at the far end of the FFN keeps that
+  garbage from reaching the next quantizer, which would otherwise pick its block
+  scales off values no expert ever produced.
 
   Args:
     x: [tokens, K] this shard's tokens, already stacked by local expert.
@@ -53,7 +56,7 @@ def grouped_gemm_mxfp8_experts(
 
   out = grouped_gemm_mxfp8(
       x,
-      jnp.swapaxes(kernel, 1, 2).astype(x.dtype),
+      kernel.astype(x.dtype),
       group_offsets,
   )
   live = jnp.arange(out.shape[0], dtype=jnp.int32)[:, None] < group_offsets[-1]
