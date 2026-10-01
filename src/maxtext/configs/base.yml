@@ -399,6 +399,7 @@ kv_wa_proj: 'remat'
 mla_q: 'remat'
 mla_kv: 'remat'
 attention_out: 'remat'
+attn_scores: 'remat' # score table. Set to device with remat_policy=custom to keep it for the backward.
 engram: 'remat'
 
 optimizer_memory_host_offload: false
@@ -410,6 +411,8 @@ param_scan_axis: 1
 # The attention parameter dictates the specific algorithm/methodology used to compute the attention scores
 # The attention_type parameter determines the variants of attention, e.g. global or local_sliding
 attention: 'autoselected' # Supported attention: autoselected, dot_product, flash, cudnn_flash_te
+# FlyDSL sparse MLA for DeepSeek-V4 compressed attention (head 512). Off keeps dot_product.
+use_flydsl_sparse_mla: false
 attention_type: 'global' # Supported attention_type: global, local_sliding, chunk, mla, full, compressed, block_diffusion
 share_kv_projections: false # Note: Not compatible with attention_type='mla'
 attention_bias: false # If true, adds a learnable bias to the query, key, and value projections

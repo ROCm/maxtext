@@ -1072,7 +1072,8 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
         )
 
     if compressed_len == 0:
-      return compressed_kv, jnp.zeros((batch_size, 1, seq_len, 0), dtype=self.dtype)
+      empty_idx = jnp.zeros((batch_size, seq_len, 0), dtype=jnp.int32)
+      return compressed_kv, jnp.zeros((batch_size, 1, seq_len, 0), dtype=self.dtype), empty_idx
 
     # 3. Apply Dynamic Masking Logic
     k = top_k_indices.shape[-1]
@@ -1093,7 +1094,97 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
           dtype=self.dtype,
       )
 
-    return compressed_kv, compressed_mask
+    return compressed_kv, compressed_mask, top_k_indices
+
+
+_SPARSE_WINDOW = 128
+_SPARSE_ROPE = 64
+
+
+def _sparse_pad_multiple(n, multiple=64):
+  return ((n + multiple - 1) // multiple) * multiple
+
+
+def _with_rope_pad(x):
+  zeros = jnp.zeros(x.shape[:-1] + (_SPARSE_ROPE,), dtype=x.dtype)
+  return jnp.concatenate([x, zeros], axis=-1)
+
+
+def _window_indices(seqlen):
+  tok = jnp.arange(seqlen)[:, None]
+  win = tok - (_SPARSE_WINDOW - 1) + jnp.arange(_SPARSE_WINDOW)[None, :]
+  return jnp.where(win >= 0, win, -1).astype(jnp.int32)
+
+
+def _pad_topk(topk):
+  pad = _sparse_pad_multiple(topk.shape[-1]) - topk.shape[-1]
+  if pad == 0:
+    return topk
+  fill = jnp.full(topk.shape[:-1] + (pad,), -1, dtype=jnp.int32)
+  return jnp.concatenate([topk, fill], axis=-1)
+
+
+def _hca_indices(seqlen, compress_ratio):
+  pool = seqlen // compress_ratio
+  tok = jnp.arange(seqlen)[:, None]
+  ps = jnp.arange(pool)[None, :]
+  pool_idx = jnp.where(((ps + 1) * compress_ratio - 1) <= tok, seqlen + ps, -1)
+  topk = jnp.concatenate([_window_indices(seqlen), pool_idx.astype(jnp.int32)], axis=1)
+  return _pad_topk(topk)
+
+
+def _csa_indices(seqlen, pool_idx):
+  shifted = jnp.where(pool_idx >= 0, pool_idx + seqlen, -1)
+  topk = jnp.concatenate([_window_indices(seqlen), shifted.astype(jnp.int32)], axis=-1)
+  return _pad_topk(topk)
+
+
+def _uses_closed_form(tokens, num_kv, width):
+  """True when the kernel ignores top-k and uses the single-sequence closed form."""
+  pool = num_kv - tokens
+  swa = num_kv == tokens and width == 128
+  hca = pool > 0 and tokens % pool == 0 and tokens // pool >= 64 and width >= 128 + pool
+  cr0 = num_kv == tokens and width == 128
+  cr128 = pool > 0 and width <= 256 and tokens % pool == 0 and tokens // pool >= 64
+  real_k = 128 + pool
+  slices = pool > 0 and width <= 256 and width > real_k and real_k % 32 == 0
+  return swa or hca or cr0 or cr128 or slices
+
+
+def _gather_pad(tokens, num_kv, width):
+  """Extra KV rows so a packed batch stays on the index path.
+
+  The closed form assumes one sequence. Packing the batch into the token axis
+  would make that form attend across the batch boundary, so the packed call
+  adds unreferenced rows until every closed-form predicate is false.
+  """
+  if not _uses_closed_form(tokens, num_kv, width):
+    return 0
+  for extra in range(1, 64):
+    if not _uses_closed_form(tokens, num_kv + extra, width):
+      return extra
+  raise ValueError(f"no gather pad for tokens={tokens} num_kv={num_kv} width={width}")
+
+
+def _sparse_mla_batched(q, kv, topk, sink):
+  """One sparse-MLA launch for the whole batch. q is already scaled by 1/sqrt(head_dim)."""
+  from jax_flydsl.ops.sparse_mla import sparse_mla
+
+  batch, seqlen, heads, _ = q.shape
+  num_kv = kv.shape[1]
+  width = topk.shape[-1]
+  if batch == 1:
+    out = sparse_mla(q[0], kv[0], topk[0], sink, scale=1.0)
+    return out[None, ...]
+  offsets = (jnp.arange(batch, dtype=jnp.int32) * jnp.int32(num_kv))[:, None, None]
+  topk_flat = jnp.where(topk >= 0, topk + offsets, jnp.int32(-1)).reshape((batch * seqlen, width))
+  kv_flat = kv.reshape((batch * num_kv, kv.shape[-1]))
+  extra = _gather_pad(batch * seqlen, batch * num_kv, width)
+  if extra:
+    kv_flat = jnp.concatenate([kv_flat, jnp.zeros((extra, kv_flat.shape[-1]), dtype=kv_flat.dtype)], axis=0)
+  q_flat = q.reshape((batch * seqlen, heads, q.shape[-1]))
+  out = sparse_mla(q_flat, kv_flat, topk_flat, sink, scale=1.0)
+  return out.reshape((batch, seqlen, heads, out.shape[-1]))
 
 
 class CompressedAttention(Attention):
@@ -1472,6 +1563,57 @@ class CompressedAttention(Attention):
 
     return kv_out, kv_out
 
+  def _flydsl_sparse_mla(self, q, kv, compressed_kv, csa_topk):
+    """Sparse MLA on the 512-d latent. Returns None when this layer is outside the kernel contract."""
+    if self.head_dim != 512 or self.num_query_heads % 32 != 0 or kv.shape[-2] != 1:
+      return None
+    if self.sliding_window_size not in (None, _SPARSE_WINDOW):
+      return None
+    batch, seqlen, _, _ = q.shape
+    local = kv[..., 0, :]
+    if self.compress_ratio == 0:
+      kv_lat = _with_rope_pad(local)
+      topk = jnp.broadcast_to(_window_indices(seqlen), (batch, seqlen, _SPARSE_WINDOW))
+    elif self.compress_ratio == 4:
+      if csa_topk is None or compressed_kv is None or seqlen % self.compress_ratio != 0:
+        return None
+      pool = compressed_kv[..., 0, :]
+      kv_lat = _with_rope_pad(jnp.concatenate([local, pool], axis=1))
+      topk = jax.vmap(lambda idx: _csa_indices(seqlen, idx))(csa_topk)
+    elif self.compress_ratio > 4:
+      if compressed_kv is None or seqlen % self.compress_ratio != 0:
+        return None
+      pool = compressed_kv[..., 0, :]
+      kv_lat = _with_rope_pad(jnp.concatenate([local, pool], axis=1))
+      hca_idx = _hca_indices(seqlen, self.compress_ratio)
+      topk = jnp.broadcast_to(hca_idx, (batch, seqlen, hca_idx.shape[-1]))
+    else:
+      return None
+    if topk.shape[-1] % 32 != 0:
+      return None
+    sink = None if self.sinks is None else self.sinks.value.astype(jnp.float32)
+    q = _with_rope_pad(q)
+    # The step's batch axis is sharded across the expert devices. A custom call
+    # on the global shape all-gathers every sequence onto each device and then
+    # asks the kernel for 65536 tokens, which overflows its 32-bit buffer size.
+    # shard_map hands the kernel the sequences this device already owns.
+    from jax.sharding import PartitionSpec as P
+
+    q_spec = self._logical_to_mesh_axes(self.query_axis_names)
+    batch_axis = q_spec[0]
+    kv_spec = P(batch_axis, None, None)
+    topk_spec = P(batch_axis, None, None)
+    out_spec = P(batch_axis, q_spec[1], q_spec[2], q_spec[3])
+    if sink is None:
+      @jax.shard_map(mesh=self.mesh, in_specs=(q_spec, kv_spec, topk_spec), out_specs=out_spec)
+      def run(q, kv, topk):
+        return _sparse_mla_batched(q, kv, topk, None)
+      return run(q, kv_lat, topk)
+    @jax.shard_map(mesh=self.mesh, in_specs=(q_spec, kv_spec, topk_spec, P()), out_specs=out_spec)
+    def run(q, kv, topk, sink):
+      return _sparse_mla_batched(q, kv, topk, sink)
+    return run(q, kv_lat, topk, sink)
+
   def __call__(
       self,
       inputs_q: Array,
@@ -1550,12 +1692,13 @@ class CompressedAttention(Attention):
       compressed_segment_mask = jnp.where(valid_comp_seg, 0.0, DEFAULT_MASK_VALUE)
 
     # Route to the appropriate compressor depending on the layer's role in the architecture
+    csa_topk = None
     if self.compress_ratio > 4:
       compressed_kv, compressed_mask = self.hca_compressor(
           inputs_kv, q_normed, inputs_positions, model_mode, self.compressor_cache
       )
     elif self.compress_ratio == 4:
-      compressed_kv, compressed_mask = self.csa_compressor(
+      compressed_kv, compressed_mask, csa_topk = self.csa_compressor(
           inputs_kv,
           q_normed,
           inputs_positions,
@@ -1627,7 +1770,11 @@ class CompressedAttention(Attention):
 
     # Compute Attention
     # -> [batch, q_length, num_query_heads, head_dim]
-    attn_out = self.attention_op(
+    attn_out = None
+    if getattr(self.config, "use_flydsl_sparse_mla", False) and model_mode == MODEL_MODE_TRAIN:
+      attn_out = self._flydsl_sparse_mla(q, kv, compressed_kv, csa_topk)
+    if attn_out is None:
+      attn_out = self.attention_op(
         q,
         kv,
         kv,

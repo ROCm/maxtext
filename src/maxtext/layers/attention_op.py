@@ -2551,6 +2551,11 @@ class AttentionOp(nnx.Module):
       sinks_logits = jnp.broadcast_to(sinks_logits, (b, n_q, t, 1))
       logits = jnp.concatenate([logits, sinks_logits], axis=-1)
 
+    # The QK GEMM writes this table in [heads, queries, keys] order and softmax
+    # reads [keys, queries, heads]. Naming it lets a custom remat policy keep the
+    # softmax layout, so the backward does not rebuild the table.
+    logits = checkpoint_name(logits, "attn_scores")
+
     # softmax
     local_max = jnp.max(logits, axis=-1, keepdims=True)
     local_exps_combined = jnp.exp(logits - local_max)

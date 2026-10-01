@@ -738,6 +738,15 @@ class CompressedAttention(BaseModel):
   compressed_rope_max_timescale: int = Field(
       160000, description="If positive, used for Compressed Sparse/Heavy Attention."
   )
+  use_flydsl_sparse_mla: bool = Field(
+      False,
+      description=(
+          "Replace dot-product attention in CompressedAttention with the FlyDSL sparse MLA "
+          "kernel. Covers sliding-window 128, compress-4, and compress-128. The kernel is "
+          "bf16; fp16 activations are cast at the boundary. Query is already scaled by "
+          "1/sqrt(head_dim), so the kernel scale is 1."
+      ),
+  )
 
 
 class AttentionIndexer(BaseModel):
@@ -1417,6 +1426,10 @@ class RematAndOffload(BaseModel):
   attention_out: RematLocation = Field(
       RematLocation.REMAT,
       description="Remat policy for the attention output.",
+  )
+  attn_scores: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for the attention score table (queries by keys).",
   )
   engram: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the engram output.")
 
@@ -3710,6 +3723,7 @@ class MaxTextConfig(
           "qkv_proj",
           "attention_out",
           "out_proj",
+          "attn_scores",
       ]
       self.tensors_on_device = [t for t in tensors if getattr(self, t) == "device"]
       self.tensors_to_offload = [t for t in tensors if getattr(self, t) == "offload"]
@@ -4941,6 +4955,7 @@ class RLConfig(
           "qkv_proj",
           "attention_out",
           "out_proj",
+          "attn_scores",
       ]
       self.tensors_on_device = [t for t in tensors if getattr(self, t) == "device"]
       self.tensors_to_offload = [t for t in tensors if getattr(self, t) == "offload"]
