@@ -18,6 +18,7 @@ import dataclasses
 import functools
 from functools import partial
 import math
+import os
 from typing import Any, Callable, Optional, Tuple
 
 from flax import linen as nn
@@ -486,6 +487,8 @@ class AttentionOp(nnx.Module):
         "paged",
         "vllm_rpa",
         "vllm_batched_rpa",
+        "aiter_triton",
+        "jax_aiter_flash",
         "cudnn_flash_te",
         "cudnn_flash_jax",
     ):
@@ -1158,6 +1161,24 @@ class AttentionOp(nnx.Module):
         )
       return (
           self.cudnn_flash_attention(query, key, value, decoder_segment_ids, segment_positions, model_mode),
+          None,
+          None,
+      )
+    elif self.attention_kernel == "aiter_triton":
+      validate_gpu_flash_attention(sinks, record_max_logits)
+      if model_mode == MODEL_MODE_AUTOREGRESSIVE:
+        raise ValueError("Decode is not supported with attention=aiter_triton.")
+      return (
+          self.aiter_triton_attention(query, key, value, decoder_segment_ids, segment_positions),
+          None,
+          None,
+      )
+    elif self.attention_kernel == "jax_aiter_flash":
+      validate_gpu_flash_attention(sinks, record_max_logits)
+      if model_mode == MODEL_MODE_AUTOREGRESSIVE:
+        raise ValueError("Decode is not supported with attention=jax_aiter_flash.")
+      return (
+          self.jax_aiter_flash_attention(query, key, value, decoder_segment_ids, segment_positions),
           None,
           None,
       )
@@ -1849,6 +1870,364 @@ class AttentionOp(nnx.Module):
         sequence_descriptor=dummy_attn_mask,
     )
     return dpa_layer(query, key, value, sequence_descriptor=attn_mask)
+
+  def _aiter_triton_packed_metadata(self, segment_ids: Array) -> tuple[Array, Array, Array]:
+    """Compacts packed rows and returns (permutation, inverse, cu_seqlens).
+
+    AITER's Triton varlen API accepts one cumulative-offset array and therefore
+    requires tightly packed tokens. MaxText rows can contain id-0 padding, so
+    valid tokens are stably moved to the front and padding to the back. Real
+    segment lengths are followed by one padding segment per row. Zero-length
+    slots make the metadata shape independent of batch contents.
+    """
+    batch, seq_len = segment_ids.shape
+    max_segments = int(self.config.max_segments_per_seq)
+    if max_segments <= 0:
+      if self.config.dataset_type != "synthetic":
+        raise ValueError("attention=aiter_triton with packing requires max_segments_per_seq > 0.")
+      max_segments = 1  # synthetic rows are a single segment
+
+    lengths = jax.vmap(partial(jnp.bincount, length=max_segments + 1))(segment_ids)[:, 1:]
+    flat_lengths = lengths.reshape(-1)
+    keep = flat_lengths > 0
+    compact_indices = jnp.nonzero(keep, size=flat_lengths.size, fill_value=flat_lengths.size)[0]
+    real_lengths = jnp.take(flat_lengths, compact_indices, fill_value=0)
+    padding_lengths = jnp.sum(segment_ids == 0, axis=1, dtype=jnp.int32)
+    all_lengths = jnp.concatenate([real_lengths.astype(jnp.int32), padding_lengths])
+    cu_seqlens = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), jnp.cumsum(all_lengths, dtype=jnp.int32)]
+    )
+
+    flat_padding = (segment_ids == 0).reshape(batch * seq_len)
+    permutation = jnp.argsort(flat_padding, stable=True)
+    inverse = jnp.argsort(permutation)
+    return permutation, inverse, cu_seqlens
+
+  def aiter_triton_attention(
+      self,
+      query: Array,
+      key: Array | KVTensor,
+      value: Array | KVTensor,
+      decoder_segment_ids: Array | None,
+      segment_positions: Array | None = None,
+  ) -> Array:
+    """Packed causal MLA forced through AITER Triton in both directions.
+
+    A diagnostic route. `jax_aiter_flash` is the production route: it keeps
+    AITER's ASM forward and lets jax-aiter choose the backward.
+    """
+    del segment_positions
+    # pylint: disable=import-outside-toplevel
+    from jax.experimental.shard_map import shard_map  # pytype: disable=import-error
+    from jax.sharding import PartitionSpec as P
+    from jax_aiter.triton.attention import flash_attn_varlen_triton  # pytype: disable=import-error
+
+    if isinstance(key, KVTensor):
+      key = key.dequant()
+    if isinstance(value, KVTensor):
+      value = value.dequant()
+    attention_type = getattr(self.attention_type, "value", self.attention_type)
+    if attention_type not in (
+        AttentionType.GLOBAL.value,
+        AttentionType.FULL.value,
+        AttentionType.MLA.value,
+    ):
+      raise NotImplementedError(
+          f"attention=aiter_triton supports global causal attention only, got {self.attention_type}."
+      )
+    if self.dropout_rate and self.dropout_rate > 0.0:
+      raise NotImplementedError("attention=aiter_triton does not implement attention dropout.")
+    if not self.config.packing and self.config.dataset_type != "synthetic":
+      # Unpacked real rows are mostly padding, which this route would compute.
+      raise NotImplementedError("attention=aiter_triton requires packed real data or synthetic full rows.")
+    if decoder_segment_ids is None:
+      raise ValueError("attention=aiter_triton requires decoder segment ids.")
+    if self.mesh.shape[self.config.context_sharding] > 1:
+      raise NotImplementedError("attention=aiter_triton does not support context parallelism.")
+
+    mesh = self.mesh
+    batch_axes = tuple(
+        axis
+        for axis in ("data", "fsdp", "fsdp_transpose", "expert")
+        if axis in mesh.axis_names and mesh.shape[axis] > 1
+    )
+    in_specs = (
+        P(batch_axes, None, None, None),
+        P(batch_axes, None, None, None),
+        P(batch_axes, None, None, None),
+        P(batch_axes, None),
+    )
+    out_specs = P(batch_axes, None, None, None)
+
+    def _local_varlen(q_local, k_local, v_local, sid_local):
+      batch, seq_len, q_heads, qk_dim = q_local.shape
+      total = batch * seq_len
+      permutation, inverse, cu_seqlens = self._aiter_triton_packed_metadata(sid_local)
+      q_flat = q_local.reshape(total, q_heads, qk_dim)[permutation]
+      k_flat = k_local.reshape(total, k_local.shape[2], k_local.shape[3])[permutation]
+      v_flat = v_local.reshape(total, v_local.shape[2], v_local.shape[3])[permutation]
+      out_flat = flash_attn_varlen_triton(
+          q_flat,
+          k_flat,
+          v_flat,
+          cu_seqlens,
+          cu_seqlens,
+          seq_len,
+          seq_len,
+          0.0,
+          1.0,
+          True,
+      )
+      compact_valid = sid_local.reshape(total)[permutation] != 0
+      out_flat = jnp.where(compact_valid[:, None, None], out_flat, 0)
+      return out_flat[inverse].reshape(batch, seq_len, q_heads, v_local.shape[-1])
+
+    return shard_map(
+        _local_varlen,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_rep=False,
+    )(query, key, value, decoder_segment_ids)
+
+  @staticmethod
+  def _jax_aiter_flash_metadata(segment_ids: Array, seq_len: int, max_segments: int) -> tuple[Array, Array]:
+    """AITER group-mode metadata for one device-local ``[b_local, seq_len]`` shard.
+
+    * ``seqstart``  -- cumulative **physical** token offsets, padding included.
+    * ``cu_seqlen`` -- cumulative **logical** lengths, padding excluded.
+
+    This is the description TE derives for its CK backend, so both routes skip
+    the same padding. Segment id ``0`` is padding. Both arrays are statically
+    sized at ``b_local * max_segments + 1`` slots; unused slots are empty and
+    point at the end of the buffer. Assumes MaxText's packing invariants: ids
+    are monotonic within a row and each id forms one contiguous run.
+    """
+    b_local = segment_ids.shape[0]
+    n_slots = b_local * max_segments
+    total = b_local * seq_len
+    sid = segment_ids.astype(jnp.int32)
+
+    # Logical length of every (row, id) pair; drop the id-0 (padding) bucket.
+    lengths = jax.vmap(partial(jnp.bincount, length=max_segments + 1))(sid)[:, 1:]
+
+    # First token of each non-padding run, as a flattened offset.
+    starts_row = jnp.concatenate(
+        [sid[:, :1] != 0, jnp.logical_and(sid[:, 1:] != sid[:, :-1], sid[:, 1:] != 0)],
+        axis=1,
+    )
+    offsets = jax.vmap(partial(jnp.argwhere, size=max_segments + 1, fill_value=-1))(starts_row)
+    offsets = offsets.squeeze(-1)
+    offsets = jnp.where(offsets >= 0, offsets + (jnp.arange(b_local) * seq_len)[:, None], -1)
+
+    def _compact(x, keep, fill):
+      """Move kept entries of a [b, k] array to the front of one flat array."""
+      flat = x.reshape(-1)
+      idx = jnp.nonzero(keep.reshape(-1), size=flat.size, fill_value=flat.size)[0]
+      return jnp.take(flat, idx, fill_value=fill)
+
+    lengths = _compact(lengths, lengths > 0, fill=0)[:n_slots]
+    seqstart = _compact(offsets, offsets >= 0, fill=total)[:n_slots]
+    seqstart = jnp.concatenate([seqstart, jnp.full((1,), total, jnp.int32)]).astype(jnp.int32)
+    cu_seqlen = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(lengths).astype(jnp.int32)])
+    return seqstart, cu_seqlen
+
+  @staticmethod
+  def _jax_aiter_flash_bucket_metadata(
+      segment_ids: Array, seq_len: int, max_segments: int
+  ) -> tuple[tuple[tuple[Array, Array, Array], ...], Array]:
+    """Build four bounded group-mode calls and report metadata overflow.
+
+    The 512/1024/2048/4096 schedule is the fastest measured schedule for
+    packed DeepSeek MLA on gfx950. The short bucket deliberately budgets 32
+    documents per row instead of the public maximum of 64. If a legal shard
+    exceeds that common-case budget, ``overflow`` selects the original
+    unbucketed call rather than truncating any document.
+    """
+    b_local = segment_ids.shape[0]
+    total = b_local * seq_len
+    sid = segment_ids.astype(jnp.int32)
+    lengths_by_id = jax.vmap(partial(jnp.bincount, length=max_segments + 1))(sid)
+    lengths = lengths_by_id[:, 1:]
+
+    starts_row = jnp.concatenate(
+        [sid[:, :1] != 0, jnp.logical_and(sid[:, 1:] != sid[:, :-1], sid[:, 1:] != 0)],
+        axis=1,
+    )
+    offsets = jax.vmap(partial(jnp.argwhere, size=max_segments + 1, fill_value=-1))(starts_row)
+    offsets = offsets.squeeze(-1)[:, :max_segments]
+    offsets = jnp.where(offsets >= 0, offsets + (jnp.arange(b_local) * seq_len)[:, None], -1)
+
+    token_lengths = jnp.take_along_axis(lengths_by_id.at[:, 0].set(0), sid, axis=1)
+    bounds = (512, 1024, 2048, 4096)
+    per_row_slots = (min(max_segments, 32), min(max_segments, 7), min(max_segments, 3), min(max_segments, 1))
+    buckets = []
+    overflow = jnp.asarray(False)
+    lo = 0
+    for hi, row_slots in zip(bounds, per_row_slots):
+      slots = b_local * row_slots
+      keep = jnp.logical_and(lengths > lo, lengths <= hi)
+      count = jnp.count_nonzero(keep)
+      overflow = jnp.logical_or(overflow, count > slots)
+
+      flat_keep = keep.reshape(-1)
+      idx = jnp.nonzero(flat_keep, size=slots, fill_value=flat_keep.size)[0]
+      flat_offsets = offsets.reshape(-1)
+      flat_lengths = lengths.reshape(-1)
+      starts = jnp.take(flat_offsets, idx, fill_value=total)
+      bucket_lengths = jnp.take(flat_lengths, idx, fill_value=0)
+      seqstart = jnp.concatenate([starts, jnp.full((1,), total, jnp.int32)]).astype(jnp.int32)
+      cu_seqlen = jnp.concatenate(
+          [jnp.zeros((1,), jnp.int32), jnp.cumsum(bucket_lengths).astype(jnp.int32)]
+      )
+      owner = jnp.logical_and(token_lengths > lo, token_lengths <= hi).reshape(total)
+      buckets.append((seqstart, cu_seqlen, owner))
+      lo = hi
+    return tuple(buckets), overflow
+
+  def jax_aiter_flash_attention(
+      self,
+      query: Array,
+      key: Array | KVTensor,
+      value: Array | KVTensor,
+      decoder_segment_ids: Array | None,
+      segment_positions: Array | None = None,
+  ) -> Array:
+    """Causal attention through jax-aiter, which chooses ASM, CK, or Triton.
+
+    Full-length rows (synthetic data, or no segment ids) use the layout
+    jax-aiter picks: batch mode, where AITER has ASM kernels in both
+    directions, or one tight segment per row when a group-mode-only backward
+    is forced. Real data uses group mode with physical offsets and logical
+    lengths, so packed documents and padding are handled as on the
+    `cudnn_flash_te` route; jax-aiter picks the backward. MaxText pre-scales
+    the query, so the softmax scale is 1.0.
+    """
+    del segment_positions
+    # pylint: disable=import-outside-toplevel
+    from jax.experimental.shard_map import shard_map  # pytype: disable=import-error
+    from jax.sharding import PartitionSpec as P
+    from jax_aiter.mha import (  # pytype: disable=import-error
+        flash_attn_auto,
+        flash_attn_varlen_auto,
+        full_row_layout,
+    )
+
+    if isinstance(key, KVTensor):
+      key = key.dequant()
+    if isinstance(value, KVTensor):
+      value = value.dequant()
+    attention_type = getattr(self.attention_type, "value", self.attention_type)
+    if attention_type not in (
+        AttentionType.GLOBAL.value,
+        AttentionType.FULL.value,
+        AttentionType.MLA.value,
+    ):
+      raise NotImplementedError(
+          f"attention=jax_aiter_flash supports global causal attention only, got {self.attention_type}."
+      )
+    if self.dropout_rate and self.dropout_rate > 0.0:
+      raise NotImplementedError("attention=jax_aiter_flash does not implement attention dropout.")
+    if self.mesh.shape[self.config.context_sharding] > 1:
+      raise NotImplementedError("attention=jax_aiter_flash does not support context parallelism.")
+
+    if os.environ.get("MAXTEXT_DIAGNOSTIC_FORCE_BATCH_ATTN", "0") == "1":
+      # Performance-only counterfactual: ignore packed-document boundaries and
+      # run the synthetic/full-row batch kernel on the same token tensor.
+      return flash_attn_auto(query, key, value, softmax_scale=1.0)
+
+    if decoder_segment_ids is None or self.config.dataset_type == "synthetic":
+      layout = full_row_layout(
+          q_dtype=query.dtype, hd_qk=query.shape[-1], hd_v=value.shape[-1], causal=True
+      )
+      if decoder_segment_ids is None or layout == "batch":
+        return flash_attn_auto(query, key, value, softmax_scale=1.0)
+      max_segments = None
+    else:
+      max_segments = int(self.config.max_segments_per_seq) if self.config.packing else 1
+      if max_segments <= 0:
+        raise ValueError("attention=jax_aiter_flash with packing requires max_segments_per_seq > 0.")
+
+    mesh = self.mesh
+    batch_axes = tuple(
+        axis
+        for axis in ("data", "fsdp", "fsdp_transpose", "expert")
+        if axis in mesh.axis_names and mesh.shape[axis] > 1
+    )
+    in_specs = (
+        P(batch_axes, None, None, None),
+        P(batch_axes, None, None, None),
+        P(batch_axes, None, None, None),
+        P(batch_axes, None),
+    )
+    out_specs = P(batch_axes, None, None, None)
+
+    def _local_varlen(q_local, k_local, v_local, sid_local):
+      batch, seq_len, q_heads, qk_dim = q_local.shape
+      total = batch * seq_len
+      if max_segments is None:
+        # Full rows: one tight segment per row, no padding to describe.
+        seqstart = jnp.arange(batch + 1, dtype=jnp.int32) * seq_len
+        cu_seqlen = None
+      else:
+        seqstart, cu_seqlen = self._jax_aiter_flash_metadata(sid_local, seq_len, max_segments)
+      q_flat = q_local.reshape(total, q_heads, qk_dim)
+      k_flat = k_local.reshape(total, k_local.shape[2], k_local.shape[3])
+      v_flat = v_local.reshape(total, v_local.shape[2], v_local.shape[3])
+
+      def _call(ss, cl, bound):
+        return flash_attn_varlen_auto(
+            q_flat,
+            k_flat,
+            v_flat,
+            ss,
+            ss,
+            cl,
+            cl,
+            bound,
+            bound,
+            0.0,
+            1.0,
+            True,
+            (-1, -1),
+        )
+
+      # Restrict the measured schedule to the DeepSeek MLA shape. Other
+      # group-mode shapes keep the existing single call.
+      use_buckets = os.environ.get("MAXTEXT_JAX_AITER_FLASH_BUCKETS", "1") != "0"
+      if (
+          use_buckets
+          and max_segments is not None
+          and seq_len == 4096
+          and qk_dim == 192
+          and v_local.shape[-1] == 128
+      ):
+        buckets, overflow = self._jax_aiter_flash_bucket_metadata(sid_local, seq_len, max_segments)
+
+        def _bucketed(_):
+          bucket_out = jnp.zeros_like(v_flat)
+          for bound, (ss, cl, owner) in zip((512, 1024, 2048, 4096), buckets):
+            out_i = _call(ss, cl, bound)
+            bucket_out = jnp.where(owner[:, None, None], out_i, bucket_out)
+          return bucket_out
+
+        out = lax.cond(
+            overflow,
+            lambda _: _call(seqstart, cu_seqlen, seq_len),
+            _bucketed,
+            operand=jnp.zeros((), dtype=jnp.int32),
+        )
+      else:
+        out = _call(seqstart, cu_seqlen, seq_len)
+      return out.reshape(batch, seq_len, q_heads, v_local.shape[-1])
+
+    return shard_map(
+        _local_varlen,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_rep=False,
+    )(query, key, value, decoder_segment_ids)
 
   def cudnn_jax_flash_attention(
       self,

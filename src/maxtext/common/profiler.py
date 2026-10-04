@@ -14,7 +14,7 @@
 
 """Dispatch to the chosen profiler."""
 
-from ctypes import cdll
+from ctypes import c_int, cdll
 import os
 import subprocess
 import shutil
@@ -34,6 +34,7 @@ class Profiler:
 
   def __init__(self, config, offset_step=0):
     self.libcudart = None
+    self.rocprof_control = None
     self.mode = config.profiler
     if self.mode != "":
       self.base_output_dir = config.tensorboard_dir
@@ -75,6 +76,26 @@ class Profiler:
     if advanced_config:
       self.profiling_options.advanced_configuration = advanced_config
 
+    rocprof_start = os.environ.get("MAXTEXT_ROCPROF_START_STEP")
+    rocprof_steps = os.environ.get("MAXTEXT_ROCPROF_STEPS")
+    if bool(rocprof_start) != bool(rocprof_steps):
+      raise ValueError("MAXTEXT_ROCPROF_START_STEP and MAXTEXT_ROCPROF_STEPS must be set together")
+    if rocprof_start:
+      self.rocprof_start_step = int(rocprof_start)
+      self.rocprof_steps = int(rocprof_steps)
+      if self.rocprof_start_step < offset_step:
+        raise ValueError("MAXTEXT_ROCPROF_START_STEP must not precede the first training step")
+      if self.rocprof_steps <= 0:
+        raise ValueError("MAXTEXT_ROCPROF_STEPS must be positive")
+      self.rocprof_finished_step = self.rocprof_start_step + self.rocprof_steps - 1
+      if self.rocprof_finished_step >= config.steps:
+        raise ValueError("rocprof selected region must finish before the final training step")
+      self.rocprof_control = cdll.LoadLibrary("librocprofiler-sdk-roctx.so.1")
+      for name in ("roctxProfilerResume", "roctxProfilerPause"):
+        fn = getattr(self.rocprof_control, name)
+        fn.argtypes = [c_int]
+        fn.restype = c_int
+
   def maybe_activate_profiler(self, step, state):
     """Conditionally activates the profiler based on the current step.
     This method checks if the current training step matches the step designated
@@ -84,6 +105,15 @@ class Profiler:
     if self.mode != "" and (step == self.start_initial_profile_step or self.should_activate_periodic_profile(step)):
       optional_postfix = f"step_{step}" if self.profile_period > 0 else ""
       self.activate(blocking_object=state, optional_postfix=optional_postfix)
+    if self.rocprof_control is not None and step == self.rocprof_start_step:
+      jax.block_until_ready(state)
+      result = self.rocprof_control.roctxProfilerResume(0)
+      if result != 0:
+        raise RuntimeError(f"roctxProfilerResume failed with status {result}")
+      max_logging.log(
+          f"rocprof selected-region capture started at step {step} "
+          f"for {self.rocprof_steps} step(s)"
+      )
 
   def activate(self, blocking_object=None, optional_postfix=""):
     """Start the profiler.
@@ -122,6 +152,12 @@ class Profiler:
     """
     if self.mode != "" and (step == self.finished_initial_profile_step or self.should_deactivate_periodic_profile(step)):
       self.deactivate(blocking_object=state)
+    if self.rocprof_control is not None and step == self.rocprof_finished_step:
+      jax.block_until_ready(state)
+      result = self.rocprof_control.roctxProfilerPause(0)
+      if result != 0:
+        raise RuntimeError(f"roctxProfilerPause failed with status {result}")
+      max_logging.log(f"rocprof selected-region capture stopped after step {step}")
 
   def deactivate(self, blocking_object=None):
     """End the profiler.

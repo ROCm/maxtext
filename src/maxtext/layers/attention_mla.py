@@ -802,6 +802,8 @@ class MLA(Attention):
           quant=self.quant,
           matmul_precision=self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
+          mesh=self.mesh,
+          retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
           rngs=self.rngs,
       )
     else:
@@ -817,6 +819,14 @@ class MLA(Attention):
           quant=self.quant,
           matmul_precision=self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
+          mesh=self.mesh,
+          retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
+          use_jax_aiter_mxfp4=(
+              "attention_wq_a"
+              in getattr(
+                  self.config, "jax_aiter_mxfp4_linear_roles", ()
+              )
+          ),
           rngs=self.rngs,
       )
       self.q_norm = RMSNorm(
@@ -838,6 +848,14 @@ class MLA(Attention):
           quant=self.quant,
           matmul_precision=self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
+          mesh=self.mesh,
+          retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
+          use_jax_aiter_mxfp4=(
+              "attention_wq_b"
+              in getattr(
+                  self.config, "jax_aiter_mxfp4_linear_roles", ()
+              )
+          ),
           rngs=self.rngs,
       )
 
@@ -853,6 +871,8 @@ class MLA(Attention):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         shard_mode=self.config.shard_mode,
+        mesh=self.mesh,
+        retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
         rngs=self.rngs,
     )
     self.kv_norm = RMSNorm(
@@ -877,6 +897,8 @@ class MLA(Attention):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         shard_mode=self.config.shard_mode,
+        mesh=self.mesh,
+        retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
         rngs=self.rngs,
     )
 

@@ -322,7 +322,13 @@ class Decoder(nn.Module):
           config=self.config, layers=build_pipeline_stage_layers, mesh=self.mesh, remat_policy=remat_policy
       )
 
-  def minimal_policy(self, with_context=False, with_quantization=False):
+  def minimal_policy(
+      self,
+      with_context=False,
+      with_quantization=False,
+      with_moe_io=False,
+      with_moe_routing=False,
+  ):
     """Helper for creating minimal checkpoint policies."""
     names = [
         "query_proj",
@@ -335,11 +341,44 @@ class Decoder(nn.Module):
         "mlpwi_1",
         "mlpwi",
         "mlpwo",
+        "mxfp4_linear",
+        "gathered_weight",
     ]
     if with_context:
       names.append("context")
     if with_quantization:
       names.append("quantization")
+    if with_moe_io:
+      # Expert up-projection output and both expert-parallel all-to-all results,
+      # so backward does not replay the dispatch/combine communication.
+      names.extend(["moe_mlpwi_1", "moe_dispatched", "moe_dispatched_meta", "moe_combined"])
+    if with_moe_routing:
+      # Torch-matched routing metadata and MLA low-rank projections. These are
+      # cheap relative to expert activations and prevent backward remat from
+      # replaying top-k, stable sorts, group counts, and MLA down-projections.
+      names.extend([
+          "moe_topk_weights",
+          "moe_topk_indices",
+          "moe_sort_order",
+          "moe_group_sizes",
+          "moe_sorted_expert_ids",
+          "moe_reshaped_group_sizes",
+          "moe_all_shards_group_sizes",
+          "moe_global_group_sizes",
+          "moe_local_sort_order",
+          "moe_local_group_sizes",
+          "moe_local_sorted_expert_ids",
+          "moe_padded_group_sizes",
+          "query_wa_proj",
+          "kv_wa_proj",
+          "mla_q",
+          "mla_kv",
+      ])
+    if self.config.jax_aiter_mxfp4_dedup_dispatch:
+      # Backward reuses the forward dispatch plan and expert ids. A recomputed
+      # top-k can differ from the forward one, which would misalign gradients
+      # with the saved expert rows.
+      names.extend(name for name in ("moe_topk_indices", "moe_dedup_plan") if name not in names)
     return jax.checkpoint_policies.save_only_these_names(*names)
 
   def get_remat_policy(self):
@@ -353,6 +392,14 @@ class Decoder(nn.Module):
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
         policy = self.minimal_policy(with_context=True)
+      elif cfg.remat_policy == "minimal_with_context_moe":
+        policy = self.minimal_policy(with_context=True, with_moe_io=True)
+      elif cfg.remat_policy == "minimal_with_context_moe_routing":
+        policy = self.minimal_policy(
+            with_context=True,
+            with_moe_io=True,
+            with_moe_routing=True,
+        )
       elif cfg.remat_policy == "minimal":
         # save all except context
         policy = self.minimal_policy()

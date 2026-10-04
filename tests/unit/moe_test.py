@@ -21,7 +21,7 @@ from flax.linen import partitioning as nn_partitioning
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh
+from jax.sharding import Mesh, PartitionSpec as P
 from maxtext.configs import pyconfig
 from maxtext.common.common_types import Config, DType
 from maxtext.layers import linears
@@ -303,6 +303,67 @@ class DeepSeekRoutingTest(unittest.TestCase):
     actual_updates = moe.calculate_load_balance_updates(top_k_indices, num_experts, rate)
 
     assert_moe_close(actual_updates, expected_updates, jnp.float32)
+
+  def test_deepseek_bias_updates_zero_mean(self):
+    top_k_indices = jnp.array([[[0, 0], [0, 0], [1, 2], [3, 0]]])
+    actual_updates = moe.calculate_load_balance_updates(
+        top_k_indices, num_experts=4, rate=0.01, zero_mean=True
+    )
+
+    self.assertAlmostEqual(float(jnp.sum(actual_updates)), 0.0, places=7)
+    expected = jnp.array([-0.015, 0.005, 0.005, 0.005])
+    assert_moe_close(actual_updates, expected, jnp.float32)
+
+
+class RoutingPermutationTest(unittest.TestCase):
+  """Tests the scatter inverse and narrowed stable-sort keys used by routing."""
+
+  def test_inverse_permutation_matches_argsort(self):
+    permutations = (
+        jnp.array([0], dtype=jnp.int32),
+        jnp.array([2, 0, 3, 1], dtype=jnp.int32),
+        jnp.array([5, 2, 0, 4, 1, 3], dtype=jnp.int32),
+    )
+    inverse_fn = jax.jit(moe._inverse_permutation)  # pylint: disable=protected-access
+
+    for permutation in permutations:
+      np.testing.assert_array_equal(
+          np.asarray(inverse_fn(permutation)),
+          np.asarray(jnp.argsort(permutation)),
+      )
+
+  def test_inverse_permutation_rejects_non_vector(self):
+    with self.assertRaisesRegex(ValueError, "permutation must be 1D"):
+      moe._inverse_permutation(jnp.arange(4).reshape(2, 2))  # pylint: disable=protected-access
+
+  def test_custom_sort_vjp_scatter_matches_gather_gradient(self):
+    permutation = jnp.array([2, 0, 3, 1], dtype=jnp.int32)
+    inputs = jnp.arange(12, dtype=jnp.float32).reshape(4, 3)
+    cotangent = jnp.arange(12, 24, dtype=jnp.float32).reshape(4, 3)
+
+    def loss_fn(values):
+      sorted_values = moe._sort_activations_custom(  # pylint: disable=protected-access
+          values, permutation
+      )
+      return jnp.sum(sorted_values * cotangent)
+
+    actual = jax.grad(loss_fn)(inputs)
+    expected = jnp.zeros_like(inputs).at[permutation].set(cotangent)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+  def test_expert_sort_key_uint8_boundary_and_stability(self):
+    expert_ids = jnp.array([255, 0, 255, 1, 0], dtype=jnp.int32)
+    narrowed = moe._expert_sort_key(expert_ids, 255)  # pylint: disable=protected-access
+    self.assertEqual(narrowed.dtype, jnp.uint8)
+    np.testing.assert_array_equal(
+        np.asarray(jnp.argsort(narrowed, stable=True)),
+        np.asarray(jnp.argsort(expert_ids, stable=True)),
+    )
+
+    sentinel_ids = jnp.array([0, 256], dtype=jnp.int32)
+    not_narrowed = moe._expert_sort_key(sentinel_ids, 256)  # pylint: disable=protected-access
+    self.assertEqual(not_narrowed.dtype, jnp.int32)
+    np.testing.assert_array_equal(np.asarray(not_narrowed), np.asarray(sentinel_ids))
 
 
 class MoeLoopBlock(nnx.Module):
@@ -1236,6 +1297,221 @@ class RoutedMoeTest(unittest.TestCase):
             "Local permuted expert assignments to not match the expected unpermuted expert assignments "
             f"for shard_id={shard_id}."
         )
+
+  def test_split_expert_route_matrix(self):
+    # Two senders, two receiver shards, and two local experts per receiver.
+    all_expert_sizes = jnp.asarray(
+        [
+            [3, 2, 1, 4],
+            [4, 3, 5, 1],
+        ],
+        dtype=jnp.int32,
+    )
+
+    primary, overflow, dropped = moe._split_expert_route_matrix(
+        all_expert_sizes,
+        num_expert_shards=2,
+        primary_capacity=8,
+        overflow_capacity=4,
+    )
+
+    np.testing.assert_array_equal(
+        primary,
+        [
+            [3, 2, 1, 4],
+            [3, 0, 3, 0],
+        ],
+    )
+    np.testing.assert_array_equal(
+        overflow,
+        [
+            [0, 0, 0, 0],
+            [1, 3, 2, 1],
+        ],
+    )
+    np.testing.assert_array_equal(dropped, jnp.zeros_like(dropped))
+    np.testing.assert_array_equal(
+        primary + overflow + dropped,
+        all_expert_sizes,
+    )
+
+  def test_single_buffer_tier_round_trip_and_grad(self):
+    if len(jax.local_devices()) < 8:
+      pytest.skip("requires eight local devices")
+
+    num_shards = 8
+    local_experts = 2
+    all_expert_sizes = np.zeros(
+        (num_shards, num_shards * local_experts), dtype=np.int32
+    )
+    for sender in range(num_shards):
+      all_expert_sizes[sender, 0] = 2
+      receiver = 1 + sender % (num_shards - 1)
+      all_expert_sizes[sender, receiver * local_experts] = 1
+
+    _, overflow_experts, dropped = (
+        moe._split_expert_route_matrix(
+            jnp.asarray(all_expert_sizes),
+            num_expert_shards=num_shards,
+            primary_capacity=8,
+            overflow_capacity=8,
+        )
+    )
+    np.testing.assert_array_equal(dropped, 0)
+
+    def traffic(expert_sizes):
+      return expert_sizes.reshape(
+          num_shards, num_shards, local_experts
+      ).sum(axis=2)
+
+    all_traffic = traffic(jnp.asarray(all_expert_sizes))
+    overflow_traffic = traffic(overflow_experts)
+    mesh = Mesh(
+        np.asarray(jax.local_devices()[:num_shards]), ("expert",)
+    )
+
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=P("expert", None),
+        out_specs=P("expert", None),
+        check_vma=False,
+    )
+    def two_tier_round_trip(local_values):
+      shard_id = jax.lax.axis_index("expert")
+      local_values = local_values[0]
+      dispatch_params = moe.RoutedMoE.get_all_to_all_params(
+          all_traffic,
+          shard_id,
+          num_shards,
+          ragged_buffer_factor=2.0,
+          buffer_size=16,
+      )
+      received = jax.lax.ragged_all_to_all(
+          local_values,
+          jnp.zeros((16,), dtype=local_values.dtype),
+          *dispatch_params,
+          axis_name="expert",
+      )
+      primary_processed = received[:8] * 2
+      overflow_processed = jax.lax.cond(
+          jnp.sum(overflow_traffic[:, shard_id]) > 0,
+          lambda values: values * 2,
+          jnp.zeros_like,
+          received[8:],
+      )
+      combined_processed = jnp.concatenate(
+          (primary_processed, overflow_processed)
+      )
+      combine_params = moe.RoutedMoE.get_all_to_all_params(
+          all_traffic,
+          shard_id,
+          num_shards,
+          ragged_buffer_factor=2.0,
+          buffer_size=16,
+          is_dispatch=False,
+      )
+      restored = jax.lax.ragged_all_to_all(
+          combined_processed,
+          jnp.zeros_like(local_values),
+          *combine_params,
+          axis_name="expert",
+      )
+      return restored[None, :]
+
+    values = jnp.arange(num_shards * 3, dtype=jnp.float32).reshape(
+        num_shards, 3
+    )
+    actual = jax.jit(two_tier_round_trip)(values)
+    np.testing.assert_array_equal(actual, values * 2)
+    grads = jax.jit(jax.grad(lambda x: jnp.sum(two_tier_round_trip(x))))(
+        values
+    )
+    np.testing.assert_array_equal(grads, jnp.full_like(values, 2))
+
+  def test_fresh_ragged_all_to_all_matches_zero_buffer_with_drops(self):
+    if len(jax.local_devices()) < 8:
+      pytest.skip("requires eight local devices")
+    pytest.importorskip("jax_aiter.ops.buffers")
+
+    num_shards, local_rows, buffer_size, cols = 8, 24, 12, 4
+    traffic = np.random.default_rng(0).integers(0, 4, size=(num_shards, num_shards)).astype(np.int32)
+    received_totals = traffic.sum(axis=0)
+    assert received_totals.max() > buffer_size, "test needs dropped rows"
+    assert traffic.sum(axis=1).max() <= local_rows
+    traffic = jnp.asarray(traffic)
+    mesh = Mesh(np.asarray(jax.local_devices()[:num_shards]), ("expert",))
+
+    def make_round_trip(fresh):
+      @jax.shard_map(
+          mesh=mesh,
+          in_specs=(P("expert", None, None), P("expert", None, None)),
+          out_specs=P("expert", None, None),
+          check_vma=False,
+      )
+      def round_trip(local_values, local_weights):
+        shard_id = jax.lax.axis_index("expert")
+        local_values, local_weights = local_values[0], local_weights[0]
+        params = {
+            is_dispatch: moe.RoutedMoE.get_all_to_all_params(
+                traffic,
+                shard_id,
+                num_shards,
+                ragged_buffer_factor=1.0,
+                buffer_size=buffer_size,
+                is_dispatch=is_dispatch,
+            )
+            for is_dispatch in (True, False)
+        }
+        if fresh:
+          received = moe._ragged_all_to_all_fresh(
+              local_values,
+              *params[True],
+              moe._exclusive_cumsum(params[True][3]),
+              buffer_size,
+              "expert",
+              0,
+          )
+        else:
+          received = jax.lax.ragged_all_to_all(
+              local_values,
+              jnp.zeros((buffer_size, cols), local_values.dtype),
+              *params[True],
+              axis_name="expert",
+          )
+        processed = jnp.tanh(received) * 3.0
+        if fresh:
+          restored = moe._ragged_all_to_all_fresh(
+              processed,
+              *params[False],
+              moe._exclusive_cumsum(traffic[shard_id]),
+              local_rows,
+              "expert",
+              1,
+          )
+        else:
+          restored = jax.lax.ragged_all_to_all(
+              processed,
+              jnp.zeros_like(local_values),
+              *params[False],
+              axis_name="expert",
+          )
+        return (restored * local_weights)[None]
+
+      return round_trip
+
+    rng = np.random.default_rng(1)
+    values = jnp.asarray(rng.standard_normal((num_shards, local_rows, cols)), jnp.float32)
+    weights = jnp.asarray(rng.standard_normal((num_shards, local_rows, cols)), jnp.float32)
+    results = {}
+    for fresh in (False, True):
+      round_trip = make_round_trip(fresh)
+      output = jax.jit(round_trip)(values, weights)
+      grads = jax.jit(jax.grad(lambda x, w, f=round_trip: jnp.sum(f(x, w)), argnums=(0, 1)))(values, weights)
+      results[fresh] = (output, *grads)
+    for reference, actual in zip(results[False], results[True]):
+      np.testing.assert_array_equal(np.asarray(actual), np.asarray(reference))
+    # Dropped rows contribute nothing in either path.
+    assert np.any(np.asarray(results[False][0]) == 0)
 
   def test_get_all_to_all_params_sharded_batch(self):
     num_expert_parallelism_sharded = 4

@@ -22,6 +22,7 @@ production loss_fn uses (decoder_input_tokens, decoder_positions, ...).
 from dataclasses import dataclass
 import types as pytypes
 import unittest
+import warnings
 
 from flax import nnx
 import jax
@@ -29,6 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 from maxtext.common import train_state_nnx
 from maxtext.common.metric_logger import record_activation_metrics
+from maxtext.layers import moe
 from maxtext.optimizers import optimizers
 from maxtext.trainers.pre_train import train as pre_train
 import optax
@@ -285,7 +287,8 @@ class TestRoutedBiasReadNNX(unittest.TestCase):
     data = _make_data(batch=cfg.micro_batch_size_to_train_on, vocab=cfg.vocab_size)
     _, aux = pre_train.loss_fn(model, cfg, data, None, None, is_train=True)
     self.assertIsNotNone(aux["moe_bias_updates"])
-    np.testing.assert_allclose(np.asarray(aux["moe_bias_updates"][0]), np.ones((2, 3)))
+    self.assertIn("moe_layers", aux["moe_bias_updates"])
+    np.testing.assert_allclose(np.asarray(aux["moe_bias_updates"]["moe_layers"]), np.ones((2, 3)))
 
   def test_routed_bias_disabled_returns_none(self):
     cfg = _Cfg()  # routed_bias=False
@@ -293,6 +296,53 @@ class TestRoutedBiasReadNNX(unittest.TestCase):
     data = _make_data(batch=cfg.micro_batch_size_to_train_on, vocab=cfg.vocab_size)
     _, aux = pre_train.loss_fn(model, cfg, data, None, None, is_train=True)
     self.assertIsNone(aux["moe_bias_updates"])
+
+  def test_routed_bias_update_uses_nnx_array_api(self):
+    bias = nnx.Param(jnp.zeros((2, 3), dtype=jnp.bfloat16))
+    update = jnp.arange(6, dtype=jnp.float32).reshape(3, 2)
+
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always", DeprecationWarning)
+      pre_train._apply_router_bias_update(bias, update, "moe_layers")
+
+    np.testing.assert_array_equal(np.asarray(bias[...]), np.asarray(update.T, dtype=np.float32))
+    self.assertFalse(any(issubclass(w.category, DeprecationWarning) for w in caught))
+
+  def test_routed_bias_dtype_keeps_small_updates(self):
+    def gate(bias_dtype):
+      return moe.GateLogit(
+          in_features_shape=4,
+          out_features_shape=3,
+          mesh=None,
+          model_name="deepseek3",
+          rngs=nnx.Rngs(0),
+          weight_dtype=jnp.bfloat16,
+          dtype=jnp.float32,
+          kernel_axes=("embed", "mlp"),
+          use_bias=True,
+          bias_dtype=bias_dtype,
+      )
+
+    step = jnp.full((3,), 0.001, jnp.float32)
+    fp32, bf16 = gate(jnp.float32), gate(None)
+    self.assertEqual(fp32.bias[...].dtype, jnp.float32)
+    self.assertEqual(fp32.kernel[...].dtype, jnp.bfloat16)
+    self.assertEqual(bf16.bias[...].dtype, jnp.bfloat16)
+    for g in (fp32, bf16):
+      g.bias[...] = jnp.full((3,), 0.6, g.bias[...].dtype)
+      pre_train._apply_router_bias_update(g.bias, step, "moe_layers")
+    np.testing.assert_allclose(np.asarray(fp32.bias[...]), 0.601, rtol=1e-6)
+    # bf16 spacing near 0.6 is 2**-8, so a 0.001 step rounds away.
+    np.testing.assert_array_equal(np.asarray(bf16.bias[...], np.float32), np.float32(jnp.bfloat16(0.6)))
+
+  def test_adamw_mask_excludes_router_bias_from_weight_decay(self):
+    cfg = pytypes.SimpleNamespace(adamw_mask=["gate/bias"])
+    params = {"gate": {"bias": jnp.full((3,), 0.6), "kernel": jnp.ones((2, 3))}}
+    opt = optax.adamw(1e-2, weight_decay=0.1, mask=optimizers.get_adamw_mask(cfg))
+    grads = jax.tree_util.tree_map(jnp.zeros_like, params)
+    updates, _ = opt.update(grads, opt.init(params), params)
+    np.testing.assert_array_equal(np.asarray(updates["gate"]["bias"]), 0.0)
+    self.assertTrue(np.all(np.asarray(updates["gate"]["kernel"]) < 0.0))
 
 
 class TestRecordActivationMetricsParity(unittest.TestCase):

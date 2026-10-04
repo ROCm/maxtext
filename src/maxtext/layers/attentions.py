@@ -624,6 +624,8 @@ class Attention(nnx.Module):
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
         shard_mode=self.config.shard_mode,
+        mesh=self.mesh,
+        retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
         rngs=self.rngs,
     )
 
@@ -661,6 +663,8 @@ class Attention(nnx.Module):
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        mesh=self.mesh,
+        retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
         rngs=self.rngs,
     )
 
@@ -702,6 +706,8 @@ class Attention(nnx.Module):
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        mesh=self.mesh,
+        retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
         rngs=self.rngs,
     )
 
@@ -757,6 +763,12 @@ class Attention(nnx.Module):
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
         use_bias=False if self.is_qwen2 else self.use_bias_in_projections,
+        mesh=self.mesh,
+        retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
+        use_jax_aiter_mxfp4=(
+            "attention_wo"
+            in getattr(self.config, "jax_aiter_mxfp4_linear_roles", ())
+        ),
         rngs=self.rngs,
     )
 

@@ -880,7 +880,7 @@ class NNXDecoder(nnx.Module):
       length: int,
       kv_caches_stacked=None,
       skip_block_remat: bool = False,
-      unroll: int = 1,
+      unroll: int | None = None,
       **kwargs,
   ):
     """Runs the layer stack using nnx.scan.
@@ -902,7 +902,8 @@ class NNXDecoder(nnx.Module):
         Used when the scanned module already applies its own (finer-grained,
         e.g. per-layer) remat internally, to avoid double rematerialization.
       unroll: Number of scan iterations to unroll into straight-line code
-        (forwarded to jax.lax.scan). unroll >= length fully unrolls the loop.
+        (forwarded to jax.lax.scan). When omitted, uses
+        ``config.scan_layer_unroll``. ``unroll >= length`` fully unrolls the loop.
       **kwargs: Keyword args forwarded to the layer (filtered by the layer signature).
 
     Returns:
@@ -915,6 +916,8 @@ class NNXDecoder(nnx.Module):
           layers,
           kv_caches_stacked if kv_caches_stacked is not None else None,
       )
+    if unroll is None:
+      unroll = getattr(self.config, "scan_layer_unroll", 1)
     policy = self.get_remat_policy()
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
     graphdef, params, state = nnx.split(layers, nnx.Param, ...)
@@ -1043,6 +1046,18 @@ class NNXDecoder(nnx.Module):
       clean_state = nnx.filter_state(scanned_state, nnx.Not((nnx.RngState, nnx.Intermediate)))
       nnx.update(layers, clean_state)
       out_layers = layers
+      # The Intermediate filter above would otherwise drop the per-layer router
+      # bias updates, silently disabling DeepSeek loss-free load balancing.
+      if "moe_bias_updates" in scanned_state:
+        stacked_updates = jax.tree_util.tree_leaves(scanned_state["moe_bias_updates"])
+        if stacked_updates:
+          layers.sow(
+              nnx.Intermediate,
+              "moe_bias_updates",
+              stacked_updates[0],
+              reduce_fn=lambda _, new: new,
+              init_fn=lambda: None,
+          )
 
     return final_carry, out_layers, returned_kv_stacked if use_kv else None
 
@@ -1087,7 +1102,13 @@ class NNXDecoder(nnx.Module):
 
     return layer_map[cfg.decoder_block]
 
-  def minimal_policy(self, with_context=False, with_quantization=False):
+  def minimal_policy(
+      self,
+      with_context=False,
+      with_quantization=False,
+      with_moe_io=False,
+      with_moe_routing=False,
+  ):
     """Helper for creating minimal checkpoint policies."""
     names = [
         "query_proj",
@@ -1100,11 +1121,44 @@ class NNXDecoder(nnx.Module):
         "mlpwi_1",
         "mlpwi",
         "mlpwo",
+        "mxfp4_linear",
+        "gathered_weight",
     ]
     if with_context:
       names.append("context")
     if with_quantization:
       names.append("quantization")
+    if with_moe_io:
+      # Expert up-projection output and both expert-parallel all-to-all results,
+      # so backward does not replay the dispatch/combine communication.
+      names.extend(["moe_mlpwi_1", "moe_dispatched", "moe_dispatched_meta", "moe_combined"])
+    if with_moe_routing:
+      # Torch-matched routing metadata and MLA low-rank projections. These are
+      # cheap relative to expert activations and prevent backward remat from
+      # replaying top-k, stable sorts, group counts, and MLA down-projections.
+      names.extend([
+          "moe_topk_weights",
+          "moe_topk_indices",
+          "moe_sort_order",
+          "moe_group_sizes",
+          "moe_sorted_expert_ids",
+          "moe_reshaped_group_sizes",
+          "moe_all_shards_group_sizes",
+          "moe_global_group_sizes",
+          "moe_local_sort_order",
+          "moe_local_group_sizes",
+          "moe_local_sorted_expert_ids",
+          "moe_padded_group_sizes",
+          "query_wa_proj",
+          "kv_wa_proj",
+          "mla_q",
+          "mla_kv",
+      ])
+    if self.config.jax_aiter_mxfp4_dedup_dispatch:
+      # Backward reuses the forward dispatch plan and expert ids. A recomputed
+      # top-k can differ from the forward one, which would misalign gradients
+      # with the saved expert rows.
+      names.extend(name for name in ("moe_topk_indices", "moe_dedup_plan") if name not in names)
     return jax.checkpoint_policies.save_only_these_names(*names)
 
   def get_remat_policy(self):
@@ -1116,6 +1170,14 @@ class NNXDecoder(nnx.Module):
         if cfg.remat_policy == "minimal_flash":
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
         policy = self.minimal_policy(with_context=True)
+      elif cfg.remat_policy == "minimal_with_context_moe":
+        policy = self.minimal_policy(with_context=True, with_moe_io=True)
+      elif cfg.remat_policy == "minimal_with_context_moe_routing":
+        policy = self.minimal_policy(
+            with_context=True,
+            with_moe_io=True,
+            with_moe_routing=True,
+        )
       elif cfg.remat_policy == "minimal":
         policy = self.minimal_policy()
       elif cfg.remat_policy == "minimal_with_quantization":

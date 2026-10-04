@@ -960,6 +960,94 @@ class MoEKernels(BaseModel):
 
   megablox: bool = Field(True, description="Whether to use Megablox kernels for MoE.")
   sparse_matmul: bool = Field(True, description="Whether to use sparse matmul kernels for MoE.")
+  moe_local_expert_backend: Literal["default", "jax_aiter_mxfp4"] = Field(
+      "default",
+      description=(
+          "Backend for local routed-expert gate/up/down grouped matrix multiplications. "
+          "The jax_aiter_mxfp4 backend is a gfx950 training path and does not "
+          "change attention, routing, collectives, or shared experts."
+      ),
+  )
+  jax_aiter_mxfp4_grouped_kernel: Literal["ragged", "wholeloop"] = Field(
+      "wholeloop",
+      description=(
+          "Grouped-GEMM kernel family for moe_local_expert_backend=jax_aiter_mxfp4. "
+          "wholeloop uses the collaborator whole-loop kernels, pads each expert's "
+          "rows to 256, and requires emb_dim and moe_mlp_dim divisible by 256. "
+          "ragged pads each expert's rows to 128."
+      ),
+  )
+  jax_aiter_mxfp4_check_route_capacity: bool = Field(
+      True,
+      description=(
+          "Check routed-token capacity with a host callback before MXFP4 expert "
+          "padding. Disable only after validating ragged_buffer_factor for the "
+          "workload; disabling removes the callback from the training graph."
+      ),
+  )
+  jax_aiter_mxfp4_overflow_buffer_factor: float = Field(
+      0.0,
+      ge=0.0,
+      description=(
+          "Optional second ragged route buffer for the JAX-AITER MXFP4 expert "
+          "path, measured relative to the balanced rows per EP rank. Zero "
+          "disables it. The primary buffer remains controlled by "
+          "ragged_buffer_factor."
+      ),
+  )
+  jax_aiter_mxfp4_fresh_a2a_buffers: bool = Field(
+      False,
+      description=(
+          "Give each MXFP4 routed ragged all-to-all a fresh uninitialized "
+          "destination buffer and mask the rows it does not write, instead of "
+          "a zero buffer that XLA hoists out of the layer scan and copies "
+          "every iteration. Results are unchanged."
+      ),
+  )
+  jax_aiter_mxfp4_fuse_gate_up: bool = Field(
+      False,
+      description=(
+          "Run the MXFP4 routed-expert gate and up projections as one grouped "
+          "GEMM with output [rows, 2*moe_mlp_dim], saved for backward under "
+          "the 'mlpwi' remat name. Its input gradient is one GEMM instead of "
+          "two partial gradients plus their sum."
+      ),
+  )
+  jax_aiter_mxfp4_dedup_dispatch: bool = Field(
+      False,
+      description=(
+          "Send each token to each expert shard once, with its local expert "
+          "ids and routing weights, and sum each shard's expert outputs before "
+          "the return all-to-all. The receive buffer holds the worst case; "
+          "ragged_buffer_factor and jax_aiter_mxfp4_overflow_buffer_factor "
+          "size the local expert tiers. Routing weights scale the "
+          "down-projection input instead of its output."
+      ),
+  )
+  jax_aiter_mxfp4_dedup_skip_unread_zeroing: bool = Field(
+      False,
+      description=(
+          "With dedup dispatch, leave uninitialized the all-to-all rows that "
+          "are not received and the grouped GEMM rows past the last expert "
+          "group, in the forward and backward passes. Only masked gathers "
+          "read those rows, so results are unchanged."
+      ),
+  )
+  jax_aiter_mxfp4_linear_roles: list[
+      Literal[
+          "attention_wo",
+          "attention_wq_a",
+          "attention_wq_b",
+          "mlp_up",
+          "mlp_down",
+      ]
+  ] = Field(
+      default_factory=list,
+      description=(
+          "Dense linear roles that use the JAX-AITER E=1 whole-loop MXFP4 "
+          "training path. Empty keeps every non-routed-expert linear unchanged."
+      ),
+  )
   wi_tile_fwd_batch_seq: int = Field(
       512,
       description="forward pass tiling dimension for batch/sequence in GMM for wi.",
@@ -1009,6 +1097,14 @@ class DeepSeekMoE(BaseModel):
   routed_score_func: str = Field("", description="Scoring function for routing (e.g., 'softmax', 'sigmoid').")
   routed_bias: bool = Field(False, description="Whether to add a bias term for routing.")
   routed_bias_update_rate: float = Field(0.0, description="Update rate applied to the router bias term.")
+  routed_bias_zero_mean_update: bool = Field(
+      False,
+      description="Subtract the mean correction-bias update, matching the TorchTitan router update.",
+  )
+  routed_bias_dtype: str = Field(
+      "",
+      description="Storage dtype of the router correction bias (e.g. 'float32'); empty uses weight_dtype.",
+  )
   mlp_bias: bool = Field(
       False,
       description="Whether to add a learnable bias for MLP matmul, "
@@ -1077,6 +1173,13 @@ class HardwareAndMesh(BaseModel):
       description=(
           "Whether to use jax.lax.scan over layers (stacked/unstacked checkpoint). "
           "When resuming from a checkpoint, this flag is auto-determined from metadata."
+      ),
+  )
+  scan_layer_unroll: PositiveInt = Field(
+      1,
+      description=(
+          "Number of layer-scan iterations to unroll into straight-line code. "
+          "Larger values trade compilation size and device memory for optimization opportunities."
       ),
   )
   param_scan_axis: int = Field(1, description="Axis to scan over for parameters.")
@@ -1156,6 +1259,13 @@ class LayoutAndSharding(BaseModel):
   dense_fsdp_use_two_stage_all_gather: bool = Field(
       False,
       description="Use two separate All-Gather calls for dense MLP weights sharded on both FSDP and FSDP-transpose.",
+  )
+  dense_retain_gathered_weights: bool = Field(
+      False,
+      description=(
+          "Save data-parallel-gathered dense weights across rematerialized "
+          "forward/backward, analogous to FSDP reshard_after_forward=never."
+      ),
   )
   internal_compile: bool = Field(
       False,
@@ -1358,6 +1468,10 @@ class DatasetGeneral(BaseModel):
   max_segments_per_seq: int = Field(
       -1,
       description="Maximum number of segments that can be packed into a single sequence. -1 or None for no limit.",
+  )
+  balance_packed_rows_by_attention_work: bool = Field(
+      False,
+      description="Reorder packed rows across local device shards to balance sum(segment_length^2) attention work.",
   )
   num_epoch: int = Field(1, description="Number of epochs to train for.")
   expansion_factor_real_data: float = Field(-1.0, description="Factor for partial data loading on hosts.")
@@ -1641,6 +1755,11 @@ class TrainingLoop(BaseModel):
       -1,
       description="Number of steps to run for each evaluation. -1 runs on entire eval split.",
   )
+  eval_cache_batches: bool = Field(
+      False,
+      description="Keep the first evaluation's device-resident batches and reuse them for every later "
+      "evaluation instead of resetting the eval iterator. Requires eval_steps > 0.",
+  )
   target_eval_loss: float = Field(
       0.0,
       description="If set, training will stop early when this evaluation loss is reached.",
@@ -1652,6 +1771,14 @@ class TrainingLoop(BaseModel):
   enable_data_shuffling: bool = Field(True, description="Enables shuffling of the training data.")
   data_shuffle_seed: int = Field(0, description="Seed for data shuffling.")
   init_weights_seed: int = Field(0, description="Seed for model weight initialization.")
+  torchtitan_dsv3_init: bool = Field(
+      False,
+      description=(
+          "Resample DeepSeek-V3 weights after model creation with TorchTitan's scheme: std 0.02 for input "
+          "projections and expert/MLP gate, 0.02/sqrt(2*(layer+1)) for output projections, router, and "
+          "up/down projections, std 1.0 embedding, dim**-0.5 output head. Only for fresh (step 0) runs."
+      ),
+  )
 
 
 class ManifoldConstrainedHyperConnections(BaseModel):
@@ -3655,8 +3782,15 @@ class MaxTextConfig(
           "STRIPED reorder strategy requires Transformer Engine and is only supported on GPUs. "
           f"Got hardware={self.hardware!r}."
       )
-    if self.hardware == "gpu" and self.packing and self.attention == "cudnn_flash_te" and self.max_segments_per_seq <= 0:
-      raise ValueError("max_segments_per_seq must be set when using TransformerEngine attention and packing")
+    if (
+        self.hardware == "gpu"
+        and self.packing
+        and self.attention in ("cudnn_flash_te", "aiter_triton", "jax_aiter_flash")
+        and self.max_segments_per_seq <= 0
+    ):
+      raise ValueError(
+          "max_segments_per_seq must be set when using TransformerEngine or jax-aiter attention and packing"
+      )
     dcn_product = (
         self.dcn_data_parallelism
         * self.dcn_pipeline_parallelism
@@ -3706,6 +3840,8 @@ class MaxTextConfig(
     ):
       logger.warning("`tokenizer_type` is not 'tiktoken' when using llama3 tokenizer. Overriding to 'tiktoken'.")
       self.tokenizer_type = TokenizerType.TIKTOKEN
+    if self.eval_cache_batches and self.eval_steps <= 0:
+      raise ValueError("eval_cache_batches requires eval_steps > 0.")
     # Data input validations
     if self.dataset_type == DatasetType.HF:
       if not self.hf_path:

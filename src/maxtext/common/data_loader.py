@@ -16,9 +16,12 @@
 """Module to load data for training."""
 
 import contextlib
+import os
+
 import jax
 from jax.experimental import checkify
 import jax.numpy as jnp
+import numpy as np
 from maxtext.common.goodput import (
     GoodputEvent,
     maybe_record_goodput,
@@ -27,6 +30,33 @@ from maxtext.trainers.diloco import diloco
 from maxtext.utils import elastic_utils
 from maxtext.utils import exceptions
 from maxtext.utils.sharding import get_input_data_sharding
+
+
+def _balanced_packed_row_order(segment_ids: np.ndarray, num_shards: int) -> np.ndarray:
+  """Greedily balance packed attention work while keeping rows unchanged."""
+  if segment_ids.ndim != 2 or segment_ids.shape[0] % num_shards:
+    raise ValueError(
+        f"expected [batch, sequence] divisible across {num_shards} shards, got {segment_ids.shape}"
+    )
+  rows_per_shard = segment_ids.shape[0] // num_shards
+  costs = []
+  for row in segment_ids:
+    real = row[row != 0]
+    if not real.size:
+      costs.append(0)
+      continue
+    boundaries = np.flatnonzero(real[1:] != real[:-1]) + 1
+    lengths = np.diff(np.concatenate(([0], boundaries, [real.size])))
+    costs.append(int(np.sum(lengths.astype(np.int64) ** 2)))
+
+  bins = [[] for _ in range(num_shards)]
+  loads = [0] * num_shards
+  for row_index in sorted(range(len(costs)), key=lambda i: (-costs[i], i)):
+    choices = [i for i in range(num_shards) if len(bins[i]) < rows_per_shard]
+    shard = min(choices, key=lambda i: (loads[i], len(bins[i]), i))
+    bins[shard].append(row_index)
+    loads[shard] += costs[row_index]
+  return np.asarray([row for shard_rows in bins for row in shard_rows], dtype=np.int32)
 
 
 @contextlib.contextmanager
@@ -64,6 +94,7 @@ class DataLoader:
     else:
       self.data_iterator = data_iterator
     self.last_batch = None
+    self.num_input_shards = int(mesh.size)
     self.input_data_shardings = get_input_data_sharding(config, mesh)
 
   def update_data_iterator(self):
@@ -81,9 +112,61 @@ class DataLoader:
         with loader_exception_guard(self.config):
           example_batch = next(self.data_iterator)
         self.update_data_iterator()
+        example_batch = self._apply_diagnostic_token_transform(example_batch)
+        example_batch = self._apply_packed_row_balance(example_batch)
       self.last_batch = example_batch
       self.check_example_batch()
     return self.last_batch
+
+  def _apply_diagnostic_token_transform(self, example_batch):
+    """Optionally replace real token IDs while preserving the packed layout."""
+    mode = os.environ.get("MAXTEXT_DIAGNOSTIC_TOKEN_MODE", "native")
+    if mode == "native":
+      return example_batch
+    if mode != "random":
+      raise ValueError(f"Unsupported MAXTEXT_DIAGNOSTIC_TOKEN_MODE={mode!r}")
+    if not self.config.reuse_example_batch:
+      raise ValueError("diagnostic random tokens require reuse_example_batch=1")
+
+    transformed = dict(example_batch)
+    vocab = int(self.config.vocab_size)
+    if vocab <= 1:
+      raise ValueError(f"diagnostic random tokens require vocab_size > 1, got {vocab}")
+    seed = int(os.environ.get("MAXTEXT_DIAGNOSTIC_TOKEN_SEED", "0"))
+    for token_key, segment_key, offset in (
+        ("inputs", "inputs_segmentation", 0),
+        ("targets", "targets_segmentation", 1),
+    ):
+      if token_key not in transformed or segment_key not in transformed:
+        raise ValueError(f"diagnostic random tokens require {token_key} and {segment_key}")
+      tokens = np.asarray(transformed[token_key])
+      segments = np.asarray(transformed[segment_key])
+      positions = np.arange(tokens.size, dtype=np.uint64).reshape(tokens.shape)
+      random_ids = (
+          (positions * np.uint64(1664525) + np.uint64(seed + offset + 1013904223))
+          % np.uint64(vocab - 1)
+          + np.uint64(1)
+      ).astype(tokens.dtype)
+      transformed[token_key] = np.where(segments != 0, random_ids, tokens)
+    return transformed
+
+  def _apply_packed_row_balance(self, example_batch):
+    """Optionally permute packed rows to balance attention work across shards."""
+    enabled = self.config.balance_packed_rows_by_attention_work or (
+        os.environ.get("MAXTEXT_DIAGNOSTIC_BALANCE_PACKED_ROWS", "0") == "1"
+    )
+    if not enabled:
+      return example_batch
+    if "inputs_segmentation" not in example_batch:
+      raise ValueError("diagnostic packed-row balancing requires inputs_segmentation")
+
+    segmentation = np.asarray(example_batch["inputs_segmentation"])
+    order = _balanced_packed_row_order(segmentation, self.num_input_shards)
+    transformed = {}
+    for name, value in example_batch.items():
+      array = np.asarray(value)
+      transformed[name] = array[order] if array.ndim and array.shape[0] == len(order) else value
+    return transformed
 
   def load_next_batch(self, *args, **kwargs):
     """Loads the next batch with sharding hint."""

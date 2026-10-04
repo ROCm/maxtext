@@ -21,11 +21,11 @@ import pytest
 
 import jax
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from jax.sharding import Mesh
 
 from maxtext.configs import pyconfig
-from maxtext.common.data_loader import DataLoader, RampUpDataLoader
+from maxtext.common.data_loader import _balanced_packed_row_order, DataLoader, RampUpDataLoader
 from maxtext.utils import exceptions
 from maxtext.utils.maxtext_utils import create_device_mesh
 from maxtext.common.gcloud_stub import is_decoupled
@@ -79,6 +79,19 @@ class DataLoaderTest(unittest.TestCase):
     self.assertTrue((data_loader.last_batch["inputs"] == expected_batch["inputs"]).all())
     self.mock_data_iterator.__next__.assert_called_once()
 
+  def test_balanced_packed_row_order_reduces_slowest_shard_work(self):
+    heavy = np.ones((4, 8), dtype=np.int32)
+    light = np.tile(np.arange(1, 9, dtype=np.int32), (4, 1))
+    segmentation = np.concatenate((heavy, light), axis=0)
+    order = _balanced_packed_row_order(segmentation, num_shards=2)
+
+    np.testing.assert_array_equal(np.sort(order), np.arange(8))
+    costs = np.asarray([64] * 4 + [8] * 4)
+    current = [int(costs[:4].sum()), int(costs[4:].sum())]
+    balanced = [int(costs[order[:4]].sum()), int(costs[order[4:]].sum())]
+    self.assertEqual(current, [256, 32])
+    self.assertEqual(balanced, [144, 144])
+
   def test_load_next_batch_reuse_true(self):
     expected_shape = [jax.device_count(), self.config.max_target_length]
     expected_batch = {"inputs": np.zeros(expected_shape, dtype=int)}
@@ -99,6 +112,42 @@ class DataLoaderTest(unittest.TestCase):
     self.assertEqual(data_loader.last_batch["inputs"].shape, expected_batch["inputs"].shape)
     self.assertTrue((data_loader.last_batch["inputs"] == expected_batch["inputs"]).all())
     self.mock_data_iterator.__next__.assert_called_once()  # Still called only once
+
+  def test_random_token_diagnostic_preserves_layout_and_reuses_batch(self):
+    config = self.get_test_config(
+        reuse_example_batch=True,
+        per_device_batch_size=1,
+        max_target_length=4,
+    )
+    mesh = Mesh(create_device_mesh(config), config.mesh_axes)
+    rows = jax.device_count()
+    inputs = np.tile(np.array([[11, 12, 13, 0]], dtype=np.int32), (rows, 1))
+    targets = np.tile(np.array([[12, 13, 14, 0]], dtype=np.int32), (rows, 1))
+    segmentation = np.tile(np.array([[1, 1, 2, 0]], dtype=np.int32), (rows, 1))
+    expected_batch = {
+        "inputs": inputs,
+        "targets": targets,
+        "inputs_segmentation": segmentation,
+        "targets_segmentation": segmentation,
+    }
+    self.mock_data_iterator.__next__.return_value = expected_batch
+    data_loader = DataLoader(config, mesh, self.mock_data_iterator, None)
+
+    with patch.dict(
+        "os.environ",
+        {"MAXTEXT_DIAGNOSTIC_TOKEN_MODE": "random", "MAXTEXT_DIAGNOSTIC_TOKEN_SEED": "7"},
+    ):
+      batch_1 = data_loader.load_next_batch()
+      batch_2 = data_loader.load_next_batch()
+
+    np.testing.assert_array_equal(batch_1["inputs_segmentation"], segmentation)
+    np.testing.assert_array_equal(batch_1["targets_segmentation"], segmentation)
+    np.testing.assert_array_equal(batch_1["inputs"][:, -1], inputs[:, -1])
+    np.testing.assert_array_equal(batch_1["targets"][:, -1], targets[:, -1])
+    self.assertFalse(np.array_equal(np.asarray(batch_1["inputs"][:, :3]), inputs[:, :3]))
+    np.testing.assert_array_equal(batch_1["inputs"], batch_2["inputs"])
+    np.testing.assert_array_equal(batch_1["targets"], batch_2["targets"])
+    self.mock_data_iterator.__next__.assert_called_once()
 
   def test_load_next_batch_reuse_false(self):
     expected_shape = [jax.device_count(), self.config.max_target_length]

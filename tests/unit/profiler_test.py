@@ -104,6 +104,37 @@ class ProfilerTest(unittest.TestCase):
           types.XProfTPUPowerTraceMode.POWER_TRACE_SPI,
       )
 
+  def test_rocprof_selected_region_uses_requested_steps(self):
+    config = pyconfig.initialize(
+        [sys.argv[0], get_test_config_path()],
+        enable_checkpointing=False,
+        run_name="test_rocprof_selected_region",
+        steps=10,
+        profiler="",
+    )
+    control = MagicMock()
+    control.roctxProfilerResume.return_value = 0
+    control.roctxProfilerPause.return_value = 0
+    state = MagicMock()
+
+    with (
+        patch.dict(
+            "os.environ",
+            {"MAXTEXT_ROCPROF_START_STEP": "4", "MAXTEXT_ROCPROF_STEPS": "2"},
+        ),
+        patch.object(profiler.cdll, "LoadLibrary", return_value=control),
+        patch("jax.block_until_ready") as block_until_ready,
+    ):
+      prof = profiler.Profiler(config)
+      prof.maybe_activate_profiler(3, state)
+      prof.maybe_activate_profiler(4, state)
+      prof.maybe_deactivate_profiler(4, state)
+      prof.maybe_deactivate_profiler(5, state)
+
+    control.roctxProfilerResume.assert_called_once_with(0)
+    control.roctxProfilerPause.assert_called_once_with(0)
+    self.assertEqual(block_until_ready.call_count, 2)
+
   # These periodic proilfer tests can run on any platform (cpu, gpu or tpu)
   @pytest.mark.tpu_only
   def test_periodic_profiler_third_period_starts(self):

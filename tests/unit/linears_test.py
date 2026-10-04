@@ -16,6 +16,7 @@
 
 import sys
 import unittest
+from unittest import mock
 from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 import jax
@@ -103,6 +104,47 @@ class DenseGeneralTest(unittest.TestCase):
     self.assertEqual(outputs.shape, (batch_size, out_features))
     self.assertIsNotNone(layer.bias)
 
+  def test_retain_gathered_weight_marks_replicated_kernel(self):
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("expert",))
+    gathered_sharding = jax.sharding.NamedSharding(
+        mesh,
+        jax.sharding.PartitionSpec(None, None),
+    )
+    layer = linears.DenseGeneral(
+        in_features_shape=4,
+        out_features_shape=8,
+        kernel_axes=("embed", "mlp"),
+        mesh=mesh,
+        retain_gathered_weight=True,
+        rngs=self.rngs,
+    )
+
+    with mock.patch(
+        "maxtext.layers.linears.get_physical_spec_without_axes",
+        return_value=gathered_sharding,
+    ) as get_gathered_sharding, mock.patch(
+        "maxtext.layers.linears.maybe_shard_with_name",
+        side_effect=lambda value, unused_sharding, **unused_kwargs: value,
+    ) as gather, mock.patch(
+        "maxtext.layers.linears.checkpoint_name",
+        side_effect=lambda value, unused_name: value,
+    ) as checkpoint:
+      outputs = layer(jnp.ones((2, 4)))
+
+    self.assertEqual(outputs.shape, (2, 8))
+    get_gathered_sharding.assert_called_once_with(
+        jax.sharding.PartitionSpec("embed", "mlp"),
+        mesh,
+        linears._DENSE_BATCH_MESH_AXES,
+    )
+    gather.assert_called_once_with(
+        mock.ANY,
+        gathered_sharding,
+        shard_mode=linears.ShardMode.AUTO,
+        debug_sharding=False,
+    )
+    checkpoint.assert_called_once_with(mock.ANY, "gathered_weight")
+
   def _run_dense_test(self, axis, in_feat_shape, expected_shape):
     batch_size = 2
     seq_len = 3
@@ -129,6 +171,39 @@ class DenseGeneralTest(unittest.TestCase):
 
   def test_axis_0(self):
     self._run_dense_test(0, 2, (3, 4, 8))
+
+  def test_jax_aiter_mxfp4_flattens_trailing_contraction_axes(self):
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]),
+        ("expert",),
+    )
+    layer = linears.DenseGeneral(
+        in_features_shape=(2, 2),
+        out_features_shape=(2, 3),
+        axis=(-2, -1),
+        dtype=jnp.bfloat16,
+        weight_dtype=jnp.bfloat16,
+        mesh=mesh,
+        use_jax_aiter_mxfp4=True,
+        rngs=self.rngs,
+    )
+    inputs = jnp.ones((2, 3, 2, 2), dtype=jnp.bfloat16)
+
+    with mock.patch(
+        "maxtext.kernels.jax_aiter_mxfp4.dense_linear",
+        side_effect=lambda lhs, rhs, unused_mesh: lhs @ rhs,
+    ) as dense_linear, mock.patch(
+        "maxtext.layers.linears.checkpoint_name",
+        side_effect=lambda value, unused_name: value,
+    ) as checkpoint:
+      outputs = layer(inputs)
+
+    self.assertEqual(outputs.shape, (2, 3, 2, 3))
+    matrix_inputs, matrix_kernel, called_mesh = dense_linear.call_args.args
+    self.assertEqual(matrix_inputs.shape, (6, 4))
+    self.assertEqual(matrix_kernel.shape, (4, 6))
+    self.assertIs(called_mesh, mesh)
+    checkpoint.assert_called_once_with(mock.ANY, "mxfp4_linear")
 
 
 class MlpBlockTest(unittest.TestCase):

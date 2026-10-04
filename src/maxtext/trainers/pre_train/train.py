@@ -67,6 +67,7 @@ from maxtext.utils import maxtext_utils
 from maxtext.utils import qk_clip_utils
 from maxtext.utils import sharding
 from maxtext.utils import maxtext_utils_nnx
+from maxtext.utils import torchtitan_init
 from maxtext.utils import train_utils
 from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad
 from maxtext.utils.vocabulary_tiling import vocab_tiling_linen_loss, vocab_tiling_nnx_loss
@@ -305,18 +306,17 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       # NNX intermediates are model-rooted (no "intermediates" prefix), so match by
       # suffix instead. Unlike collect_intermediates_by_suffix we must not ravel:
       # the update is a 2-D matrix that's transposed at the apply site below.
-      moe_bias_updates = next(
-          (
-              val
-              for path, val in jax.tree_util.tree_leaves_with_path(intermediate_outputs)
-              if tuple(k.key for k in path if hasattr(k, "key"))[-1:] == ("moe_bias_updates",)
-          ),
-          None,
-      )
-      if moe_bias_updates is not None:
-        # The Linen path returns the sow tuple and indexes [0] downstream; tree_leaves
-        # already descended that tuple, so wrap it back so the apply site is uniform.
-        moe_bias_updates = (moe_bias_updates,)
+      # A scanned decoder sows one stacked update under "moe_layers"; an unscanned
+      # decoder sows a separate update under each "moe_layers_<i>" block, so key the
+      # result by block name and let the apply site write each one back in place.
+      updates_by_block = {}
+      for path, val in jax.tree_util.tree_leaves_with_path(intermediate_outputs):
+        keys = tuple(k.key for k in path if hasattr(k, "key"))
+        if "moe_bias_updates" not in keys:
+          continue
+        block = next((k for k in keys if isinstance(k, str) and k.startswith("moe_layers")), "moe_layers")
+        updates_by_block.setdefault(block, val)
+      moe_bias_updates = updates_by_block or None
 
   # Add the model's primary output to the intermediates dict so it can be used
   # by the acceptance rate calculation in eval_step.
@@ -334,6 +334,23 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       "batch_stats": (intermediate_outputs.get("batch_stats", None) if hasattr(intermediate_outputs, "get") else None),
   }
   return loss, aux
+
+
+def _grad_group_absmax(grads):
+  """Per-parameter max |grad|, keyed by parameter path, to localize gradient blow-ups."""
+
+  def _name(key):
+    for attr in ("key", "name", "idx"):
+      if hasattr(key, attr):
+        return str(getattr(key, attr))
+    return str(key)
+
+  stats = {}
+  for path, leaf in jax.tree_util.tree_leaves_with_path(grads):
+    names = [_name(k) for k in path]
+    label = "/".join(n for n in names if n not in ("value", "raw_value"))
+    stats[f"grad_absmax/{label}"] = jnp.max(jnp.abs(leaf.astype(jnp.float32)))
+  return stats
 
 
 def train_step(model, config, state_mesh_shardings, params_shardings, state, data, dropout_rng=None):
@@ -557,8 +574,10 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
     # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
     if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
-      target_bias = new_state.model.decoder.moe_layers.DeepSeekMoeBlock_0.MoeBlock_0.gate.bias
-      target_bias.value = target_bias.value + jnp.array(moe_bias_updates[0]).transpose()
+      decoder = new_state.model.decoder
+      for block_name, block_update in moe_bias_updates.items():
+        target_bias = getattr(decoder, block_name).DeepSeekMoeBlock_0.MoeBlock_0.gate.bias
+        _apply_router_bias_update(target_bias, block_update, block_name)
 
   lm_loss = xent_sum / (total_weights + EPS)
   scalar_metrics = {
@@ -571,6 +590,21 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
   }
+  if config.routed_bias and not isinstance(model, nn.Module):
+    decoder = new_state.model.decoder
+    bias_absmax = jnp.asarray(0.0, dtype=jnp.float32)
+    names = ["moe_layers"] + [f"moe_layers_{i}" for i in range(getattr(config, "num_decoder_layers", 0))]
+    for name in names:
+      block = getattr(decoder, name, None)
+      if block is None:
+        continue
+      try:
+        bias = block.DeepSeekMoeBlock_0.MoeBlock_0.gate.bias
+        val = bias[...]
+        bias_absmax = jnp.maximum(bias_absmax, jnp.max(jnp.abs(val.astype(jnp.float32))))
+      except AttributeError:
+        continue
+    scalar_metrics["learning/router_bias_max_abs"] = bias_absmax
   if config.use_qk_clip:
     if isinstance(model, nn.Module):
       new_state = qk_clip_utils.apply_qk_clip(new_state, intermediate_outputs, config)
@@ -584,6 +618,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   if not config.optimizer_memory_host_offload:
     scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
     scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
+    if os.environ.get("MAXTEXT_GRAD_GROUP_STATS"):
+      scalar_metrics.update(_grad_group_absmax(raw_grads))
     if isinstance(model, nn.Module):
       scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
     else:
@@ -743,21 +779,32 @@ def training_loop_iteration(
       and (step - eval_start_step) % eval_interval == 0
   ):
     assert eval_data_iterator
-    # Explicitly reset the eval iterator and counters before starting the eval loop
-    eval_data_iterator.reset()
+    cached_eval_batches = python_vars["eval_batch_cache"]
+    new_eval_batch_cache = None
+    if cached_eval_batches is not None:
+      eval_batches = cached_eval_batches
+    else:
+      # Explicitly reset the eval iterator before starting the eval loop
+      eval_data_iterator.reset()
+      eval_batches = eval_data_iterator
+      if config.eval_cache_batches:
+        new_eval_batch_cache = []
     metric_logger_instance.reset_eval_metrics()
     max_logging.log(f"Starting eval after train step {step}")
 
     eval_step_count = 0
     last_eval_step_completion = datetime.datetime.now()
     # pylint: disable=not-callable
-    for eval_batch in eval_data_iterator:
-      # Shard input eval data
-      eval_batch = jax.device_put(
-          eval_batch, sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
-      )
+    for eval_batch in eval_batches:
+      if cached_eval_batches is None:
+        # Shard input eval data
+        eval_batch = jax.device_put(
+            eval_batch, sharding.get_input_data_sharding(config, mesh, rules=config.logical_axis_rules_for_eval)
+        )
       if 0 < eval_steps <= eval_step_count:
         break
+      if new_eval_batch_cache is not None:
+        new_eval_batch_cache.append(eval_batch)
       with jax.set_mesh(mesh), nn_partitioning.axis_rules(logical_axis_rules_for_eval):
         eval_metrics = p_eval_step(state, eval_batch, *step_rng_args)
       eval_step_time_delta = datetime.datetime.now() - last_eval_step_completion
@@ -766,6 +813,8 @@ def training_loop_iteration(
           eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
       )
       eval_step_count += 1
+    if new_eval_batch_cache is not None:
+      python_vars["eval_batch_cache"] = new_eval_batch_cache
 
   prof.maybe_deactivate_profiler(step, state)
 
@@ -777,6 +826,57 @@ def training_loop_iteration(
   # Pack mutated state back to dicts
   jax_device_state["state"] = state
   python_vars["last_step_completion"] = last_step_completion
+
+
+def _apply_router_bias_update(target_bias, block_update, block_name):
+  """Apply one scanned or unscanned DeepSeek router-bias update."""
+  target_value = target_bias[...]
+  update = jnp.asarray(block_update)
+  if update.shape != target_value.shape:
+    update = update.transpose()
+  if update.shape != target_value.shape:
+    raise ValueError(
+        f"router bias update {jnp.shape(block_update)} does not match "
+        f"{block_name} gate bias {target_value.shape}"
+    )
+  target_bias[...] = target_value + update.astype(target_value.dtype)
+
+
+def _log_router_bias_replica_spread(state):
+  """Print max-abs and replica hash spread of DeepSeek gate bias copies."""
+  decoder = getattr(getattr(state, "model", None), "decoder", None)
+  if decoder is None:
+    max_logging.log("router_bias: no decoder on state")
+    return
+  names = ["moe_layers"] + [f"moe_layers_{i}" for i in range(64)]
+  found = False
+  for name in names:
+    block = getattr(decoder, name, None)
+    if block is None:
+      continue
+    try:
+      bias = block.DeepSeekMoeBlock_0.MoeBlock_0.gate.bias
+      arr = bias[...]
+    except AttributeError:
+      continue
+    found = True
+    shards = getattr(arr, "addressable_shards", None)
+    if not shards:
+      absmax = float(jnp.max(jnp.abs(jax.device_get(arr))))
+      max_logging.log(f"router_bias {name}: no addressable_shards absmax={absmax}")
+      continue
+    hashes = []
+    absmax = 0.0
+    for shard in shards:
+      local = jax.device_get(shard.data)
+      local_np = local if hasattr(local, "tobytes") else None
+      absmax = max(absmax, float(jnp.max(jnp.abs(local))))
+      hashes.append(hash(local.tobytes()) if hasattr(local, "tobytes") else hash(str(local)))
+    max_logging.log(
+        f"router_bias {name}: n_shards={len(shards)} unique_replicas={len(set(hashes))} absmax={absmax}"
+    )
+  if not found:
+    max_logging.log("router_bias: no DeepSeek gate bias found")
 
 
 def train_loop(config, recorder, state=None):
@@ -801,6 +901,14 @@ def train_loop(config, recorder, state=None):
 
   start_step = get_first_step(model, state)  # this is the start_step for training
   train_utils.validate_completed_steps(start_step, config.steps)
+
+  if config.torchtitan_dsv3_init:
+    if isinstance(model, nn.Module) or config.enable_diloco:
+      raise ValueError("torchtitan_dsv3_init supports only the NNX training state")
+    if start_step != 0:
+      max_logging.log("torchtitan_dsv3_init: skipped, training resumes from a checkpoint")
+    else:
+      torchtitan_init.apply_torchtitan_dsv3_init(state.model, config)
 
   if isinstance(model, nn.Module):
     jit_model = model
@@ -882,6 +990,7 @@ def train_loop(config, recorder, state=None):
       "checkpoint_manager": checkpoint_manager,
       "data_iterator": data_iterator,
       "eval_data_iterator": eval_data_iterator,
+      "eval_batch_cache": None,
       "metric_logger_instance": metric_logger_instance,
       "prof": prof,
   }
@@ -938,6 +1047,7 @@ def train_loop(config, recorder, state=None):
     if checkpoint_manager is not None:
       # in case the last checkpoint_period checkpoint is still in progress
       checkpointing.wait_until_finished(checkpoint_manager)
+    _log_router_bias_replica_spread(state)
     _job_completed_gracefully = True
   except exceptions.StopTraining as e:
     prof.deactivate()

@@ -444,6 +444,18 @@ class TestNNXDecoderRematPolicy(unittest.TestCase):
     decoder = NNXDecoder(config=cfg, mesh=mesh, rngs=nnx.Rngs(params=0, dropout=1))
     self.assertIsNotNone(decoder.get_remat_policy())
 
+  def test_remat_policy_minimal_with_context_moe_returns_non_none(self):
+    cfg = _make_config(remat_policy="minimal_with_context_moe")
+    mesh = _make_mesh(cfg)
+    decoder = NNXDecoder(config=cfg, mesh=mesh, rngs=nnx.Rngs(params=0, dropout=1))
+    self.assertIsNotNone(decoder.get_remat_policy())
+
+  def test_remat_policy_minimal_with_context_moe_routing_returns_non_none(self):
+    cfg = _make_config(remat_policy="minimal_with_context_moe_routing")
+    mesh = _make_mesh(cfg)
+    decoder = NNXDecoder(config=cfg, mesh=mesh, rngs=nnx.Rngs(params=0, dropout=1))
+    self.assertIsNotNone(decoder.get_remat_policy())
+
   def test_remat_policy_save_qkv_proj_returns_non_none(self):
     cfg = _make_config(remat_policy="save_qkv_proj")
     mesh = _make_mesh(cfg)
@@ -473,6 +485,66 @@ class TestNNXDecoderRematPolicy(unittest.TestCase):
   def test_minimal_policy_with_context_and_quantization(self):
     policy = self.decoder.minimal_policy(with_context=True, with_quantization=True)
     self.assertIsNotNone(policy)
+
+  def test_minimal_policy_with_moe_io_excludes_routing_names(self):
+    with mock.patch.object(
+        jax.checkpoint_policies,
+        "save_only_these_names",
+        return_value=object(),
+    ) as save_only:
+      self.decoder.minimal_policy(with_context=True, with_moe_io=True)
+
+    saved_names = set(save_only.call_args.args)
+    self.assertTrue(
+        {
+            "context",
+            "moe_dispatched",
+            "moe_combined",
+            "mxfp4_linear",
+            "gathered_weight",
+        }.issubset(saved_names)
+    )
+    self.assertTrue({
+        "moe_topk_weights",
+        "moe_topk_indices",
+        "moe_sort_order",
+        "moe_group_sizes",
+        "moe_padded_group_sizes",
+        "query_wa_proj",
+        "kv_wa_proj",
+    }.isdisjoint(saved_names))
+
+  def test_minimal_policy_with_moe_routing_saves_expected_names(self):
+    expected_policy = object()
+    with mock.patch.object(
+        jax.checkpoint_policies,
+        "save_only_these_names",
+        return_value=expected_policy,
+    ) as save_only:
+      policy = self.decoder.minimal_policy(
+          with_context=True,
+          with_moe_io=True,
+          with_moe_routing=True,
+      )
+
+    self.assertIs(policy, expected_policy)
+    saved_names = set(save_only.call_args.args)
+    self.assertTrue({
+        "context",
+        "moe_dispatched",
+        "moe_combined",
+        "moe_topk_weights",
+        "moe_topk_indices",
+        "moe_sort_order",
+        "moe_group_sizes",
+        "moe_local_sort_order",
+        "moe_local_group_sizes",
+        "moe_padded_group_sizes",
+        "query_wa_proj",
+        "kv_wa_proj",
+        "mla_q",
+        "mla_kv",
+    }.issubset(saved_names))
 
   def test_minimal_policy_returns_distinct_objects_for_different_flags(self):
     """Different flag combinations should produce different policy objects."""
@@ -680,8 +752,8 @@ class TestNNXDecoderForwardPass(unittest.TestCase):
     self.assertFalse(jnp.allclose(logits1, logits2))
 
   def test_scan_layers(self):
-    """Test NNXDecoder with scan_layers=True."""
-    cfg = _make_config(scan_layers=True)
+    """Test NNXDecoder forwards the configured partial-unroll factor."""
+    cfg = _make_config(scan_layers=True, scan_layer_unroll=2)
     rngs = nnx.Rngs(params=0, dropout=1)
     decoder = NNXDecoder(
         config=cfg,
@@ -705,15 +777,18 @@ class TestNNXDecoderForwardPass(unittest.TestCase):
     segment_ids = jnp.full((batch, seq_len), DECODING_ACTIVE_SEQUENCE_INDICATOR)
     positions = jnp.broadcast_to(jnp.arange(seq_len)[None], (batch, seq_len))
 
-    logits, _, _ = decoder(
-        shared_embedding,
-        ids,
-        positions,
-        decoder_segment_ids=segment_ids,
-        deterministic=True,
-        model_mode=MODEL_MODE_TRAIN,
-    )
+    real_scan = jax.lax.scan
+    with mock.patch.object(jax.lax, "scan", wraps=real_scan) as scan_mock:
+      logits, _, _ = decoder(
+          shared_embedding,
+          ids,
+          positions,
+          decoder_segment_ids=segment_ids,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
     self.assertEqual(logits.shape, (batch, seq_len, cfg.vocab_size))
+    self.assertTrue(any(call.kwargs.get("unroll") == 2 for call in scan_mock.call_args_list))
 
 
 if __name__ == "__main__":
