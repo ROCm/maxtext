@@ -2193,20 +2193,37 @@ class AttentionOp(nnx.Module):
         )
 
       # Restrict the measured schedule to the DeepSeek MLA shape. Other
-      # group-mode shapes keep the existing single call.
-      use_buckets = os.environ.get("MAXTEXT_JAX_AITER_FLASH_BUCKETS", "1") != "0"
+      # group-mode shapes keep the existing single call. "shared" runs the
+      # bounded calls in place on one output and one set of gradients.
+      bucket_mode = os.environ.get("MAXTEXT_JAX_AITER_FLASH_BUCKETS", "1")
+      if bucket_mode not in ("0", "1", "shared"):
+        raise ValueError(f"MAXTEXT_JAX_AITER_FLASH_BUCKETS={bucket_mode!r}; expected 0, 1, or shared.")
       if (
-          use_buckets
+          bucket_mode != "0"
           and max_segments is not None
           and seq_len == 4096
           and qk_dim == 192
           and v_local.shape[-1] == 128
       ):
+        bounds = (512, 1024, 2048, 4096)
         buckets, overflow = self._jax_aiter_flash_bucket_metadata(sid_local, seq_len, max_segments)
 
         def _bucketed(_):
+          if bucket_mode == "shared":
+            from jax_aiter.mha import flash_attn_varlen_buckets  # pytype: disable=import-error
+
+            return flash_attn_varlen_buckets(
+                q_flat,
+                k_flat,
+                v_flat,
+                tuple((ss, cl) for ss, cl, _ in buckets),
+                tuple(owner for _, _, owner in buckets),
+                bounds,
+                1.0,
+                True,
+            )
           bucket_out = jnp.zeros_like(v_flat)
-          for bound, (ss, cl, owner) in zip((512, 1024, 2048, 4096), buckets):
+          for bound, (ss, cl, owner) in zip(bounds, buckets):
             out_i = _call(ss, cl, bound)
             bucket_out = jnp.where(owner[:, None, None], out_i, bucket_out)
           return bucket_out

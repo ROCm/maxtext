@@ -198,5 +198,32 @@ class YarnRotaryEmbeddingTest(unittest.TestCase):
     np.testing.assert_allclose(outputs, expected, atol=1e-5)
 
 
+@unittest.skipIf(jax.device_count() != 8, "requires eight devices; on CPU set --xla_force_host_platform_device_count=8")
+class RailAlignedEmbeddingLookupTest(unittest.TestCase):
+
+  def test_matches_gather_forward_and_gradient(self):
+    P = jax.sharding.PartitionSpec
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("expert",))
+    table_pspec, out_pspec = P(None, "expert"), P("expert", None, None)
+    k_table, k_ids, k_cot = jax.random.split(jax.random.key(3), 3)
+    table = jax.device_put(
+        jax.random.normal(k_table, (37, 8 * 3), jnp.float32), jax.sharding.NamedSharding(mesh, table_pspec)
+    )
+    ids = jax.device_put(
+        jax.random.randint(k_ids, (16, 5), 0, 37), jax.sharding.NamedSharding(mesh, P("expert", None))
+    )
+    cotangent = jax.random.normal(k_cot, (16, 5, 24), jnp.float32)
+
+    for local_shards in (2, 4, 8):
+      lookup = jax.jit(
+          lambda t, i, n=local_shards: embeddings.rail_aligned_embedding_lookup(t, i, mesh, table_pspec, out_pspec, n)
+      )
+      output, pullback = jax.vjp(lambda t, f=lookup: f(t, ids), table)
+      np.testing.assert_array_equal(np.asarray(output), np.asarray(table)[np.asarray(ids)], err_msg=str(local_shards))
+      expected_grad = np.zeros(table.shape, np.float32)
+      np.add.at(expected_grad, np.asarray(ids), np.asarray(cotangent))
+      np.testing.assert_allclose(np.asarray(pullback(cotangent)[0]), expected_grad, rtol=1e-6, atol=1e-6)
+
+
 if __name__ == "__main__":
   unittest.main()

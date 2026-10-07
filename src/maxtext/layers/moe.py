@@ -213,8 +213,8 @@ def _check_no_tier_route_drops(dropped):
   dropped = int(dropped)
   if dropped:
     raise RuntimeError(
-        f"MXFP4 two-tier route capacity overflow: {dropped} assignments do "
-        "not fit in the primary plus overflow buffers."
+        f"MXFP4 route drop: {dropped} routed assignments were not computed. They "
+        "exceed the expert tier capacity or a token's destination-shard bound."
     )
 
 
@@ -981,6 +981,21 @@ class RoutedMoE(nnx.Module):
     if isinstance(self._expert_parallelism_name, tuple):
       return math.prod(self.mesh.shape.get(name, 1) for name in self._expert_parallelism_name)
     return self.mesh.shape.get(self._expert_parallelism_name, 1)
+
+  def _dedup_shards_per_token(self) -> int:
+    """Bound on the distinct expert shards one token routes to under group-limited routing, or 0 if none applies.
+
+    A token picks `topk_routing_group` of `n_routing_groups` contiguous groups,
+    so it reaches at most that many groups' worth of shards.
+    """
+    num_ep, groups = self.get_expert_parallelism_size(), self.config.n_routing_groups
+    if groups <= 0:
+      return 0
+    if num_ep % groups == 0:
+      return min(self.config.topk_routing_group * (num_ep // groups), self.num_experts_per_tok, num_ep)
+    if groups % num_ep == 0:
+      return min(self.config.topk_routing_group, self.num_experts_per_tok, num_ep)
+    return 0
 
   def get_tensor_parallelism_size(self):
     if isinstance(self._tensor_parallelism_name, tuple):
@@ -2424,8 +2439,10 @@ class RoutedMoE(nnx.Module):
         _weight_gather,
         partial_accum0=None,
         partial_accum1=None,
+        save_residuals=True,
     ):
       """Run the two up-projections (gate + up) and apply the FFN activation."""
+      name = adc.checkpoint_name if save_residuals else lambda value, _: value
       wi_gather_axes, wi_tile_size = get_wi_gmm_params()
       if self.config.prefuse_moe_weights:
         # Weights are stored as (G,K,2N); w0/w1 are adjacent slices so XLA elides this concat.
@@ -2436,8 +2453,8 @@ class RoutedMoE(nnx.Module):
         if self.config.mlp_bias and w0_bias is not None and w1_bias is not None:
           layer_w0 = layer_w0 + w0_bias
           layer_w1 = layer_w1 + w1_bias
-        layer_w0 = adc.checkpoint_name(adc.checkpoint_name(layer_w0, "mlpwi_0"), "moe_mlpwi_0")
-        layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
+        layer_w0 = name(name(layer_w0, "mlpwi_0"), "moe_mlpwi_0")
+        layer_w1 = name(layer_w1, "moe_mlpwi_1")
       else:
         layer_w0 = gmm_fn(
             x,
@@ -2448,7 +2465,7 @@ class RoutedMoE(nnx.Module):
         )
         if self.config.mlp_bias and w0_bias is not None:
           layer_w0 = layer_w0 + w0_bias
-        layer_w0 = adc.checkpoint_name(adc.checkpoint_name(layer_w0, "mlpwi_0"), "moe_mlpwi_0")
+        layer_w0 = name(name(layer_w0, "mlpwi_0"), "moe_mlpwi_0")
 
         layer_w1 = gmm_fn(
             x,
@@ -2459,7 +2476,7 @@ class RoutedMoE(nnx.Module):
         )
         if self.config.mlp_bias and w1_bias is not None:
           layer_w1 = layer_w1 + w1_bias
-        layer_w1 = adc.checkpoint_name(layer_w1, "moe_mlpwi_1")
+        layer_w1 = name(layer_w1, "moe_mlpwi_1")
       return layer_w0, layer_w1
 
     def get_gmm_for_local_experts(x, routing, route_metadata):
@@ -2731,8 +2748,8 @@ class RoutedMoE(nnx.Module):
           unsupported.append("global quantization")
         if self.get_tensor_parallelism_size() != 1:
           unsupported.append("tensor parallelism")
-        if self.get_expert_parallelism_size() != 8:
-          unsupported.append("expert parallelism other than EP=8")
+        if self.get_expert_parallelism_size() != 8 and not use_mxfp4_dedup:
+          unsupported.append("expert parallelism other than EP=8 without dedup dispatch")
         if use_mxfp4_overflow and not is_batch_sharded_by_expert:
           unsupported.append("overflow route with an unsharded batch")
         if use_mxfp4_overflow and self.config.ragged_buffer_factor <= 0.0:
@@ -2744,14 +2761,21 @@ class RoutedMoE(nnx.Module):
             unsupported.append("dedup dispatch without fresh all-to-all buffers on a sharded batch")
           if self.config.ragged_buffer_factor <= 0.0:
             unsupported.append("dedup dispatch without a fixed primary tier")
-          if self.config.n_routing_groups != self.get_expert_parallelism_size():
-            unsupported.append("dedup dispatch without one routing group per expert shard")
+          if not self._dedup_shards_per_token():
+            unsupported.append("dedup dispatch unless routing groups split evenly into expert shards or vice versa")
+          if self.config.jax_aiter_mxfp4_two_stage_exchange and not isinstance(self._expert_parallelism_name, str):
+            unsupported.append("two-stage exchange over more than one mesh axis")
           if weight_gather:
             unsupported.append("dedup dispatch with in-branch weight collectives")
           if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
             unsupported.append("dedup dispatch with Llama4 input scaling")
-        elif self.config.jax_aiter_mxfp4_dedup_skip_unread_zeroing:
-          unsupported.append("skipping unread-row zeroing without dedup dispatch")
+        else:
+          if self.config.jax_aiter_mxfp4_dedup_skip_unread_zeroing:
+            unsupported.append("skipping unread-row zeroing without dedup dispatch")
+          if self.config.jax_aiter_mxfp4_dropless_tiers:
+            unsupported.append("dropless tiers without dedup dispatch")
+          if self.config.jax_aiter_mxfp4_two_stage_exchange:
+            unsupported.append("two-stage exchange without dedup dispatch")
         if unsupported:
           raise ValueError(
               "jax_aiter_mxfp4 initial DeepSeek path does not support: " + ", ".join(unsupported)
@@ -2760,14 +2784,15 @@ class RoutedMoE(nnx.Module):
         from maxtext.kernels import jax_aiter_mxfp4
 
         def run_padded_mxfp4_experts(
-            padded_inputs, padded_group_sizes, *, is_overflow, row_weights=None
+            padded_inputs, padded_group_sizes, *, is_overflow, row_weights=None, save_residuals=True
         ):
           if padded_group_sizes.shape != (w0.shape[0],):
             raise ValueError(
                 "jax_aiter_mxfp4 requires one routed group size per "
                 "EP-local expert"
             )
-          padded_group_sizes = adc.checkpoint_name(
+          name = adc.checkpoint_name if save_residuals else lambda value, _: value
+          padded_group_sizes = name(
               padded_group_sizes,
               (
                   "moe_overflow_padded_group_sizes"
@@ -2777,7 +2802,7 @@ class RoutedMoE(nnx.Module):
           )
           # Dedup overflow rows are gathered from the dispatch exchange output,
           # so saving them keeps backward from replaying that exchange.
-          padded_inputs = adc.checkpoint_name(
+          padded_inputs = name(
               padded_inputs,
               "moe_overflow_dispatched" if is_overflow and not use_mxfp4_dedup else "moe_dispatched",
           )
@@ -2797,7 +2822,7 @@ class RoutedMoE(nnx.Module):
               raise ValueError("jax_aiter_mxfp4 requires complete EP-local expert weights")
             # Saving the fused output, not its halves, keeps the GEMM result
             # as the only saved buffer instead of two sliced copies.
-            local_output01 = adc.checkpoint_name(
+            local_output01 = name(
                 jax_aiter_mxfp4.grouped_gmm_gate_up(
                     padded_inputs.astype(jnp.bfloat16),
                     w0.astype(jnp.bfloat16),
@@ -2820,6 +2845,7 @@ class RoutedMoE(nnx.Module):
                 w1_bias,
                 local_gmm,
                 weight_gather,
+                save_residuals=save_residuals,
             )
           local_intermediate = self.apply_ffn_activation(
               local_output0, local_output1
@@ -2868,33 +2894,50 @@ class RoutedMoE(nnx.Module):
         tier_factors = [self.config.ragged_buffer_factor]
         if use_mxfp4_overflow:
           tier_factors.append(self.config.jax_aiter_mxfp4_overflow_buffer_factor)
+        capacities = [
+            self.get_ragged_buffer_size(
+                tokens * self.num_experts_per_tok,
+                num_ep,
+                self.config.num_experts,
+                self.num_experts_per_tok,
+                factor,
+            )
+            for factor in tier_factors
+        ]
+        dropless_tier_rows = 0
+        if self.config.jax_aiter_mxfp4_dropless_tiers:
+          # Dropless tiers match the last configured tier, within what the
+          # quantizer can index.
+          dropless_tier_rows = min(
+              capacities[-1],
+              jax_aiter_mxfp4.max_compact_capacity(
+                  embed_dim, w0.shape[0], self.config.jax_aiter_mxfp4_grouped_kernel
+              ),
+          )
         output = moe_dedup.dedup_dispatch_combine(
             jnp.reshape(x, (tokens, embed_dim)).astype(self.dtype),
             jnp.reshape(selected_experts, (tokens, self.num_experts_per_tok)),
             jnp.reshape(weights, (tokens, self.num_experts_per_tok)),
-            lambda rows, row_weights, group_sizes, *, is_overflow: run_padded_mxfp4_experts(
-                rows, group_sizes, is_overflow=is_overflow, row_weights=row_weights
+            lambda rows, row_weights, group_sizes, *, is_overflow, save_residuals: run_padded_mxfp4_experts(
+                rows, group_sizes, is_overflow=is_overflow, row_weights=row_weights, save_residuals=save_residuals
             ),
             num_experts=self.config.num_experts,
             num_shards=num_ep,
             axis_name=self._expert_parallelism_name,
-            max_shards_per_token=min(self.config.topk_routing_group, num_ep),
-            capacities=[
-                self.get_ragged_buffer_size(
-                    tokens * self.num_experts_per_tok,
-                    num_ep,
-                    self.config.num_experts,
-                    self.num_experts_per_tok,
-                    factor,
-                )
-                for factor in tier_factors
-            ],
+            max_shards_per_token=self._dedup_shards_per_token(),
+            capacities=capacities,
             check_capacity=self.config.jax_aiter_mxfp4_check_route_capacity,
             row_layout=functools.partial(
                 jax_aiter_mxfp4.expert_padding,
                 grouped_kernel=self.config.jax_aiter_mxfp4_grouped_kernel,
             ),
             zero_unwritten_rows=not skip_unread_zeroing,
+            dropless_tier_rows=dropless_tier_rows,
+            local_shards=(
+                moe_dedup.process_local_shards(self.mesh, self._expert_parallelism_name)
+                if self.config.jax_aiter_mxfp4_two_stage_exchange
+                else 0
+            ),
         )
         return output.reshape(batch_size, sequence_length, -1).astype(self.dtype), lb_loss, bias_updates
 

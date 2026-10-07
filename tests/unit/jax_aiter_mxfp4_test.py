@@ -47,6 +47,22 @@ def test_expert_padding_matches_pad_expert_rows():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+@pytest.mark.parametrize("grouped_kernel", ["ragged", "wholeloop"])
+def test_max_compact_capacity_is_the_largest_int32_indexable_padding(grouped_kernel):
+  cols, num_experts = 7168, 32
+
+  def padded_rows(capacity):
+    padding = jax.eval_shape(
+        functools.partial(jax_aiter_mxfp4.expert_padding, compact_capacity=capacity, grouped_kernel=grouped_kernel),
+        jax.ShapeDtypeStruct((num_experts,), jnp.int32),
+    )
+    return padding.padded_to_compact.shape[0]
+
+  capacity = jax_aiter_mxfp4.max_compact_capacity(cols, num_experts, grouped_kernel)
+  assert padded_rows(capacity) * cols <= 2**31 - 1
+  assert padded_rows(capacity + 1) * cols > 2**31 - 1
+
+
 def test_wholeloop_pads_expert_rows_to_256():
   values = jnp.arange(10 * 2, dtype=jnp.float32).reshape(10, 2)
   group_sizes = jnp.asarray([3, 0, 4], dtype=jnp.int32)

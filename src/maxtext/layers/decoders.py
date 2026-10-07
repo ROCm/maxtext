@@ -351,7 +351,7 @@ class Decoder(nn.Module):
     if with_moe_io:
       # Expert up-projection output and both expert-parallel all-to-all results,
       # so backward does not replay the dispatch/combine communication.
-      names.extend(["moe_mlpwi_1", "moe_dispatched", "moe_dispatched_meta", "moe_combined"])
+      names.extend(["moe_mlpwi_1", "moe_dispatched", "moe_dispatched_meta", "moe_dedup_received", "moe_combined"])
     if with_moe_routing:
       # Torch-matched routing metadata and MLA low-rank projections. These are
       # cheap relative to expert activations and prevent backward remat from

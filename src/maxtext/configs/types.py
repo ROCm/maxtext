@@ -995,6 +995,38 @@ class MoEKernels(BaseModel):
           "ragged_buffer_factor."
       ),
   )
+  jax_aiter_mxfp4_dropless_tiers: bool = Field(
+      False,
+      description=(
+          "With dedup dispatch, add expert tiers after the primary and "
+          "overflow tiers until every received assignment has a row, so no "
+          "assignment drops. Each added tier matches the last configured tier, "
+          "within what the MXFP4 quantizer can index, runs only in steps "
+          "where the overflow tiers hold rows, and is recomputed in backward "
+          "from the received rows (remat name 'moe_dedup_received')."
+      ),
+  )
+  rail_aligned_embedding_lookup: bool = Field(
+      False,
+      description=(
+          "Look up token embeddings in a shard_map whose regroup of feature "
+          "slices runs within each process and then between GPUs with the "
+          "same local index, instead of the flat all-to-all XLA inserts. "
+          "Needs the table's feature dim and the batch sharded over one mesh "
+          "axis, and nothing else sharded."
+      ),
+  )
+  jax_aiter_mxfp4_two_stage_exchange: bool = Field(
+      False,
+      description=(
+          "With dedup dispatch, run each expert all-to-all as an exchange "
+          "within each process followed by one between GPUs with the same "
+          "local index on different processes. Needed on rail-isolated "
+          "networks, where a GPU's NIC reaches only the same NIC index on "
+          "other nodes. Processes must own contiguous blocks of the expert "
+          "axis; with one process it changes nothing."
+      ),
+  )
   jax_aiter_mxfp4_fresh_a2a_buffers: bool = Field(
       False,
       description=(

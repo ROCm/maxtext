@@ -170,6 +170,16 @@ def pad_expert_rows(
   return padded, padding
 
 
+def max_compact_capacity(cols: int, num_experts: int, grouped_kernel: str = "ragged") -> int:
+  """Largest `expert_padding` compact capacity whose padded `[rows, cols]` buffer has int32-indexable elements.
+
+  The JAX-AITER quantizer indexes its operand with signed int32.
+  """
+  alignment = _group_alignment(grouped_kernel)
+  padded_rows = (2**31 - 1) // cols // alignment * alignment
+  return padded_rows - (alignment - 1) * num_experts
+
+
 def expert_padding(
     group_sizes: jax.Array,
     compact_capacity: int,

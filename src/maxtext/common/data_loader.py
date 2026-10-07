@@ -59,6 +59,18 @@ def _balanced_packed_row_order(segment_ids: np.ndarray, num_shards: int) -> np.n
   return np.asarray([row for shard_rows in bins for row in shard_rows], dtype=np.int32)
 
 
+def _process_rows(value: jax.Array) -> tuple[np.ndarray, int]:
+  """This process's contiguous rows of a batch-sharded global array, and how many shards hold them."""
+  shards = {}
+  for shard in value.addressable_shards:
+    shards.setdefault(shard.index[0].start or 0, shard)
+  starts = sorted(shards)
+  rows = [np.asarray(shards[start].data) for start in starts]
+  if any(start + len(block) != nxt for start, block, nxt in zip(starts, rows, starts[1:])):
+    raise ValueError(f"packed-row balancing needs contiguous process-local rows, got starts {starts}")
+  return np.concatenate(rows), len(starts)
+
+
 @contextlib.contextmanager
 def loader_exception_guard(config):
   """Context manager that wraps data loading Exception handling.
@@ -160,7 +172,21 @@ class DataLoader:
     if "inputs_segmentation" not in example_batch:
       raise ValueError("diagnostic packed-row balancing requires inputs_segmentation")
 
-    segmentation = np.asarray(example_batch["inputs_segmentation"])
+    segmentation = example_batch["inputs_segmentation"]
+    if isinstance(segmentation, jax.Array) and not segmentation.is_fully_addressable:
+      # A process sees only its own rows, so it balances them across its own shards.
+      local_segmentation, local_shards = _process_rows(segmentation)
+      order = _balanced_packed_row_order(local_segmentation, local_shards)
+      transformed = {}
+      for name, value in example_batch.items():
+        if isinstance(value, jax.Array) and value.ndim and value.shape[0] == segmentation.shape[0]:
+          rows, _ = _process_rows(value)
+          transformed[name] = jax.make_array_from_process_local_data(value.sharding, rows[order], value.shape)
+        else:
+          transformed[name] = value
+      return transformed
+
+    segmentation = np.asarray(segmentation)
     order = _balanced_packed_row_order(segmentation, self.num_input_shards)
     transformed = {}
     for name, value in example_batch.items():

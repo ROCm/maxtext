@@ -215,6 +215,9 @@ moe_local_expert_backend: "default"
 jax_aiter_mxfp4_grouped_kernel: "wholeloop" # wholeloop or ragged; used only by moe_local_expert_backend=jax_aiter_mxfp4. wholeloop needs emb_dim and moe_mlp_dim divisible by 256
 jax_aiter_mxfp4_check_route_capacity: true # host-side overflow check; disable only after validating ragged_buffer_factor for the workload
 jax_aiter_mxfp4_overflow_buffer_factor: 0.0 # optional second MXFP4 route buffer relative to balanced rows/rank; 0 disables it
+jax_aiter_mxfp4_dropless_tiers: false # with dedup dispatch, extra expert tiers so no assignment drops; they run only when the overflow tiers hold rows
+rail_aligned_embedding_lookup: false # regroup token-embedding slices within each process, then between same-local-index GPUs, instead of one flat all-to-all
+jax_aiter_mxfp4_two_stage_exchange: false # with dedup dispatch over several processes, exchange within each process and then only between same-local-index GPUs, for rail-isolated networks
 jax_aiter_mxfp4_fresh_a2a_buffers: false # fresh uninitialized MXFP4 ragged all-to-all destinations with unwritten rows masked; avoids a per-layer copy of a hoisted zero buffer
 jax_aiter_mxfp4_fuse_gate_up: false # one MXFP4 grouped GEMM for the gate and up projections, saved as remat name 'mlpwi'; backward input gradient is one GEMM instead of two plus a sum
 jax_aiter_mxfp4_dedup_dispatch: false # one all-to-all row per (token, expert shard) instead of per (token, expert); the buffer factors size the local expert tiers

@@ -89,6 +89,57 @@ def embed_as_linen(
   )
 
 
+def rail_aligned_embedding_lookup(
+    embedding: Array,
+    inputs: Array,
+    mesh: Mesh,
+    table_pspec,
+    out_pspec,
+    local_shards: int | None = None,
+) -> Array:
+  """`embedding[inputs]` for a table whose feature dim is sharded over one mesh axis, without a flat all-to-all.
+
+  XLA regroups the looked-up feature slices by batch with one all-to-all over
+  every shard of that axis. On a rail-isolated network that pairs GPUs with
+  different local indexes on different nodes, so here the regroup runs within
+  each process's block of `local_shards` shards and then only between shards
+  with the same local index. The batch must be sharded over the same axis and
+  nothing else may be sharded.
+  """
+  from maxtext.layers import moe_dedup  # pylint: disable=g-import-not-at-top
+
+  def active(entry):
+    axes = entry if isinstance(entry, tuple) else (entry,) if entry else ()
+    return tuple(a for a in axes if mesh.shape[a] > 1)
+
+  axes = active(table_pspec[1])
+  if len(axes) != 1 or active(table_pspec[0]) or active(out_pspec[0]) != axes or any(map(active, out_pspec[1:])):
+    raise ValueError(
+        "rail_aligned_embedding_lookup needs the table's feature dim and the batch sharded over one "
+        f"mesh axis and nothing else sharded; got table {table_pspec}, output {out_pspec}"
+    )
+  (axis,) = axes
+  num = mesh.shape[axis]
+  local_shards = local_shards or moe_dedup.process_local_shards(mesh, axis)
+  within, across = moe_dedup.two_stage_groups(num, local_shards)
+
+  def lookup(table, ids):
+    rows = table[jax.lax.all_gather(ids, axis)]
+    rows = rows.reshape(num // local_shards, local_shards, *rows.shape[1:])
+    rows = jax.lax.all_to_all(rows, axis, 1, 1, axis_index_groups=within)
+    rows = jax.lax.all_to_all(rows, axis, 0, 0, axis_index_groups=across)
+    rows = jnp.moveaxis(rows.reshape(num, *rows.shape[2:]), 0, -2)
+    return rows.reshape(*rows.shape[:-2], num * rows.shape[-1])
+
+  return jax.shard_map(
+      lookup,
+      mesh=mesh,
+      in_specs=(table_pspec, jax.sharding.PartitionSpec(*out_pspec[:-1])),
+      out_specs=out_pspec,
+      check_vma=False,
+  )(embedding, inputs)
+
+
 class Embed(nnx.Module):
   """A parameterized function from integers [0, n) to d-dimensional vectors."""
 
@@ -178,6 +229,10 @@ class Embed(nnx.Module):
       iota = lax.iota(jnp.int32, self.num_embeddings)
       one_hot = jnp.array(inputs[..., jnp.newaxis] == iota, dtype=self.dtype)
       output = jnp.dot(one_hot, embedding, out_sharding=out_sharding)
+    elif cfg.rail_aligned_embedding_lookup:
+      rules = getattr(self.config, "logical_axis_rules", None)
+      table_pspec = logical_to_mesh_axes(("vocab", "embed_vocab"), self.mesh, rules=rules)
+      output = rail_aligned_embedding_lookup(embedding, inputs, self.mesh, table_pspec, out_pspec)
     else:
       output = embedding.at[inputs].get(out_sharding=out_sharding)
 

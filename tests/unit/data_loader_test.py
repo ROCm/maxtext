@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 from jax.sharding import Mesh
 
 from maxtext.configs import pyconfig
-from maxtext.common.data_loader import _balanced_packed_row_order, DataLoader, RampUpDataLoader
+from maxtext.common.data_loader import _balanced_packed_row_order, _process_rows, DataLoader, RampUpDataLoader
 from maxtext.utils import exceptions
 from maxtext.utils.maxtext_utils import create_device_mesh
 from maxtext.common.gcloud_stub import is_decoupled
@@ -91,6 +91,14 @@ class DataLoaderTest(unittest.TestCase):
     balanced = [int(costs[order[:4]].sum()), int(costs[order[4:]].sum())]
     self.assertEqual(current, [256, 32])
     self.assertEqual(balanced, [144, 144])
+
+  def test_process_rows_returns_local_rows_in_global_order(self):
+    devices = np.asarray(jax.devices())
+    rows = np.arange(devices.size * 2 * 3, dtype=np.int32).reshape(devices.size * 2, 3)
+    sharding = jax.sharding.NamedSharding(Mesh(devices, ("x",)), jax.sharding.PartitionSpec("x"))
+    local, shards = _process_rows(jax.device_put(rows, sharding))
+    np.testing.assert_array_equal(local, rows)
+    self.assertEqual(shards, devices.size)
 
   def test_load_next_batch_reuse_true(self):
     expected_shape = [jax.device_count(), self.config.max_target_length]

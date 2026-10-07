@@ -141,9 +141,14 @@ class JaxAiterFlashRoutingTest(parameterized.TestCase):
       calls.append(("varlen", seqstart_q.shape, cu_q is not None, max_q, scale, causal, window))
       return jnp.zeros(q.shape[:2] + v.shape[-1:], q.dtype)
 
+    def fake_buckets(q, k, v, buckets, owners, max_seqlens, scale, causal):
+      calls.append(("buckets", tuple(ss.shape for ss, _ in buckets), len(owners), max_seqlens, scale, causal))
+      return jnp.zeros(q.shape[:2] + v.shape[-1:], q.dtype)
+
     mha = types.ModuleType("jax_aiter.mha")
     mha.flash_attn_auto = fake_auto
     mha.flash_attn_varlen_auto = fake_varlen
+    mha.flash_attn_varlen_buckets = fake_buckets
     mha.full_row_layout = lambda **kwargs: full_row_layout
     fake_modules = {"jax_aiter": types.ModuleType("jax_aiter"), "jax_aiter.mha": mha}
     query = jnp.zeros((2, seq_len, 2, qk_dim), jnp.float32)
@@ -195,6 +200,33 @@ class JaxAiterFlashRoutingTest(parameterized.TestCase):
           v_dim=128,
       )
     self.assertEqual(calls, [("varlen", (2 * 2 + 1,), True, 4096, 1.0, True, (-1, -1))])
+
+  def _route_mla_buckets(self, mode):
+    with mock.patch.dict("os.environ", {"MAXTEXT_JAX_AITER_FLASH_BUCKETS": mode}):
+      return self._route(
+          self._attention(packing=True, dataset_type="hf", max_segments_per_seq=2),
+          jnp.ones((2, 4096), jnp.int32),
+          seq_len=4096,
+          qk_dim=192,
+          v_dim=128,
+      )
+
+  def test_buckets_trace_overflow_fallback_and_four_bounded_calls(self):
+    calls = self._route_mla_buckets("1")
+    self.assertEqual(calls[0], ("varlen", (2 * 2 + 1,), True, 4096, 1.0, True, (-1, -1)))
+    self.assertEqual([c[3] for c in calls[1:]], [512, 1024, 2048, 4096])
+
+  def test_shared_buckets_use_one_in_place_call(self):
+    calls = self._route_mla_buckets("shared")
+    self.assertEqual(calls, [
+        ("varlen", (2 * 2 + 1,), True, 4096, 1.0, True, (-1, -1)),
+        # Bucket slots are capped by max_segments_per_seq=2.
+        ("buckets", ((2 * 2 + 1,), (2 * 2 + 1,), (2 * 2 + 1,), (2 * 1 + 1,)), 4, (512, 1024, 2048, 4096), 1.0, True),
+    ])
+
+  def test_unknown_bucket_mode_is_rejected(self):
+    with self.assertRaisesRegex(ValueError, "MAXTEXT_JAX_AITER_FLASH_BUCKETS"):
+      self._route_mla_buckets("yes")
 
   def test_real_unpacked_data_uses_one_slot_per_row(self):
     calls = self._route(self._attention(packing=False, dataset_type="hf", max_segments_per_seq=-1),

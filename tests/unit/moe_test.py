@@ -35,6 +35,32 @@ from tests.utils.test_helpers import get_test_config_path
 import pytest
 
 
+@pytest.mark.parametrize(
+    "num_ep, groups, topk_groups, expected",
+    [
+        (8, 8, 4, 4),
+        (16, 8, 4, 8),
+        (32, 8, 4, 8),
+        (16, 8, 1, 2),
+        (4, 8, 4, 4),
+        (4, 16, 2, 2),
+        (12, 8, 4, 0),
+        (8, -1, 4, 0),
+    ],
+)
+def test_dedup_shards_per_token_bounds_group_limited_routing(num_ep, groups, topk_groups, expected):
+  stub = type(
+      "Stub",
+      (),
+      {
+          "get_expert_parallelism_size": lambda self: num_ep,
+          "config": type("Cfg", (), {"n_routing_groups": groups, "topk_routing_group": topk_groups})(),
+          "num_experts_per_tok": 8,
+      },
+  )()
+  assert moe.RoutedMoE._dedup_shards_per_token(stub) == expected
+
+
 def assert_moe_close(actual, expected, dtype):
   """Asserts that the actual and expected MoE outputs are close."""
   assert np.isfinite(actual).all(), "Actual output contains NaNs or Infs!"

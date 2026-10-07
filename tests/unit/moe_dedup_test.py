@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh, PartitionSpec as P
 
 from maxtext.kernels import jax_aiter_mxfp4
@@ -20,6 +21,16 @@ def _group_limited_ids(rng, tokens, num_shards, local_experts, top_k, shards_per
   ids = np.empty((tokens, top_k), np.int32)
   for t in range(tokens):
     shards = rng.choice(num_shards, shards_per_token, replace=False)
+    candidates = (shards[:, None] * local_experts + np.arange(local_experts)).reshape(-1)
+    ids[t] = rng.choice(candidates, top_k, replace=False)
+  return ids
+
+
+def _skewed_ids(rng, tokens, num_shards, local_experts, top_k):
+  """Group-limited expert ids whose two shards always include shard 0."""
+  ids = np.empty((tokens, top_k), np.int32)
+  for t in range(tokens):
+    shards = np.asarray([0, rng.integers(1, num_shards)])
     candidates = (shards[:, None] * local_experts + np.arange(local_experts)).reshape(-1)
     ids[t] = rng.choice(candidates, top_k, replace=False)
   return ids
@@ -222,6 +233,102 @@ def _take_rows(values, indices, valid):
   return jnp.where(valid[..., None], taken, 0)
 
 
+def _emulated_grouped_ragged(
+    operand, output_rows, input_offsets, send_sizes, output_offsets, recv_sizes, *, axis_name, axis_index_groups, key
+):
+  """Grouped `ragged_all_to_all` into a NaN-filled buffer, built from `all_to_all`, for backends without the ragged op."""
+  del key
+  peers = len(axis_index_groups[0])
+  slices = input_offsets.shape[0] // peers
+  rows = operand.shape[0]
+  i = jnp.arange(rows)
+  in_range = i[None, :] < send_sizes[:, None]
+  chunks = _take_rows(operand, input_offsets[:, None] + i[None, :], in_range).reshape((peers, slices, rows) + operand.shape[1:])
+  received = jax.lax.all_to_all(chunks, axis_name, 0, 0, axis_index_groups=axis_index_groups)
+  offsets = jax.lax.all_to_all(output_offsets.reshape(peers, slices), axis_name, 0, 0, axis_index_groups=axis_index_groups)
+  sizes = recv_sizes.reshape(peers, slices)
+  targets = jnp.where(i < sizes[..., None], offsets[..., None] + i, output_rows)
+  output = jnp.full((output_rows,) + operand.shape[1:], jnp.nan, operand.dtype)
+  return output.at[targets.reshape(-1)].set(received.reshape((-1,) + operand.shape[1:]), mode="drop")
+
+
+@pytest.mark.parametrize("local_shards", [2, 4])
+@pytest.mark.parametrize("zero_unwritten", [True, False], ids=["zeroed", "unwritten"])
+def test_two_stage_exchange_matches_direct_exchange(local_shards, zero_unwritten):
+  devices = jax.devices()
+  if len(devices) < 8:
+    pytest.skip("requires eight devices; on CPU set --xla_force_host_platform_device_count=8")
+  num_shards, pair_rows, hidden = 8, 5, 3
+  rng = np.random.default_rng(11)
+  matrix = rng.integers(0, pair_rows + 1, (num_shards, num_shards)).astype(np.int32)
+  matrix[2, 5] = matrix[6, 1] = 0
+  in_rows, out_rows = int(matrix.sum(1).max()) + 2, int(matrix.sum(0).max()) + 3
+  operand = jnp.asarray(rng.standard_normal((num_shards, in_rows, hidden)), jnp.float32)
+  cotangent = jnp.asarray(rng.standard_normal((num_shards, out_rows, hidden)), jnp.float32)
+  mesh = Mesh(np.asarray(devices[:num_shards]), ("expert",))
+  traffic = jnp.asarray(matrix)
+
+  def run(two_stage):
+    @jax.shard_map(mesh=mesh, in_specs=(P("expert"),), out_specs=P("expert"), check_vma=False)
+    def f(x):
+      shard = jax.lax.axis_index("expert")
+      if two_stage:
+        return moe_dedup.two_stage_exchange(
+            x[0], traffic, shard, out_rows, pair_rows, "expert", local_shards, 0, zero_unwritten, _emulated_grouped_ragged
+        )[None]
+      params = moe_dedup.exchange_params(traffic, shard, is_dispatch=True)
+      return _emulated_exchange(x[0], *params, None, out_rows, "expert", 0, True)[None]
+
+    return f
+
+  # Rows past each shard's received count are unwritten; rows past its sent count get no gradient.
+  live_out = np.arange(out_rows)[None, :] < matrix.sum(0)[:, None]
+  live_in = np.arange(in_rows)[None, :] < matrix.sum(1)[:, None]
+  want = jax.jit(run(False))(operand)
+  got = jax.jit(run(True))(operand)
+  np.testing.assert_array_equal(np.asarray(got)[live_out], np.asarray(want)[live_out])
+  if zero_unwritten:
+    np.testing.assert_array_equal(np.asarray(got)[~live_out], 0)
+  masked = jnp.asarray(cotangent * live_out[..., None])
+  want_grad = jax.jit(jax.grad(lambda x: jnp.sum(run(False)(x) * masked)))(operand)
+  got_grad = jax.jit(jax.vjp(run(True), operand)[1])(masked)[0]
+  np.testing.assert_array_equal(np.asarray(got_grad)[live_in], np.asarray(want_grad)[live_in])
+  if zero_unwritten:
+    np.testing.assert_array_equal(np.asarray(got_grad)[~live_in], 0)
+
+
+class _FakeDevice:
+
+  def __init__(self, process_index, local_hardware_id):
+    self.process_index = process_index
+    self.local_hardware_id = local_hardware_id
+
+
+class _FakeMesh:
+
+  def __init__(self, devices, axis_names):
+    self.devices = np.asarray(devices, dtype=object)
+    self.axis_names = axis_names
+
+
+def test_process_local_shards_requires_contiguous_rail_aligned_blocks():
+  block = lambda order: [_FakeDevice(p, h) for p in range(2) for h in order]  # pylint: disable=unnecessary-lambda-assignment
+  assert moe_dedup.process_local_shards(_FakeMesh([block(range(8))], ("data", "expert")), "expert") == 8
+  single = [_FakeDevice(0, h) for h in range(8)]
+  assert moe_dedup.process_local_shards(_FakeMesh([single], ("data", "expert")), "expert") == 8
+  interleaved = [_FakeDevice(i % 2, i // 2) for i in range(16)]
+  with pytest.raises(ValueError, match="contiguous blocks"):
+    moe_dedup.process_local_shards(_FakeMesh([interleaved], ("data", "expert")), "expert")
+  remote = [_FakeDevice(0, h) for h in range(8)] + [_FakeDevice(1, None) for _ in range(8)]
+  assert moe_dedup.process_local_shards(_FakeMesh([remote], ("data", "expert")), "expert") == 8
+  crossed = [_FakeDevice(0, h) for h in range(8)] + [_FakeDevice(1, h) for h in reversed(range(8))]
+  with pytest.raises(ValueError, match="local GPU order"):
+    moe_dedup.process_local_shards(_FakeMesh([crossed], ("data", "expert")), "expert")
+  remote_crossed = [_FakeDevice(0, None) for _ in range(8)] + [_FakeDevice(1, h) for h in reversed(range(8))]
+  with pytest.raises(ValueError, match="local GPU order"):
+    moe_dedup.process_local_shards(_FakeMesh([remote_crossed], ("data", "expert")), "expert")
+
+
 def _expected_kept(ids, num_shards, local_experts, capacity):
   """Assignments kept under the receiver's sort order: sender, token, then slot, within each local expert."""
   kept = np.zeros(ids.shape, bool)
@@ -255,28 +362,50 @@ def _exchange_or_skip(exchange):
 
 @pytest.mark.parametrize("zero_unwritten_rows", [True, False], ids=["zeroed", "unread_rows_nan"])
 @pytest.mark.parametrize("layout", ["compact", "padded"])
-@pytest.mark.parametrize("exchange", ["emulated", "fresh"])
-@pytest.mark.parametrize("capacities", [(48, 160), (40, 20)], ids=["two_tier_dropless", "two_tier_drops"])
-def test_dedup_dispatch_combine_matches_dense_reference(capacities, exchange, layout, zero_unwritten_rows):
-  exchange_fn = _exchange_or_skip(exchange)
+@pytest.mark.parametrize("exchange", ["emulated", "fresh", "two_stage_emulated", "two_stage_fresh"])
+@pytest.mark.parametrize(
+    "capacities, dropless_tier_rows",
+    [((48, 160), 0), ((40, 20), 0), ((16, 8), 160), ((48, 16), 160)],
+    ids=["two_tier_dropless", "two_tier_drops", "dropless_tiers", "dropless_tiers_mixed"],
+)
+def test_dedup_dispatch_combine_matches_dense_reference(
+    capacities, dropless_tier_rows, exchange, layout, zero_unwritten_rows
+):
+  two_stage = exchange.startswith("two_stage_")
+  exchange_fn = _exchange_or_skip(exchange.removeprefix("two_stage_"))
+  # Two emulated processes of four shards each.
+  two_stage_args = {}
+  if two_stage:
+    ragged = _emulated_grouped_ragged if exchange_fn else moe_dedup.fresh_ragged_all_to_all
+    two_stage_args = {"local_shards": 4, "two_stage_ragged": ragged}
+    exchange_fn = None
   devices = jax.devices()
   num_shards, local_experts, top_k, tokens, hidden, hidden_out = 8, 4, 4, 24, 8, 6
   num_experts = num_shards * local_experts
   rng = np.random.default_rng(3)
-  ids = np.stack([_group_limited_ids(rng, tokens, num_shards, local_experts, top_k, 2) for _ in range(num_shards)])
+  if dropless_tier_rows:
+    # Every token also routes to shard 0, which then needs several dropless tiers.
+    ids = np.stack([_skewed_ids(rng, tokens, num_shards, local_experts, top_k) for _ in range(num_shards)])
+  else:
+    ids = np.stack([_group_limited_ids(rng, tokens, num_shards, local_experts, top_k, 2) for _ in range(num_shards)])
   x = jnp.asarray(rng.standard_normal((num_shards, tokens, hidden)), jnp.float32)
   weights = jnp.asarray(rng.random((num_shards, tokens, top_k)), jnp.float32)
   kernels = jnp.asarray(rng.standard_normal((num_experts, hidden, hidden_out)) / 3, jnp.float32)
   cotangent = jnp.asarray(rng.standard_normal((num_shards, tokens, hidden_out)), jnp.float32)
-  kept = _expected_kept(ids, num_shards, local_experts, sum(capacities))
+  kept = _expected_kept(ids, num_shards, local_experts, ids.size if dropless_tier_rows else sum(capacities))
   per_shard = np.bincount((ids // local_experts).reshape(-1), minlength=num_shards)
   if capacities == (48, 160):
     assert kept.all() and per_shard.max() > 48, "test needs the overflow tier and no drops"
+  elif dropless_tier_rows:
+    assert per_shard.max() > sum(capacities) + dropless_tier_rows, "test needs more than one dropless tier"
+    if capacities == (48, 16):
+      regimes = np.digitize(per_shard, np.cumsum(capacities), right=True)
+      assert set(regimes) == {0, 1, 2}, "test needs shards within tier 0, within the overflow tier, and beyond it"
   else:
     assert not kept.all()
 
-  def expert_fn(rows, row_weights, group_sizes, *, is_overflow, local_kernels):
-    del is_overflow
+  def expert_fn(rows, row_weights, group_sizes, *, is_overflow, save_residuals, local_kernels):
+    del is_overflow, save_residuals
     expert = jnp.repeat(jnp.arange(local_experts), group_sizes, total_repeat_length=rows.shape[0])
     if zero_unwritten_rows:
       return jnp.einsum("ch,cho->co", rows, local_kernels[expert]) * row_weights[:, None]
@@ -308,6 +437,8 @@ def test_dedup_dispatch_combine_matches_dense_reference(capacities, exchange, la
         exchange=exchange_fn,
         row_layout=jax_aiter_mxfp4.expert_padding if layout == "padded" else None,
         zero_unwritten_rows=zero_unwritten_rows,
+        dropless_tier_rows=dropless_tier_rows,
+        **two_stage_args,
     )[None]
 
   def reference(x, ids, weights, kernels):
@@ -358,7 +489,7 @@ def test_saved_plan_is_not_rebuilt_in_backward(saved, passes, exchange):
         x[0],
         ids[0],
         weights[0],
-        lambda rows, row_weights, group_sizes, *, is_overflow: jnp.tanh(rows) * row_weights[:, None],
+        lambda rows, row_weights, group_sizes, *, is_overflow, save_residuals: jnp.tanh(rows) * row_weights[:, None],
         num_experts=num_shards * local_experts,
         num_shards=num_shards,
         axis_name="expert",
@@ -376,3 +507,145 @@ def test_saved_plan_is_not_rebuilt_in_backward(saved, passes, exchange):
   assert _primitive_count(grad_jaxpr, "sort") == passes
   for actual, wanted in zip(jax.jit(grad(remat))(x, weights), jax.jit(grad(dedup))(x, weights)):
     np.testing.assert_allclose(actual, wanted, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("shards_per_token", [2, 3], ids=["within_bound", "beyond_bound"])
+def test_capacity_check_counts_unsent_destinations(shards_per_token):
+  exchange_fn = _exchange_or_skip("emulated")
+  devices = jax.devices()
+  num_shards, local_experts, top_k, tokens, hidden = 8, 4, 4, 24, 8
+  rng = np.random.default_rng(11)
+  ids = jnp.asarray(
+      np.stack([_group_limited_ids(rng, tokens, num_shards, local_experts, top_k, shards_per_token) for _ in range(num_shards)])
+  )
+  x = jnp.asarray(rng.standard_normal((num_shards, tokens, hidden)), jnp.float32)
+  weights = jnp.asarray(rng.random((num_shards, tokens, top_k)), jnp.float32)
+  mesh = Mesh(np.asarray(devices[:num_shards]), ("expert",))
+
+  @jax.jit
+  @jax.shard_map(mesh=mesh, in_specs=(P("expert"),) * 3, out_specs=P("expert"), check_vma=False)
+  def dedup(x, ids, weights):
+    return moe_dedup.dedup_dispatch_combine(
+        x[0],
+        ids[0],
+        weights[0],
+        lambda rows, row_weights, group_sizes, *, is_overflow, save_residuals: rows * row_weights[:, None],
+        num_experts=num_shards * local_experts,
+        num_shards=num_shards,
+        axis_name="expert",
+        max_shards_per_token=2,
+        capacities=(16, 8),
+        check_capacity=True,
+        exchange=exchange_fn,
+        dropless_tier_rows=160,
+    )[None]
+
+  if shards_per_token == 2:
+    jax.block_until_ready(dedup(x, ids, weights))
+  else:
+    with pytest.raises(Exception, match="route drop"):
+      jax.block_until_ready(dedup(x, ids, weights))
+
+
+def test_dropless_tiers_save_only_the_received_rows():
+  exchange_fn = _exchange_or_skip("emulated")
+  devices = jax.devices()
+  num_shards, local_experts, top_k, tokens, hidden = 8, 4, 4, 24, 8
+  rng = np.random.default_rng(7)
+  ids = jnp.asarray(np.stack([_skewed_ids(rng, tokens, num_shards, local_experts, top_k) for _ in range(num_shards)]))
+  x = jnp.asarray(rng.standard_normal((num_shards, tokens, hidden)), jnp.float32)
+  weights = jnp.asarray(rng.random((num_shards, tokens, top_k)), jnp.float32)
+  mesh = Mesh(np.asarray(devices[:num_shards]), ("expert",))
+
+  def dedup(dropless_tier_rows):
+    @jax.shard_map(mesh=mesh, in_specs=(P("expert"),) * 3, out_specs=P("expert"), check_vma=False)
+    def f(x, ids, weights):
+      return moe_dedup.dedup_dispatch_combine(
+          x[0],
+          ids[0],
+          weights[0],
+          # Like the MXFP4 expert path, which names its input rows unless told not to.
+          lambda rows, row_weights, group_sizes, *, is_overflow, save_residuals: (
+              jnp.tanh(checkpoint_name(rows, "moe_dispatched") if save_residuals else rows) * row_weights[:, None]
+          ),
+          num_experts=num_shards * local_experts,
+          num_shards=num_shards,
+          axis_name="expert",
+          max_shards_per_token=2,
+          capacities=(16, 8),
+          exchange=exchange_fn,
+          dropless_tier_rows=dropless_tier_rows,
+      )[None]
+
+    return f
+
+  def grad(f):
+    return jax.grad(lambda x, w: jnp.sum(f(x, ids, w) ** 2), argnums=(0, 1))
+
+  def remat(f, *names):
+    policy = jax.checkpoint_policies.save_only_these_names(
+        "moe_dispatched", "moe_dispatched_meta", "moe_dedup_plan", "moe_combined", *names
+    )
+    return jax.checkpoint(f, policy=policy)
+
+  def exchanges(f):
+    return _primitive_count(jax.make_jaxpr(grad(f))(x, weights).jaxpr, "all_to_all")
+
+  def saved_float_shapes(f):
+    _, vjp = jax.vjp(lambda a, b: f(a, ids, b), x, weights)
+    leaves = jax.tree_util.tree_leaves(vjp)
+    return sorted(tuple(l.shape) for l in leaves if hasattr(l, "dtype") and jnp.issubdtype(l.dtype, jnp.floating))
+
+  received_rows = (num_shards * tokens * num_shards, hidden)
+  dropless = remat(dedup(160), "moe_dedup_received")
+  assert saved_float_shapes(dropless) == sorted(saved_float_shapes(remat(dedup(0))) + [received_rows])
+  assert exchanges(dropless) == exchanges(remat(dedup(0)))
+  assert exchanges(remat(dedup(160))) > exchanges(remat(dedup(0))), "the saved received rows spare the exchange"
+  for actual, wanted in zip(jax.jit(grad(dropless))(x, weights), jax.jit(grad(dedup(160)))(x, weights)):
+    np.testing.assert_allclose(actual, wanted, rtol=1e-6, atol=1e-6)
+
+
+def test_dropless_tiers_hold_one_tier_live_in_backward():
+  exchange_fn = _exchange_or_skip("emulated")
+  devices = jax.devices()
+  num_shards, local_experts, top_k, tokens, hidden, ffn = 8, 4, 4, 256, 256, 2048
+  rng = np.random.default_rng(7)
+  ids = jnp.asarray(np.stack([_skewed_ids(rng, tokens, num_shards, local_experts, top_k) for _ in range(num_shards)]))
+  x = jnp.asarray(rng.standard_normal((num_shards, tokens, hidden)), jnp.float32)
+  weights = jnp.asarray(rng.random((num_shards, tokens, top_k)), jnp.float32)
+  w_in = jnp.asarray(rng.standard_normal((num_shards, hidden, ffn)) / 16, jnp.float32)
+  mesh = Mesh(np.asarray(devices[:num_shards]), ("expert",))
+  policy = jax.checkpoint_policies.save_only_these_names(
+      "moe_dispatched", "moe_dispatched_meta", "moe_dedup_plan", "moe_combined", "moe_dedup_received"
+  )
+
+  def temp_bytes(dropless_tier_rows):
+    @jax.shard_map(mesh=mesh, in_specs=(P("expert"),) * 4, out_specs=P("expert"), check_vma=False)
+    def f(x, ids, weights, w_in):
+      def expert_fn(rows, row_weights, group_sizes, *, is_overflow, save_residuals):
+        del group_sizes, is_overflow
+        rows = checkpoint_name(rows, "moe_dispatched") if save_residuals else rows
+        return jnp.tanh(rows @ w_in[0]) @ w_in[0].T * row_weights[:, None]
+
+      return moe_dedup.dedup_dispatch_combine(
+          x[0],
+          ids[0],
+          weights[0],
+          expert_fn,
+          num_experts=num_shards * local_experts,
+          num_shards=num_shards,
+          axis_name="expert",
+          max_shards_per_token=2,
+          capacities=(512, 256),
+          exchange=exchange_fn,
+          dropless_tier_rows=dropless_tier_rows,
+      )[None]
+
+    f = jax.checkpoint(f, policy=policy)
+    grad = jax.jit(jax.grad(lambda x, w, w_in: jnp.sum(f(x, ids, w, w_in) ** 2), argnums=(0, 1, 2)))
+    return grad.lower(x, weights, w_in).compile().memory_analysis().temp_size_in_bytes
+
+  # The same extra rows in four times as many tiers: if every tier stayed live
+  # through backward, the overhead would not shrink.
+  base = temp_bytes(0)
+  assert temp_bytes(256) - base < 0.6 * (temp_bytes(1024) - base)
