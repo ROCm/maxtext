@@ -199,6 +199,10 @@ def _ensure_deepep_setup(mesh, config):
   global _deepep_setup_done  # pylint: disable=global-statement
   if _deepep_setup_done:
     return
+  import primus_turbo.jax  # pylint: disable=g-import-not-at-top
+
+  # Registers the primitives; normally done by the jax_plugins entry point, absent for in-place builds.
+  primus_turbo.jax.initialize()
   try:
     from primus_turbo.jax.lax.moe import setup as _deepep_setup  # pylint: disable=g-import-not-at-top
   except ImportError:
@@ -1788,14 +1792,17 @@ class RoutedMoE(nnx.Module):
             interpret=megablox_interpret,
         )
       elif self.config.use_turbo_grouped_gemm:
+        import primus_turbo.jax  # pylint: disable=import-outside-toplevel
         from primus_turbo.jax.lax.grouped_gemm import grouped_gemm as turbo_grouped_gemm  # pylint: disable=import-outside-toplevel
+
+        primus_turbo.jax.initialize()
 
         if not getattr(turbo_grouped_gemm, "_logged", False):
           max_logging.log("Using primus_turbo grouped_gemm in MoE sparse matmul")
           turbo_grouped_gemm._logged = True
         # Thread-local x64: the CK kernel requires int64 group_sizes, but global x64 breaks argsort
         # (XLA-ROCm s32/s64 scatter mismatch). Remove once primus_turbo accepts int32 group_lens.
-        with jax.experimental.enable_x64():
+        with jax.enable_x64(True):
           output = turbo_grouped_gemm(
               inputs,
               kernel,
