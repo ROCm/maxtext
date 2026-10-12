@@ -19,7 +19,7 @@ import enum
 import functools
 import math
 import random
-from typing import Iterable, Optional, Tuple, Union
+from typing import Callable, Iterable, NamedTuple, Optional, Tuple, Union
 
 from aqt.jax.v2 import aqt_tensor as aqt
 from flax import nnx
@@ -183,6 +183,89 @@ def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tupl
 
 
 _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_custom_bwd)
+
+
+_deepep_dispatch_logged = False
+_deepep_setup_done = False
+
+
+def _ensure_deepep_setup(mesh, config):
+  """Bootstrap Primus-Turbo DeepEP once per process before the first dispatch.
+
+  Primus-Turbo pins the expert-parallel communication group per process, so this runs in whichever
+  process executes the MoE forward. Newer Primus-Turbo requires this explicit setup(); older builds
+  auto-bootstrap and expose no setup(), so the import is guarded to work against both.
+  """
+  global _deepep_setup_done  # pylint: disable=global-statement
+  if _deepep_setup_done:
+    return
+  try:
+    from primus_turbo.jax.lax.moe import setup as _deepep_setup  # pylint: disable=g-import-not-at-top
+  except ImportError:
+    _deepep_setup = None
+  if _deepep_setup is not None:
+    _deepep_setup(mesh=mesh, ep_axis_name="expert", hidden_bytes=config.emb_dim * 2)
+    max_logging.log("Primus-Turbo DeepEP runtime initialized via setup() on the 'expert' mesh axis")
+  _deepep_setup_done = True
+
+
+class _DeepEPCombineState(NamedTuple):
+  """State passed from DeepEP dispatch to combine within sparse_matmul."""
+
+  handle: Tuple
+  recv_topk_weights: jax.Array
+  recv_topk_idx: jax.Array
+  sort_idx: jax.Array
+  num_recv_tokens: int
+  combine_fn: Callable
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _deepep_dispatch_fan_out(recv_x: jax.Array, sort_idx: jax.Array, num_topk: int) -> jax.Array:
+  """Fan recv_x out onto the sorted expert-dispatch layout: x[i] = recv_x[sort_idx[i] // num_topk].
+
+  The custom backward avoids the atomic scatter-add JAX autodiff would emit for a duplicate-index
+  gather: it inverts the permutation with argsort and folds the top-K duplicates with a reduce-sum.
+  """
+  return recv_x[sort_idx // num_topk]
+
+
+def _deepep_dispatch_fan_out_fwd(recv_x, sort_idx, num_topk):
+  return recv_x[sort_idx // num_topk], (sort_idx, recv_x.shape)
+
+
+def _deepep_dispatch_fan_out_bwd(num_topk, residual, grad_x):
+  sort_idx, recv_x_shape = residual
+  grad_fanned = grad_x[jnp.argsort(sort_idx)]  # permutation gather, no atomics
+  num_recv_tokens, hidden = recv_x_shape
+  grad_recv_x = grad_fanned.reshape(num_recv_tokens, num_topk, hidden).sum(axis=1)
+  # sort_idx is integer and has no real gradient; return zeros to match custom_vjp arity.
+  return (grad_recv_x, jnp.zeros_like(sort_idx))
+
+
+_deepep_dispatch_fan_out.defvjp(_deepep_dispatch_fan_out_fwd, _deepep_dispatch_fan_out_bwd)
+
+
+def deepep_fan_in(
+    expert_output: jax.Array,
+    recv_topk_weights: jax.Array,
+    recv_topk_idx: jax.Array,
+    num_recv_tokens: int,
+    float32_weight_sum: bool = True,
+) -> jax.Array:
+  """Aggregate multi-expert outputs per received token via a local weighted sum (no scatter-add).
+
+  expert_output is [num_recv * num_topk, hidden], already unsorted back to the (token, topk) slot order.
+  """
+  flat_idx = recv_topk_idx.reshape(-1)
+  slot_weights = jnp.where(flat_idx >= 0, recv_topk_weights.reshape(-1), 0.0)
+  hidden_out = expert_output.shape[-1]
+  num_topk = expert_output.shape[0] // num_recv_tokens
+  if float32_weight_sum:
+    weighted_output = expert_output.astype(jnp.float32) * slot_weights[:, None]
+  else:
+    weighted_output = expert_output * slot_weights[:, None]
+  return weighted_output.reshape(num_recv_tokens, num_topk, hidden_out).sum(axis=1)
 
 
 def get_batchsplit_init_kernel_axes():
@@ -1704,6 +1787,23 @@ class RoutedMoE(nnx.Module):
             partial_sum=partial_sum,
             interpret=megablox_interpret,
         )
+      elif self.config.use_turbo_grouped_gemm:
+        from primus_turbo.jax.lax.grouped_gemm import grouped_gemm as turbo_grouped_gemm  # pylint: disable=import-outside-toplevel
+
+        if not getattr(turbo_grouped_gemm, "_logged", False):
+          max_logging.log("Using primus_turbo grouped_gemm in MoE sparse matmul")
+          turbo_grouped_gemm._logged = True
+        # Thread-local x64: the CK kernel requires int64 group_sizes, but global x64 breaks argsort
+        # (XLA-ROCm s32/s64 scatter mismatch). Remove once primus_turbo accepts int32 group_lens.
+        with jax.experimental.enable_x64():
+          output = turbo_grouped_gemm(
+              inputs,
+              kernel,
+              group_sizes.astype(jnp.int64),
+              transA=False,
+              transB=False,
+              num_cu=-1,
+          )
       else:
         # jax.lax.ragged_dot
         output = jax_ragged_dot_gmm(
@@ -2030,6 +2130,106 @@ class RoutedMoE(nnx.Module):
           ),
       )
 
+    deepep_combine_state = []
+
+    def deepep_and_route(
+        x,
+        logits,
+        pre_bias_logits,
+        num_ep,
+        expert_shard_id,
+        rngs,
+        input_ids=None,
+        forced_routed_experts=None,
+    ):
+      """Dispatch tokens to expert shards with Primus-Turbo DeepEP and sort them by local expert."""
+      from primus_turbo.jax.lax.moe import (  # pylint: disable=g-import-not-at-top
+          moe_combine as deepep_moe_combine,
+          moe_dispatch as deepep_moe_dispatch,
+      )
+
+      _ensure_deepep_setup(self.mesh, self.config)
+      global _deepep_dispatch_logged  # pylint: disable=global-statement
+      if not _deepep_dispatch_logged:
+        max_logging.log(
+            f"Using Primus-Turbo DeepEP dispatch/combine for MoE expert parallelism (EP={num_ep}, intranode IPC)"
+        )
+        _deepep_dispatch_logged = True
+
+      num_tokens = x.shape[0] * x.shape[1]
+      weights, selected_experts_raw = self.get_topk(logits, pre_bias_logits, rngs, input_ids, forced_routed_experts)
+
+      lb_loss = None
+      probs_logits = pre_bias_logits if pre_bias_logits is not None else logits
+      if self.config.load_balance_loss_weight > 0.0 and not self.is_hash_routing:
+        softmax_probs = jax.nn.softmax(probs_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+        lb_loss = self.load_balance_loss(selected_experts_raw, softmax_probs)
+      if self.should_update_load_balance():
+        bias_updates = calculate_load_balance_updates(
+            selected_experts_raw,
+            self.config.num_experts,
+            self.config.routed_bias_update_rate,
+            axis_names=bias_update_axis_names,
+        )
+      else:
+        bias_updates = None
+
+      x_2d = jnp.reshape(x, (num_tokens, -1))
+      topk_idx = selected_experts_raw.reshape(num_tokens, self.num_experts_per_tok).astype(jnp.int32)
+      topk_weights_f32 = weights.reshape(num_tokens, self.num_experts_per_tok).astype(jnp.float32)
+      recv_x, recv_topk_idx, recv_topk_weights, deepep_handle = deepep_moe_dispatch(
+          x_2d,
+          topk_idx=topk_idx,
+          topk_weights=topk_weights_f32,
+          num_experts=self.num_experts,
+          expert_alignment=1,
+      )
+      rank_prefix_matrix = deepep_handle[0]
+      actual_num_recv = rank_prefix_matrix[num_ep - 1, expert_shard_id]
+      valid_recv_rows = jnp.arange(recv_topk_idx.shape[0]) < actual_num_recv
+      recv_topk_idx = jnp.where(valid_recv_rows[:, None], recv_topk_idx, -1)
+
+      local_expert_size = self.config.num_experts // num_ep
+      flat_idx = recv_topk_idx.reshape(-1)
+      expert_ids = jnp.where(flat_idx >= 0, flat_idx, local_expert_size).astype(jnp.int32)
+      group_sizes = jnp.bincount(expert_ids, length=local_expert_size + 1)[:local_expert_size]
+      deepep_sort_idx = jnp.argsort(expert_ids)
+      x = _deepep_dispatch_fan_out(recv_x, deepep_sort_idx, recv_topk_idx.shape[1])
+      # This mask must stay: its backward zeros the gradients flowing out of the grouped-GEMM VJP for rows
+      # beyond sum(group_sizes). Without it those garbage gradients fold into recv_x and stall training.
+      valid_rows = (jnp.arange(x.shape[0]) < jnp.sum(group_sizes))[:, None]
+      x = jnp.where(valid_rows, x, 0)
+      selected_experts = jnp.where(expert_ids < local_expert_size, expert_ids, 0)[deepep_sort_idx]
+
+      deepep_combine_state.append(
+          _DeepEPCombineState(
+              handle=deepep_handle,
+              recv_topk_weights=recv_topk_weights,
+              recv_topk_idx=recv_topk_idx,
+              sort_idx=deepep_sort_idx,
+              num_recv_tokens=recv_x.shape[0],
+              combine_fn=deepep_moe_combine,
+          )
+      )
+      return (
+          x,
+          RouteOutput(
+              group_sizes=group_sizes,
+              selected_experts=selected_experts,
+              sorted_selected_experts=jnp.array([], dtype=jnp.int32),
+              weights=weights,
+              lb_loss=lb_loss,
+              bias_updates=bias_updates,
+              local_group_sizes=None,
+          ),
+          RouteMetadata(
+              expert_shard_id=expert_shard_id,
+              local_sorted_indices=None,
+              all_shards_group_sizes=None,
+              reshaped_group_sizes=None,
+          ),
+      )
+
     def route(
         x,
         logits,
@@ -2044,6 +2244,17 @@ class RoutedMoE(nnx.Module):
 
       if self.config.use_ring_of_experts:
         return roe_ag_and_route(
+            x,
+            logits,
+            pre_bias_logits,
+            num_ep,
+            expert_shard_id,
+            rngs,
+            input_ids=input_ids,
+            forced_routed_experts=forced_routed_experts,
+        )
+      elif self.config.use_turbo_deepep_dispatch and num_ep > 1:
+        return deepep_and_route(
             x,
             logits,
             pre_bias_logits,
@@ -2536,6 +2747,22 @@ class RoutedMoE(nnx.Module):
             tiled=True,
         )
         return output, routing.lb_loss, routing.bias_updates
+
+      if self.config.use_turbo_deepep_dispatch and self.get_expert_parallelism_size() > 1:
+        cs = deepep_combine_state[-1]
+        valid_rows = (jnp.arange(intermediate_output.shape[0]) < jnp.sum(routing.group_sizes))[:, None]
+        intermediate_output = jnp.where(valid_rows, intermediate_output, 0)
+        unsorted_output = _sort_activations(intermediate_output, jnp.argsort(cs.sort_idx), use_custom_vjp=True)
+        aggregated = deepep_fan_in(
+            unsorted_output,
+            cs.recv_topk_weights,
+            cs.recv_topk_idx,
+            cs.num_recv_tokens,
+            float32_weight_sum=self.config.float32_weight_sum,
+        )
+        combined_x = cs.combine_fn(aggregated.astype(jnp.bfloat16), handle=cs.handle)
+        output = combined_x.reshape(batch_size, sequence_length, -1).astype(self.dtype)
+        return output, routing.lb_loss, routing.bias_updates, routing.has_overflow
 
       if self.get_expert_parallelism_size() > 1:
         original_inputs_first_dim = batch_size * sequence_length * self.config.num_experts_per_tok
