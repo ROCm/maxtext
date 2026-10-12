@@ -205,6 +205,11 @@ float32_logits: false # in dot_product attention, whether to cast to fp32 the in
 mla_qk_head_chunk_size: 0 # Limits HBM footprint by sequentially evaluating the QK matrix in the Indexer across the unsharded local heads dimension natively.
 float32_weight_sum: true # whether to use full fp32 precision to sum expert weights for numerical stability
 float32_gate_logits: false # whether to cast inputs to fp32 to compute MoE gate logits for numerical stability
+# Runs only the MoE grouped GEMM in the given dtype, leaving the trunk in `dtype`. Lets a
+# bf16 trunk (which does not overflow at depth) still hit hipBLASLt's fp16 grouped matmul,
+# which XLA only wires up for fp16. The GEMM output is cast back to `dtype`, so only the
+# expert matmul precision changes. Does not affect the FlyDSL MXFP8 path.
+moe_gmm_dtype: ""
 
 # multi-token prediction configs
 # the number of auxiliary prediction layers to use for mtp.
@@ -227,6 +232,15 @@ sparse_matmul: true
 # sparse_matmul path contract in MXFP8, routing/activation/unpermute unchanged. Requires
 # sparse_matmul and the jax_flydsl package on PYTHONPATH.
 use_flydsl_moe: false
+# On by default. Takes effect only together with use_flydsl_moe: gate and up are one
+# GEMM, SiLU runs in the epilogue, and that weight is stored in tile order at init.
+# The fp16 and CK paths ignore it. Pass false to measure the unfused MXFP8 path.
+use_flydsl_glu_epilogue: true
+# Train routed MoE through Transformer Engine's grouped GEMM, which dispatches to Composable
+# Kernel when NVTE_USE_CK_GROUPED_GEMM=1: the same three expert matmuls as the FlyDSL branch,
+# contracted in the activation dtype. Requires sparse_matmul and the ROCm transformer_engine
+# build. Mutually exclusive with use_flydsl_moe.
+use_te_ck_moe: false
 capacity_factor: -1.0 # a factor to decide expert capacity for token dropping, and no dropping by default
 num_moe_token_chunks: 1 # split routed-MoE tokens into N chunks (ring-of-experts path) so each chunk's EP all-gather / reduce-scatter overlaps the previous chunk's GMM compute. 1 = disabled (identical to baseline).
 moe_chunk_barrier: false # wraps its iteration with optimization_barrier to chain the chunked ring-of-experts MoE loop so each chunk's input is fenced on the previous chunk's output, forcing sequential (no-interleave) chunk execution. Math unchanged (barrier is identity), loss bit-exact. Needs num_moe_token_chunks>1 + use_ring_of_experts=True to matter.

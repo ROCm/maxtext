@@ -340,6 +340,10 @@ class HyperParameters:
     final_dict["mu_dtype"] = (
         final_dict["weight_dtype"] if not final_dict["mu_dtype"] else jnp.dtype(final_dict["mu_dtype"])
     )
+    # Empty string keeps the falsy sentinel (inherit `dtype` at the GEMM); otherwise
+    # normalize to a real dtype object so the MoE layer can cast operands to it.
+    if final_dict.get("moe_gmm_dtype"):
+      final_dict["moe_gmm_dtype"] = jnp.dtype(final_dict["moe_gmm_dtype"])
     final_dict["logical_axis_rules"] = _lists_to_tuples(final_dict["logical_axis_rules"])
     final_dict["data_sharding"] = _lists_to_tuples(final_dict["data_sharding"])
 

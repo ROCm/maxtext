@@ -16,7 +16,16 @@ import dataclasses
 import os
 import sys
 
-from absl import app
+# FlyDSL carries its own MLIR, and PyTorch -- pulled in by transformer_engine,
+# which MaxText imports for its TE attention integration -- carries another
+# LLVM. Whichever registers its command-line options second aborts the process
+# with "Option 'print-inst-addrs' registered more than once", so the MXFP8 arm
+# dies during tracing at flydsl._mlir.ir. Importing FlyDSL before anything that
+# reaches torch lets it register first.
+if os.environ.get("FLYDSL_FIRST"):
+  import jax_flydsl  # noqa: F401
+
+from absl import app  # noqa: E402  (import after the MLIR ordering fix above)
 
 from maxtext.layers import quantizations
 

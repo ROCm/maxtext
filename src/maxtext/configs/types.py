@@ -1007,6 +1007,12 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to cast inputs to fp32 to compute MoE gate logits for numerical stability.",
   )
+  moe_gmm_dtype: str = Field(
+      "",
+      description="Optional dtype override for only the MoE grouped-GEMM operands/accumulation "
+      "(e.g. 'float16'). Empty inherits `dtype`. Lets a bf16 trunk still use hipBLASLt's fp16 "
+      "grouped matmul; the GEMM output is cast back to `dtype`.",
+  )
   prefuse_moe_weights: bool = Field(
       False,
       description="Whether to pre-fuse MoE weights (w0 and w1) during initialization. "
@@ -1049,6 +1055,23 @@ class MoEKernels(BaseModel):
           "unpermute stay unchanged. Requires sparse_matmul, the jax_flydsl package, and "
           "expert dims that are multiples of 128 and at least 256 -- both the embed and "
           "MLP dims, since each is contracted somewhere in a step."
+      ),
+  )
+  use_flydsl_glu_epilogue: bool = Field(
+      True,
+      description=(
+          "With use_flydsl_moe, run gate and up as one grouped GEMM and apply SiLU in the "
+          "epilogue. The gate/up weight is stored in tile order at init. Ignored unless "
+          "use_flydsl_moe is set. Requires a silu gate; honours DeepSeek's activation clamp."
+      ),
+  )
+  use_te_ck_moe: bool = Field(
+      False,
+      description=(
+          "Train routed MoE through Transformer Engine's grouped GEMM, which dispatches to "
+          "Composable Kernel when NVTE_USE_CK_GROUPED_GEMM=1. Replaces the same three expert "
+          "matmuls as use_flydsl_moe, contracted in the activation dtype, so the two are "
+          "directly comparable. Requires sparse_matmul and the ROCm transformer_engine build."
       ),
   )
   wi_tile_fwd_batch_seq: int = Field(

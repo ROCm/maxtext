@@ -587,17 +587,24 @@ class RoutedMoE(nnx.Module):
       self.wi_0 = jnp.zeros((num_experts, self.moe_expert_input_dim, intermediate_dim))
       self.wi_1 = jnp.zeros((num_experts, self.moe_expert_input_dim, intermediate_dim))
       self.wo = jnp.zeros((num_experts, intermediate_dim, self.moe_expert_input_dim))
-    elif self.config.prefuse_moe_weights:
-      self.wi = nnx.Param(
-          self.kernel_init(
-              self.rngs.params(),
-              (num_experts, self.moe_expert_input_dim, moe_intermediate_dim * 2),
-              weight_dtype,
-              kernel_in_axis,
-              kernel_out_axis,
-          ),
-          out_sharding=self.wi_kernel_axes,
+    elif self.config.prefuse_moe_weights or (
+        self.config.use_flydsl_moe and self.config.use_flydsl_glu_epilogue
+    ):
+      wi_init = self.kernel_init(
+          self.rngs.params(),
+          (num_experts, self.moe_expert_input_dim, moe_intermediate_dim * 2),
+          weight_dtype,
+          kernel_in_axis,
+          kernel_out_axis,
       )
+      if self.config.use_flydsl_moe and self.config.use_flydsl_glu_epilogue:
+        # Store [gate_128 | up_128 | ...] once. The GEMM reads that order, so
+        # the forward does not permute the weight again.
+        from jax_flydsl.ops.grouped_gemm_mxfp8 import pack_glu_columns
+
+        i = moe_intermediate_dim
+        wi_init = pack_glu_columns(wi_init[..., :i], wi_init[..., i:])
+      self.wi = nnx.Param(wi_init, out_sharding=self.wi_kernel_axes)
       self.wo = nnx.Param(
           self.kernel_init(
               self.rngs.params(),
@@ -1517,6 +1524,26 @@ class RoutedMoE(nnx.Module):
           "use_flydsl_moe does not support num_moe_emb_chunks > 0, which takes a "
           "separate path that does its own routing and never reaches the grouped GEMM."
       )
+    if self.config.use_te_ck_moe:
+      if self.config.use_flydsl_moe:
+        raise ValueError("use_te_ck_moe and use_flydsl_moe both replace the expert matmuls; pick one.")
+      if self.config.num_moe_emb_chunks > 0:
+        raise ValueError(
+            "use_te_ck_moe does not support num_moe_emb_chunks > 0, which takes a "
+            "separate path that does its own routing and never reaches the grouped GEMM."
+        )
+    if self.config.use_flydsl_moe and self.config.use_flydsl_glu_epilogue:
+      # The flag is on by default and is ignored unless this is the FlyDSL path.
+      # Gate and up are one parameter, packed at init, so prefuse is not required.
+      if self.config.decoder_block == ctypes.DecoderBlockType.GPT_OSS or self.config.mlp_bias:
+        raise ValueError(
+            "use_flydsl_glu_epilogue implements silu(gate) * up with DeepSeek's optional clamp; "
+            "GPT-OSS's scaled, offset GLU and expert biases are not covered."
+        )
+      if self.config.mlp_activations[0] != "silu":
+        raise ValueError(
+            f"use_flydsl_glu_epilogue supports a silu gate, got mlp_activations={self.config.mlp_activations}."
+        )
 
     def jax_ragged_dot_gmm(inputs, kernel, tiling, group_sizes, expert_assignments, padding_amount):
       """Execute jax.lax.ragged_dot, with potential quantization"""
@@ -1620,8 +1647,12 @@ class RoutedMoE(nnx.Module):
       inputs, padding_amount = max_utils.maybe_pad(inputs, self.config.wi_tile_fwd_batch_seq)
       if padding_amount > 0 and partial_sum is not None:
         partial_sum = jnp.pad(partial_sum, ((0, padding_amount), (0, 0)))
-      inputs = inputs.astype(self.dtype)
-      kernel = kernel.astype(self.dtype)
+      # Optionally run only the grouped GEMM in a narrower dtype (e.g. fp16 to reach
+      # hipBLASLt's grouped matmul) while the trunk stays in self.dtype. The gmm calls
+      # below pass preferred_element_type=self.dtype, so nothing downstream sees it.
+      gemm_dtype = getattr(self.config, "moe_gmm_dtype", "") or self.dtype
+      inputs = inputs.astype(gemm_dtype)
+      kernel = kernel.astype(gemm_dtype)
       lhs_quantize_dtype, rhs_quantize_dtype = get_quantization_dtypes()
 
       # Interpret the megablox Pallas kernel only when the TARGET is NOT TPU (CPU or GPU,
@@ -2366,9 +2397,13 @@ class RoutedMoE(nnx.Module):
         forced_routed_experts=None,
     ):
       batch_size, sequence_length, embed_dim = x.shape
-      # Set by the MXFP8 branch below and read again after the activation, which
-      # is shared with the megablox path. `None` means that path is not in use.
+      # Set by the MXFP8 / TE-CK branches below and read again after the activation,
+      # which is shared with the megablox path. `None` means that path is not in use.
       group_offsets = None
+      ck_group_sizes = None
+      # SiLU(gate)*up from the in-GEMM epilogue. Set only on that path, which
+      # writes the activated tensor and skips apply_ffn_activation.
+      activated = None
       if self.config.num_moe_emb_chunks > 0:
         output0, output1, gmm_fn, routing, route_metadata, wo_bias = moe_emb_chunking(
             x,
@@ -2407,25 +2442,59 @@ class RoutedMoE(nnx.Module):
           from maxtext.integration.flydsl import moe_bridge  # local import: optional dep
 
           group_offsets = moe_bridge.group_offsets_from_sizes(routing.group_sizes)
-          output0 = moe_bridge.grouped_gemm_mxfp8_experts(x, w0, group_offsets)
-          output1 = moe_bridge.grouped_gemm_mxfp8_experts(x, w1, group_offsets)
+          if self.config.use_flydsl_glu_epilogue:
+            # One GEMM owns both halves of the tile, applies SiLU, and writes
+            # [tokens, I]. The concatenated pre-activation is not stored.
+            clamp_limit = None
+            if (
+                self.config.decoder_block in (ctypes.DecoderBlockType.DEEPSEEK, ctypes.DecoderBlockType.DEEPSEEK4)
+                and self.config.mlp_activations_limit > 0.0
+            ):
+              clamp_limit = float(self.config.mlp_activations_limit)
+            # w0 is the packed [G, K, 2I] parameter. w1 is the same tensor and
+            # is not read on this path.
+            activated = moe_bridge.grouped_gemm_mxfp8_glu(x, w0, group_offsets, clamp_limit)
+          else:
+            # Gate and up share one quantization of x. Each weight still quantizes
+            # on its own, and the down projection below quantizes the activation.
+            output0, output1 = moe_bridge.grouped_gemm_mxfp8_gate_up(x, w0, w1, group_offsets)
+        elif self.config.use_te_ck_moe:
+          # Same three matmuls the FlyDSL branch above replaces, so the two
+          # backends differ only in the contraction. TE's grouped_dense reads the
+          # per-expert token counts directly, no offsets needed.
+          from maxtext.integration.te_ck import moe_bridge as ck_bridge  # local import: optional dep
+
+          ck_group_sizes = routing.group_sizes
+          output0 = ck_bridge.grouped_gemm_ck_experts(x, w0, ck_group_sizes)
+          output1 = ck_bridge.grouped_gemm_ck_experts(x, w1, ck_group_sizes)
         else:
           gmm_fn = get_gmm_for_local_experts(x, routing, route_metadata)
           output0, output1 = gmm_up(x, w0, w1, w0_bias, w1_bias, gmm_fn, weight_gather, mask=mask)
 
-      intermediate_layer = self.apply_ffn_activation(output0, output1)
-      if group_offsets is not None:
+      if activated is not None:
         from maxtext.integration.flydsl import moe_bridge  # local import: optional dep
 
-        intermediate_output = moe_bridge.grouped_gemm_mxfp8_experts(intermediate_layer, wo, group_offsets)
+        # SiLU already ran in the gate/up epilogue. The down GEMM quantizes
+        # that 2048-wide result; there is no [gate || up] tensor to read.
+        intermediate_output = moe_bridge.grouped_gemm_mxfp8_experts(activated, wo, group_offsets)
       else:
-        wo_gather_axes, wo_tile_size = get_wo_gmm_params()
-        intermediate_output = gmm_fn(
-            intermediate_layer,
-            wo,
-            tiling=wo_tile_size,
-            weight_gather_axes=wo_gather_axes,
-        )
+        intermediate_layer = self.apply_ffn_activation(output0, output1)
+        if group_offsets is not None:
+          from maxtext.integration.flydsl import moe_bridge  # local import: optional dep
+
+          intermediate_output = moe_bridge.grouped_gemm_mxfp8_experts(intermediate_layer, wo, group_offsets)
+        elif ck_group_sizes is not None:
+          from maxtext.integration.te_ck import moe_bridge as ck_bridge  # local import: optional dep
+
+          intermediate_output = ck_bridge.grouped_gemm_ck_experts(intermediate_layer, wo, ck_group_sizes)
+        else:
+          wo_gather_axes, wo_tile_size = get_wo_gmm_params()
+          intermediate_output = gmm_fn(
+              intermediate_layer,
+              wo,
+              tiling=wo_tile_size,
+              weight_gather_axes=wo_gather_axes,
+          )
       if self.get_tensor_parallelism_size() > 1:
         intermediate_output = jax.lax.psum_scatter(
             intermediate_output,
@@ -3438,13 +3507,19 @@ class RoutedMoE(nnx.Module):
     fused_kernel = None
     w0_kernel = None
     w1_kernel = None
-    if cfg.prefuse_moe_weights and cfg.attention in ("vllm_rpa", "vllm_batched_rpa") and not self.is_hash_routing:
+    fused_wi = cfg.prefuse_moe_weights or (cfg.use_flydsl_moe and cfg.use_flydsl_glu_epilogue)
+    if fused_wi and cfg.attention in ("vllm_rpa", "vllm_batched_rpa") and not self.is_hash_routing:
       fused_kernel = jnp.asarray(self.wi[...], self.dtype)
-    elif cfg.prefuse_moe_weights:
+    elif fused_wi:
       wi = jnp.asarray(self.wi[...], self.dtype)
-      n = wi.shape[-1] // 2
-      w0_kernel = wi[..., :n]
-      w1_kernel = wi[..., n:]
+      if cfg.use_flydsl_moe and cfg.use_flydsl_glu_epilogue:
+        # Already [gate_128 | up_128 | ...] from init. Halving it would split a pair.
+        w0_kernel = wi
+        w1_kernel = wi
+      else:
+        n = wi.shape[-1] // 2
+        w0_kernel = wi[..., :n]
+        w1_kernel = wi[..., n:]
     else:
       w0_kernel = jnp.asarray(self.wi_0[...], self.dtype)
       w1_kernel = jnp.asarray(self.wi_1[...], self.dtype)
