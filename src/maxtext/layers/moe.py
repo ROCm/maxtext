@@ -2769,7 +2769,7 @@ class RoutedMoE(nnx.Module):
         )
         combined_x = cs.combine_fn(aggregated.astype(jnp.bfloat16), handle=cs.handle)
         output = combined_x.reshape(batch_size, sequence_length, -1).astype(self.dtype)
-        return output, routing.lb_loss, routing.bias_updates, routing.has_overflow
+        return output, routing.lb_loss, routing.bias_updates
 
       if self.get_expert_parallelism_size() > 1:
         original_inputs_first_dim = batch_size * sequence_length * self.config.num_experts_per_tok
