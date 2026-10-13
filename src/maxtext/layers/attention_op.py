@@ -577,6 +577,7 @@ class AttentionOp(nnx.Module):
         "vllm_batched_rpa",
         "cudnn_flash_te",
         "cudnn_flash_jax",
+        "flydsl_flash",
     ):
       if self.attention_type == AttentionType.LOCAL_SLIDING:
         self.block_q = self.config.local_sa_block_q
@@ -1563,6 +1564,15 @@ class AttentionOp(nnx.Module):
           None,
           None,
       )
+    elif self.attention_kernel == "flydsl_flash":
+      validate_gpu_flash_attention(sinks, record_max_logits)
+      if isinstance(key, KVTensor):
+        key = key.dequant()
+      if isinstance(value, KVTensor):
+        value = value.dequant()
+      if model_mode == MODEL_MODE_AUTOREGRESSIVE:
+        raise ValueError("Decode is not supported with attention=flydsl_flash. Use `dot_product` instead.")
+      return self.flydsl_flash_attention(query, key, value, decoder_segment_ids), None, None
     elif self.attention_kernel == "cudnn_flash_jax":
       validate_gpu_flash_attention(sinks, record_max_logits)
       if isinstance(key, KVTensor):
@@ -2465,6 +2475,43 @@ class AttentionOp(nnx.Module):
         sequence_descriptor=dummy_attn_mask,
     )
     return dpa_layer(query, key, value, sequence_descriptor=attn_mask)
+
+  def flydsl_flash_attention(self, query: Array, key: Array, value: Array, decoder_segment_ids: Array | None) -> Array:
+    """Causal attention through the FlyDSL gfx950 flash kernels (`jax_flydsl.ops.flash_attn`).
+
+    Handles MLA's separate value width (Q/K 192, V 128) in both directions. Full rows only: synthetic data or no
+    segment ids. MaxText pre-scales the query, so the kernel's softmax scale is 1.0.
+    """
+    from jax_flydsl.ops.flash_attn import flash_attn  # pylint: disable=import-outside-toplevel
+
+    if getattr(self.attention_type, "value", self.attention_type) not in (
+        AttentionType.GLOBAL.value,
+        AttentionType.FULL.value,
+        AttentionType.MLA.value,
+    ):
+      raise NotImplementedError(
+          f"attention=flydsl_flash supports global causal attention only, got {self.attention_type}."
+      )
+    if self.dropout_rate and self.dropout_rate > 0.0:
+      raise NotImplementedError("attention=flydsl_flash does not implement attention dropout.")
+    if self.mesh.shape[self.config.context_sharding] > 1:
+      raise NotImplementedError("attention=flydsl_flash does not support context parallelism.")
+    if decoder_segment_ids is not None and self.config.dataset_type != "synthetic":
+      raise NotImplementedError("attention=flydsl_flash has no packed-document path yet; use synthetic data.")
+
+    batch_axes = tuple(
+        axis
+        for axis in ("data", "fsdp", "fsdp_transpose", "expert")
+        if axis in self.mesh.axis_names and self.mesh.shape[axis] > 1
+    )
+    spec = jax.sharding.PartitionSpec(batch_axes, None, None, None)
+    return jax.shard_map(
+        functools.partial(flash_attn, scale=1.0),
+        mesh=self.mesh,
+        in_specs=(spec, spec, spec),
+        out_specs=spec,
+        check_vma=False,
+    )(query, key, value)
 
   def cudnn_jax_flash_attention(
       self,

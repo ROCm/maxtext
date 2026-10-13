@@ -426,7 +426,7 @@ param_scan_axis: 1
 
 # The attention parameter dictates the specific algorithm/methodology used to compute the attention scores
 # The attention_type parameter determines the variants of attention, e.g. global or local_sliding
-attention: 'autoselected' # Supported attention: autoselected, dot_product, flash, cudnn_flash_te
+attention: 'autoselected' # Supported attention: autoselected, dot_product, flash, cudnn_flash_te, flydsl_flash
 # FlyDSL sparse MLA for DeepSeek-V4 compressed attention (head 512). Off keeps dot_product.
 use_flydsl_sparse_mla: false
 attention_type: 'global' # Supported attention_type: global, local_sliding, chunk, mla, full, compressed, block_diffusion
