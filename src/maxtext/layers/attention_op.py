@@ -2506,7 +2506,7 @@ class AttentionOp(nnx.Module):
     )
     spec = jax.sharding.PartitionSpec(batch_axes, None, None, None)
     return jax.shard_map(
-        functools.partial(flash_attn, scale=1.0),
+        functools.partial(flash_attn, scale=1.0, residual_name="context"),
         mesh=self.mesh,
         in_specs=(spec, spec, spec),
         out_specs=spec,
