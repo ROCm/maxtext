@@ -812,7 +812,10 @@ class MLA(Attention):
       )
     else:
       # LoRA path for Q.
+      flydsl_mxfp8_roles = frozenset(getattr(self.config, "flydsl_mxfp8_linear_roles", ()))
       self.wq_a = DenseGeneral(
+          use_flydsl_mxfp8="attention_wq_a" in flydsl_mxfp8_roles,
+          mesh=self.mesh,
           in_features_shape=self.config.emb_dim,
           out_features_shape=self.q_lora_rank,
           axis=-1,
@@ -834,6 +837,8 @@ class MLA(Attention):
           rngs=self.rngs,
       )
       self.wq_b = DenseGeneral(
+          use_flydsl_mxfp8="attention_wq_b" in flydsl_mxfp8_roles,
+          mesh=self.mesh,
           in_features_shape=self.q_lora_rank,
           out_features_shape=(self.num_query_heads, self.qk_head_dim),
           axis=-1,

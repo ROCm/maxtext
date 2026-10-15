@@ -1074,6 +1074,15 @@ class MoEKernels(BaseModel):
           "directly comparable. Requires sparse_matmul and the ROCm transformer_engine build."
       ),
   )
+  flydsl_mxfp8_linear_roles: list[Literal["attention_wo", "attention_wq_a", "attention_wq_b", "mlp_up", "mlp_down"]] = Field(
+      default_factory=list,
+      description=(
+          "Dense (non-expert) linears that run through the FlyDSL dense MXFP8 GEMM, forward and backward: "
+          "the MLA output projection, the two query projections, and the MLP up (gate and up) and down "
+          "projections. Empty keeps every one in bf16. Needs the jax_flydsl package, gfx950, bf16 compute, "
+          "and dimensions that are multiples of 128."
+      ),
+  )
   use_turbo_grouped_gemm: bool = Field(
       False,
       description="Use Primus-Turbo grouped GEMM for MoE sparse matmul. "

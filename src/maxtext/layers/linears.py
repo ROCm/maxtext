@@ -132,6 +132,7 @@ class DenseGeneral(nnx.Module):
       mesh: Mesh | None = None,
       use_two_stage_all_gather: bool = False,
       debug_sharding: bool = False,
+      use_flydsl_mxfp8: bool = False,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -158,6 +159,9 @@ class DenseGeneral(nnx.Module):
         transpose XLA emits for a single combined 2-axis all-gather.
       debug_sharding: when True, log the logical/physical sharding of the
         two-stage all-gather constraints to the sharding dump files.
+      use_flydsl_mxfp8: run this linear through the FlyDSL dense MXFP8 GEMM (forward and backward) instead
+        of a bf16 dot_general. Needs bf16 compute, `mesh`, no other quantizer, and contraction, output and
+        per-device token counts that are multiples of 128 and at least 256.
       rngs: RNG state for initialization in nnx.
     """
     self.in_features_shape = canonicalize_tuple(in_features_shape)
@@ -175,6 +179,7 @@ class DenseGeneral(nnx.Module):
     self.mesh = mesh
     self.use_two_stage_all_gather = use_two_stage_all_gather
     self.debug_sharding = debug_sharding
+    self.use_flydsl_mxfp8 = use_flydsl_mxfp8
 
     # Parameter initialization
     kernel_shape = self.in_features_shape + self.out_features_shape
@@ -254,6 +259,37 @@ class DenseGeneral(nnx.Module):
     kernel = shard(kernel, stage2)
     return kernel
 
+  def _flydsl_mxfp8_linear(self, inputs: Array, kernel: Array, norm_axis: tuple[int, ...]) -> Array:
+    """The linear through `jax_flydsl.ops.dense_mxfp8`, run per device under `shard_map`.
+
+    The activations are split over the batch mesh axes and the weight is replicated, so the per-device
+    weight gradients are summed over those axes by the transpose of the `shard_map`.
+    """
+    if self.quant is not None:
+      raise ValueError("use_flydsl_mxfp8 cannot be combined with another quantizer")
+    if self.mesh is None:
+      raise ValueError("use_flydsl_mxfp8 requires a device mesh")
+    trailing_axes = tuple(range(inputs.ndim - len(norm_axis), inputs.ndim))
+    if norm_axis != trailing_axes:
+      raise ValueError(f"use_flydsl_mxfp8 requires trailing contraction axes; got axes {norm_axis} for rank {inputs.ndim}")
+    from jax_flydsl.ops.dense_mxfp8 import dense_mxfp8  # pylint: disable=import-outside-toplevel
+
+    leading_shape = inputs.shape[: inputs.ndim - len(norm_axis)]
+    contraction = int(np.prod(self.in_features_shape))
+    output_features = int(np.prod(self.out_features_shape))
+    batch_axes = tuple(
+        axis for axis in ("data", "fsdp", "fsdp_transpose", "expert") if axis in self.mesh.axis_names and self.mesh.shape[axis] > 1
+    )
+    x_spec = PartitionSpec(batch_axes or None, None)
+    output = jax.shard_map(
+        dense_mxfp8,
+        mesh=self.mesh,
+        in_specs=(x_spec, PartitionSpec(None, None)),
+        out_specs=x_spec,
+        check_vma=False,
+    )(inputs.reshape((-1, contraction)), kernel.reshape((contraction, output_features)))
+    return output.reshape(leading_shape + self.out_features_shape)
+
   def __call__(
       self,
       inputs: Array,
@@ -311,16 +347,21 @@ class DenseGeneral(nnx.Module):
       out_sharding = None
 
     contract_ind = tuple(range(0, len(self.axis)))
-    output = _compute_dot_general_nnx(
-        inputs,
-        kernel,
-        norm_axis,
-        contract_ind,
-        self.matmul_precision,
-        self.quant_dot_general if slice_bounds is None else None,
-        _initializing,
-        out_sharding,
-    )
+    if self.use_flydsl_mxfp8 and slice_bounds is None and not _initializing:
+      output = self._flydsl_mxfp8_linear(inputs, kernel, norm_axis)
+      if out_sharding is not None:
+        output = jax.lax.with_sharding_constraint(output, out_sharding)
+    else:
+      output = _compute_dot_general_nnx(
+          inputs,
+          kernel,
+          norm_axis,
+          contract_ind,
+          self.matmul_precision,
+          self.quant_dot_general if slice_bounds is None else None,
+          _initializing,
+          out_sharding,
+      )
 
     if self.bias is not None:
       bias = jnp.asarray(self.bias[...], self.dtype)
@@ -489,8 +530,10 @@ class MlpBlock(nnx.Module):
     else:
       self.intermediate_logical = ("activation_batch", "activation_length", "activation_mlp")
 
+    flydsl_mxfp8_roles = frozenset(getattr(config, "flydsl_mxfp8_linear_roles", ()))
     if config.fused_mlp:
       self.wi = DenseGeneral(
+          use_flydsl_mxfp8="mlp_up" in flydsl_mxfp8_roles,
           in_features_shape=in_features,
           out_features_shape=(len(self.activations), self.intermediate_dim),
           dtype=self.dtype,
@@ -510,6 +553,7 @@ class MlpBlock(nnx.Module):
       for idx in range(len(self.activations)):
         dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
         module = DenseGeneral(
+            use_flydsl_mxfp8="mlp_up" in flydsl_mxfp8_roles,
             in_features_shape=in_features,
             out_features_shape=self.intermediate_dim,
             dtype=self.dtype,
@@ -528,6 +572,7 @@ class MlpBlock(nnx.Module):
         setattr(self, dense_name, module)
     self.dropout = Dropout(rate=self.intermediate_dropout_rate, broadcast_dims=(-2,), rngs=rngs)
     self.wo = DenseGeneral(
+        use_flydsl_mxfp8="mlp_down" in flydsl_mxfp8_roles,
         in_features_shape=self.intermediate_dim,
         out_features_shape=in_features,
         dtype=self.dtype,

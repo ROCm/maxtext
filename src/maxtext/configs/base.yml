@@ -241,6 +241,8 @@ use_flydsl_glu_epilogue: true
 # contracted in the activation dtype. Requires sparse_matmul and the ROCm transformer_engine
 # build. Mutually exclusive with use_flydsl_moe.
 use_te_ck_moe: false
+# Dense linears through the FlyDSL dense MXFP8 GEMM: any of attention_wo, attention_wq_a, attention_wq_b, mlp_up, mlp_down.
+flydsl_mxfp8_linear_roles: []
 use_turbo_grouped_gemm: false # Use Primus-Turbo grouped GEMM for MoE sparse matmul. Requires sparse_matmul=True, megablox=False, and primus_turbo.
 use_turbo_deepep_dispatch: false # Primus-Turbo DeepEP MoE dispatch/combine. Requires sparse_matmul=True, bfloat16, full local-device expert parallelism, and primus_turbo.
 capacity_factor: -1.0 # a factor to decide expert capacity for token dropping, and no dropping by default

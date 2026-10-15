@@ -820,6 +820,8 @@ class Attention(nnx.Module):
       axis = (-1,)
 
     return DenseGeneral(
+        use_flydsl_mxfp8="attention_wo" in getattr(self.config, "flydsl_mxfp8_linear_roles", ()),
+        mesh=self.mesh,
         in_features_shape=in_features,
         out_features_shape=out_features,
         axis=axis,
