@@ -151,11 +151,11 @@ jobs:
         if: ${{ !inputs.maxtext_installed }}
         shell: bash
         run: |
-          if [ "${{ inputs.device_type }}" = "rocm" ]; then
+          if [ "${INPUTS_DEVICE_TYPE}" = "rocm" ]; then
             python3 -m pip install -U uv
           fi
           # ROCm: inherit the image's TheRock ROCm SDK (rocm-sdk) into the venv; never install ROCm.
-          if [ "${{ inputs.device_type }}" = "rocm" ]; then
+          if [ "${INPUTS_DEVICE_TYPE}" = "rocm" ]; then
             python3 -m uv venv --seed --system-site-packages
           else
             python3 -m uv venv --seed
@@ -163,23 +163,23 @@ jobs:
           source .venv/bin/activate
           maxtext_wheel=$(ls maxtext-*-py3-none-any.whl 2>/dev/null)
           echo "Installing ${maxtext_wheel} for ${MAXTEXT_PACKAGE_EXTRA}..."
-          if [ "${{ inputs.device_type }}" = "rocm" ]; then
-            if [ -n "${{ inputs.requirements_file }}" ]; then
-              echo "Installing requirements from ${{ inputs.requirements_file }}"
+          if [ "${INPUTS_DEVICE_TYPE}" = "rocm" ]; then
+            if [ -n "${INPUTS_REQUIREMENTS_FILE}" ]; then
+              echo "Installing requirements from ${INPUTS_REQUIREMENTS_FILE}"
               # generated_requirements/ files are seed-env locks expressed as lower bounds, so
               # --resolution=lowest is what installs the versions they pin (the same way the
               # non-ROCm branch installs the wheel extras); base_requirements/ resolve normally.
-              case "${{ inputs.requirements_file }}" in
+              case "${INPUTS_REQUIREMENTS_FILE}" in
                 */generated_requirements/*) resolution='--resolution=lowest' ;;
                 *) resolution='' ;;
               esac
-              uv pip install ${resolution} -r "${{ inputs.requirements_file }}"
+              uv pip install ${resolution} -r "${INPUTS_REQUIREMENTS_FILE}"
             fi
             uv pip install "${maxtext_wheel}" --no-deps
             # A requirements file already carries the test/runtime deps; otherwise add the
             # GitHub-sourced pins (no TPU extra / scripts). The decoupled lock must not get them:
             # google-jetstream is one of the packages decoupled mode has to run without.
-            if [ -z "${{ inputs.requirements_file }}" ]; then
+            if [ -z "${INPUTS_REQUIREMENTS_FILE}" ]; then
               uv pip install -r src/dependencies/extra_deps/pre_train_github_deps.txt --no-deps
             fi
           else
@@ -207,13 +207,17 @@ jobs:
           python3 -m pip freeze
         env:
           INPUTS_INSTALL_TORCH_CPU: ${{ inputs.install_torch_cpu }}
+          INPUTS_DEVICE_TYPE: ${{ inputs.device_type }}
+          INPUTS_REQUIREMENTS_FILE: ${{ inputs.requirements_file }}
 
       - name: Install extra pip deps
         if: inputs.extra_pip_deps_file != ''
         shell: bash
+        env:
+          INPUTS_EXTRA_PIP_DEPS_FILE: ${{ inputs.extra_pip_deps_file }}
         run: |
           source .venv/bin/activate
-          uv pip install -r ${{ inputs.extra_pip_deps_file }}
+          uv pip install -r "${INPUTS_EXTRA_PIP_DEPS_FILE}"
 
       - name: Install ROCm JAX plugin + pjrt
         if: ${{ inputs.device_type == 'rocm' }}
