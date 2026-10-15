@@ -27,7 +27,7 @@ jobs:
       IMAGE: ghcr.io/rocm/maxtext
       DOCKER_BUILDKIT: "1"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
@@ -44,9 +44,10 @@ jobs:
       - name: Compute image tags
         id: tags
         shell: bash
+        env:
+          SUFFIX: ${{ inputs.image_suffix }}
         run: |
           set -euo pipefail
-          SUFFIX="${{ inputs.image_suffix }}"
           {
             echo "nightly=rocm_jax_nightly${SUFFIX:+_${SUFFIX}}"
             echo "date=$(date -u +%Y-%m-%d)"
@@ -61,18 +62,24 @@ jobs:
 
       - name: Build image (local tags, no push yet)
         shell: bash
+        env:
+          TAG_NIGHTLY: ${{ steps.tags.outputs.nightly }}
+          TAG_DATE: ${{ steps.tags.outputs.date }}
+          TAG_SHA: ${{ steps.tags.outputs.sha }}
         run: |
           set -euo pipefail
-          echo "Building ${IMAGE} tags: ${{ steps.tags.outputs.nightly }}, ${{ steps.tags.outputs.date }}, ${{ steps.tags.outputs.sha }}"
+          echo "Building ${IMAGE} tags: ${TAG_NIGHTLY}, ${TAG_DATE}, ${TAG_SHA}"
           docker build \
             -f src/dependencies/dockerfiles/maxtext_rocm_dependencies.Dockerfile \
-            -t "${IMAGE}:${{ steps.tags.outputs.nightly }}" \
-            -t "${IMAGE}:${{ steps.tags.outputs.date }}" \
-            -t "${IMAGE}:${{ steps.tags.outputs.sha }}" \
+            -t "${IMAGE}:${TAG_NIGHTLY}" \
+            -t "${IMAGE}:${TAG_DATE}" \
+            -t "${IMAGE}:${TAG_SHA}" \
             .
 
       - name: Smoke test the built image (on GPU)
         shell: bash
+        env:
+          TAG_SHA: ${{ steps.tags.outputs.sha }}
         run: |
           set -euo pipefail
           # Run the freshly-built image on the runner's GPUs (same device/isolation flags as CI)
@@ -81,17 +88,24 @@ jobs:
             --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined \
             --group-add video --shm-size 64G \
             --env-file /etc/podinfo/gha-gpu-isolation-settings \
-            "${IMAGE}:${{ steps.tags.outputs.sha }}" \
+            "${IMAGE}:${TAG_SHA}" \
             python3 -c 'import jax, transformer_engine, maxtext; d=jax.devices(); print("jax", jax.__version__, "devices:", d); assert d, "no JAX devices visible in the image"; print("transformer_engine", getattr(transformer_engine, "__version__", "?")); print("smoke test OK")'
 
       - name: Log in to GitHub Container Registry
         shell: bash
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
 
       - name: Push image
         shell: bash
+        env:
+          TAG_NIGHTLY: ${{ steps.tags.outputs.nightly }}
+          TAG_DATE: ${{ steps.tags.outputs.date }}
+          TAG_SHA: ${{ steps.tags.outputs.sha }}
         run: |
           set -euo pipefail
-          docker push "${IMAGE}:${{ steps.tags.outputs.nightly }}"
-          docker push "${IMAGE}:${{ steps.tags.outputs.date }}"
-          docker push "${IMAGE}:${{ steps.tags.outputs.sha }}"
+          docker push "${IMAGE}:${TAG_NIGHTLY}"
+          docker push "${IMAGE}:${TAG_DATE}"
+          docker push "${IMAGE}:${TAG_SHA}"

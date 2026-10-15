@@ -47,3 +47,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       "jax-rocm10-plugin==${ROCM_JAX_VERSION}+rocm${ROCM_SDK_VER}"; \
     TE_WHL="$(ls /deps/transformer_engine-*.whl 2>/dev/null | sort | tail -n1 || true)"; \
     if [ -n "${TE_WHL}" ]; then uv pip install --system --no-deps --force-reinstall "${TE_WHL}"; fi
+
+# Batch training/test image: no long-running service to probe.
+HEALTHCHECK NONE
+
+# Stays root like its ROCm base image: GPU access (/dev/kfd, /dev/dri) and in-container
+# installs assume it.
+# trivy:ignore:DS-0002
+USER root
