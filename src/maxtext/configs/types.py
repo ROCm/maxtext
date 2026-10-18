@@ -2294,6 +2294,14 @@ class DatasetGeneral(BaseModel):
       -1,
       description="Maximum number of segments that can be packed into a single sequence. -1 or None for no limit.",
   )
+  jax_aiter_flash_varlen_buckets: Literal["none", "separate", "shared"] = Field(
+      "shared",
+      description=(
+          "attention=jax_aiter_flash on packed DeepSeek MLA rows (4096 tokens, head dims 192/128): 'none' runs "
+          "one group-mode call; 'separate' runs one call per document-length bucket; 'shared' runs the bucket "
+          "calls in place on one output and one set of gradients."
+      ),
+  )
   use_stream_chunking: bool | None = Field(
       None,
       description=(
@@ -5897,8 +5905,13 @@ class MaxTextConfig(
           "STRIPED reorder strategy requires Transformer Engine and is only supported on GPUs. "
           f"Got hardware={self.hardware!r}."
       )
-    if self.hardware == "gpu" and self.packing and self.attention == "cudnn_flash_te" and self.max_segments_per_seq <= 0:
-      raise ValueError("max_segments_per_seq must be set when using TransformerEngine attention and packing")
+    if (
+        self.hardware == "gpu"
+        and self.packing
+        and self.attention in ("cudnn_flash_te", "jax_aiter_flash")
+        and self.max_segments_per_seq <= 0
+    ):
+      raise ValueError("max_segments_per_seq must be set when using TransformerEngine or jax-aiter attention and packing")
     dcn_product = (
         self.dcn_data_parallelism
         * self.dcn_pipeline_parallelism
