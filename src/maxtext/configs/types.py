@@ -1487,6 +1487,12 @@ class MoEKernels(BaseModel):
       "Requires sparse_matmul=True and megablox=False. "
       "Requires the primus_turbo package to be installed.",
   )
+  turbo_grouped_gemm_backend: Literal["ck", "hipblaslt"] = Field(
+      "ck",
+      description="Primus-Turbo grouped GEMM backend: 'ck' (CK grouped GEMM kernels) or 'hipblaslt' "
+      "(one hipBLASLt grouped GEMM launch for all experts, group sizes stay on the device; needs a "
+      "primus_turbo build that provides primus_turbo.jax.lax.grouped_gemm_hipblaslt).",
+  )
   wi_tile_fwd_batch_seq: int = Field(
       512,
       description="forward pass tiling dimension for batch/sequence in GMM for wi.",
@@ -5327,10 +5333,22 @@ class MaxTextConfig(
         raise ValueError("use_turbo_grouped_gemm requires sparse_matmul=True.")
       if self.megablox:
         raise ValueError("use_turbo_grouped_gemm requires megablox=False.")
+      if self.use_tokamax_gmm:
+        raise ValueError("use_turbo_grouped_gemm requires use_tokamax_gmm=False.")
+      if self.dtype not in (DType.BFLOAT16, DType.FLOAT16):
+        raise ValueError(f"use_turbo_grouped_gemm requires dtype bfloat16 or float16, got {self.dtype}.")
+      if self.use_ring_of_experts and self.use_ragged_sort:
+        raise ValueError("use_turbo_grouped_gemm does not support use_ring_of_experts with use_ragged_sort.")
       try:
-        import primus_turbo.jax.lax.grouped_gemm  # pylint: disable=import-outside-toplevel,unused-import
+        if self.turbo_grouped_gemm_backend == "hipblaslt":
+          import primus_turbo.jax.lax.grouped_gemm_hipblaslt  # pylint: disable=import-outside-toplevel,unused-import
+        else:
+          import primus_turbo.jax.lax.grouped_gemm  # pylint: disable=import-outside-toplevel,unused-import
       except ImportError as e:
-        raise ValueError("use_turbo_grouped_gemm requires the primus_turbo package.") from e
+        raise ValueError(
+            f"use_turbo_grouped_gemm with turbo_grouped_gemm_backend={self.turbo_grouped_gemm_backend} "
+            "requires a primus_turbo package that provides it."
+        ) from e
 
     if self.enable_streaming_diloco:
       if not self.scan_layers:
