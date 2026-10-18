@@ -16,9 +16,11 @@
 """Module to load data for training."""
 
 import contextlib
+
 import jax
 from jax.experimental import checkify
 import jax.numpy as jnp
+import numpy as np
 from maxtext.common.goodput import (
     GoodputEvent,
     maybe_record_goodput,
@@ -27,6 +29,43 @@ from maxtext.utils import diloco_sharding
 from maxtext.utils import elastic_utils
 from maxtext.utils import exceptions
 from maxtext.utils.sharding import get_input_data_sharding
+
+
+def _balanced_packed_row_order(segment_ids: np.ndarray, num_shards: int) -> np.ndarray:
+  """Greedily balance packed attention work while keeping rows unchanged."""
+  if segment_ids.ndim != 2 or segment_ids.shape[0] % num_shards:
+    raise ValueError(f"expected [batch, sequence] divisible across {num_shards} shards, got {segment_ids.shape}")
+  rows_per_shard = segment_ids.shape[0] // num_shards
+  costs = []
+  for row in segment_ids:
+    real = row[row != 0]
+    if not real.size:
+      costs.append(0)
+      continue
+    boundaries = np.flatnonzero(real[1:] != real[:-1]) + 1
+    lengths = np.diff(np.concatenate(([0], boundaries, [real.size])))
+    costs.append(int(np.sum(lengths.astype(np.int64) ** 2)))
+
+  bins = [[] for _ in range(num_shards)]
+  loads = [0] * num_shards
+  for row_index in sorted(range(len(costs)), key=lambda i: (-costs[i], i)):
+    choices = [i for i in range(num_shards) if len(bins[i]) < rows_per_shard]
+    shard = min(choices, key=lambda i: (loads[i], len(bins[i]), i))
+    bins[shard].append(row_index)
+    loads[shard] += costs[row_index]
+  return np.asarray([row for shard_rows in bins for row in shard_rows], dtype=np.int32)
+
+
+def _process_rows(value: jax.Array) -> tuple[np.ndarray, int]:
+  """This process's contiguous rows of a batch-sharded global array, and how many shards hold them."""
+  shards = {}
+  for shard in value.addressable_shards:
+    shards.setdefault(shard.index[0].start or 0, shard)
+  starts = sorted(shards)
+  rows = [np.asarray(shards[start].data) for start in starts]
+  if any(start + len(block) != nxt for start, block, nxt in zip(starts, rows, starts[1:])):
+    raise ValueError(f"packed-row balancing needs contiguous process-local rows, got starts {starts}")
+  return np.concatenate(rows), len(starts)
 
 
 @contextlib.contextmanager
@@ -68,6 +107,7 @@ class DataLoader:
     else:
       self.data_iterator = data_iterator
     self.last_batch = None
+    self.num_input_shards = int(mesh.size)
     self.input_data_shardings = get_input_data_sharding(config, mesh)
 
   def update_data_iterator(self):
@@ -85,9 +125,39 @@ class DataLoader:
         with loader_exception_guard(self.config):
           example_batch = next(self.data_iterator)
         self.update_data_iterator()
+        example_batch = self._apply_packed_row_balance(example_batch)
       self.last_batch = example_batch
       self.check_example_batch()
     return self.last_batch
+
+  def _apply_packed_row_balance(self, example_batch):
+    """Optionally permute packed rows to balance attention work across shards."""
+    if not self.config.balance_packed_rows_by_attention_work:
+      return example_batch
+    if "inputs_segmentation" not in example_batch:
+      raise ValueError("balance_packed_rows_by_attention_work requires inputs_segmentation")
+
+    segmentation = example_batch["inputs_segmentation"]
+    if isinstance(segmentation, jax.Array) and not segmentation.is_fully_addressable:
+      # A process sees only its own rows, so it balances them across its own shards.
+      local_segmentation, local_shards = _process_rows(segmentation)
+      order = _balanced_packed_row_order(local_segmentation, local_shards)
+      transformed = {}
+      for name, value in example_batch.items():
+        if isinstance(value, jax.Array) and value.ndim and value.shape[0] == segmentation.shape[0]:
+          rows, _ = _process_rows(value)
+          transformed[name] = jax.make_array_from_process_local_data(value.sharding, rows[order], value.shape)
+        else:
+          transformed[name] = value
+      return transformed
+
+    segmentation = np.asarray(segmentation)
+    order = _balanced_packed_row_order(segmentation, self.num_input_shards)
+    transformed = {}
+    for name, value in example_batch.items():
+      array = np.asarray(value)
+      transformed[name] = array[order] if array.ndim and array.shape[0] == len(order) else value
+    return transformed
 
   def load_next_batch(self, *args, **kwargs):
     """Loads the next batch with sharding hint."""

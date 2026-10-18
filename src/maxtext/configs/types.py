@@ -2310,6 +2310,10 @@ class DatasetGeneral(BaseModel):
           "If None, defaults to True for pre-tokenized datasets and False for raw text."
       ),
   )
+  balance_packed_rows_by_attention_work: bool = Field(
+      False,
+      description="Reorder packed rows across local device shards to balance sum(segment_length^2) attention work.",
+  )
   num_epoch: int = Field(1, description="Number of epochs to train for.")
   expansion_factor_real_data: float = Field(-1.0, description="Factor for partial data loading on hosts.")
   reuse_example_batch: int = Field(0, description="For performance testing, repeatedly uses the same batch.")
