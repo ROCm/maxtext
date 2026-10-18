@@ -769,6 +769,7 @@ class Attention(nnx.Module):
             "attention_wo"
             in getattr(self.config, "jax_aiter_mxfp4_linear_roles", ())
         ),
+        jax_aiter_mxfp4_dual_grad_cast=getattr(self.config, "jax_aiter_mxfp4_dual_grad_cast", False),
         rngs=self.rngs,
     )
 

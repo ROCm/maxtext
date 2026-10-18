@@ -217,6 +217,79 @@ def sum_recomputed_tiers(
   return run(count, starts, floats, others)
 
 
+def switch_on_base(
+    index: jax.Array, base: Callable[[], jax.Array], branches: Sequence[Callable[[jax.Array], jax.Array]]
+) -> jax.Array:
+  """`jax.lax.switch(index, branches, base())`, without differentiating the switch.
+
+  Differentiating a switch makes every branch return the residuals of every
+  other branch, zero-filled, and return zero cotangents for the arrays it does
+  not read. Here backward instead pulls the cotangent back through `branches[0]`
+  and `base`'s own vjp, then, only when `index > 0`, recomputes branch `index`
+  from the arrays it reads and adds its cotangents in place. Every branch must
+  pass the cotangent to its argument exactly as `branches[0]` does.
+  """
+  if len(branches) == 1:
+    return branches[0](base())
+  closed = [jax.make_jaxpr(base)()]
+  base_shape = jax.ShapeDtypeStruct(closed[0].out_avals[0].shape, closed[0].out_avals[0].dtype)
+  closed += [jax.make_jaxpr(branch)(base_shape) for branch in branches]
+  # Every array the functions close over becomes an explicit input, as in
+  # `sum_recomputed_tiers`; the floating ones are differentiated.
+  slot = {}
+  consts = []
+  for jaxpr in closed:
+    for c in jaxpr.consts:
+      if id(c) not in slot:
+        slot[id(c)] = len(consts)
+        consts.append(c)
+  is_float = [jnp.issubdtype(c.dtype, jnp.inexact) for c in consts]
+  place = [sum(is_float[:i]) if f else sum(not g for g in is_float[:i]) for i, f in enumerate(is_float)]
+  floats = tuple(c for c, f in zip(consts, is_float) if f)
+  others = tuple(c for c, f in zip(consts, is_float) if not f)
+
+  def call(fn, args, floats, others):
+    fn_consts = [
+        floats[place[slot[id(c)]]] if is_float[slot[id(c)]] else others[place[slot[id(c)]]] for c in closed[fn].consts
+    ]
+    (out,) = jax_core.jaxpr_as_fun(jax_core.ClosedJaxpr(closed[fn].jaxpr, fn_consts))(*args)
+    return out
+
+  def taken(index, base_out, floats, others):
+    return jax.lax.switch(
+        index, [lambda value, fn=fn: call(fn, (value,), floats, others) for fn in range(1, len(closed))], base_out
+    )
+
+  @jax.custom_vjp
+  def run(index, floats, others):
+    return taken(index, call(0, (), floats, others), floats, others)
+
+  def run_fwd(index, floats, others):
+    base_out, pull_base = jax.vjp(lambda floats: call(0, (), floats, others), floats)
+    return taken(index, base_out, floats, others), (index, pull_base, floats, others)
+
+  def run_bwd(res, grad):
+    index, pull_base, floats, others = res
+    # Branches read their argument linearly, so its value does not reach a cotangent.
+    stub = jnp.zeros(base_shape.shape, base_shape.dtype)
+    grad_base = jax.vjp(lambda base_out: call(1, (base_out,), floats, others), stub)[1](grad)[0]
+    (grads,) = pull_base(grad_base)
+
+    def pull_branch(fn):
+      return jax.vjp(lambda floats: call(fn, (stub,), floats, others), floats)[1](grad)[0]
+
+    def add_taken(_, grads):
+      extra = jax.lax.switch(index - 1, [functools.partial(pull_branch, fn) for fn in range(2, len(closed))])
+      return jax.tree.map(jnp.add, grads, extra)
+
+    # A loop rather than a cond, so the usual zero-trip case passes `grads` through without a copy.
+    grads = jax.lax.fori_loop(0, (index > 0).astype(jnp.int32), add_taken, grads)
+    return None, grads, tuple(None for _ in others)
+
+  run.defvjp(run_fwd, run_bwd)
+  return run(index, floats, others)
+
+
 def _invert(slot_rows: jax.Array, slot_valid: jax.Array, rows: int) -> jax.Array:
   """`row_slots` with `row_slots[slot_rows[s]] = s` for every valid flat slot `s`."""
   flat_rows = slot_rows.reshape(-1)
@@ -294,11 +367,38 @@ class SortedSlots(NamedTuple):
     return self.group_ends[-1]
 
 
+# On ROCm (gfx950), XLA's GPU sort intermittently misorders and duplicates
+# entries of sorts whose shared-memory tile spans several wavefronts; rows of
+# 256 keys, one 64-lane wavefront each, sort correctly.
+_SORT_ROW = 256
+
+
+def _stable_order(key: jax.Array, num_keys: int) -> jax.Array:
+  """`jnp.argsort(key, stable=True)` of flat `key` in `[0, num_keys)`, sorting only rows of `_SORT_ROW` keys."""
+  size = key.size
+  row = max(1, min(_SORT_ROW, size))
+  rows = -(-size // row)
+  # Padding takes the largest key, so it sorts after every slot.
+  blocks = jnp.pad(key, (0, rows * row - size), constant_values=num_keys - 1).reshape(rows, row)
+  sort_key = blocks.astype(jnp.uint8) if num_keys <= 256 else blocks
+  sorted_key, local = jax.lax.sort(
+      (sort_key, jax.lax.broadcasted_iota(jnp.int32, blocks.shape, 1)), dimension=1, num_keys=1, is_stable=True
+  )
+  counts = jnp.sum(blocks[:, :, None] == jnp.arange(num_keys, dtype=key.dtype), axis=1, dtype=jnp.int32)
+  totals = jnp.sum(counts, axis=0)
+  # Sorted entry p of row r, holding key k, lands at the start of key k, plus
+  # the k slots of earlier rows, plus its rank among row r's k slots.
+  offset = (jnp.cumsum(totals) - totals) + (jnp.cumsum(counts, axis=0) - counts) - (jnp.cumsum(counts, axis=1) - counts)
+  target = jnp.take_along_axis(offset, sorted_key.astype(jnp.int32), axis=1) + jnp.arange(row, dtype=jnp.int32)
+  source = local + jnp.arange(0, rows * row, row, dtype=jnp.int32)[:, None]
+  order = jnp.zeros(rows * row, jnp.int32).at[target.reshape(-1)].set(source.reshape(-1), unique_indices=True)
+  return order[:size]
+
+
 def sort_slots(local_ids: jax.Array, num_experts: int) -> SortedSlots:
   """Stable sort of the slots of `local_ids` by local expert id, empty slots last."""
   key = jnp.where(local_ids >= 0, local_ids, num_experts).reshape(-1)
-  sort_key = key.astype(jnp.uint8) if num_experts <= jnp.iinfo(jnp.uint8).max else key
-  order = jnp.argsort(sort_key, stable=True).astype(jnp.int32)
+  order = _stable_order(key, num_experts + 1)
   position = jnp.zeros_like(order).at[order].set(jnp.arange(order.size, dtype=jnp.int32), unique_indices=True)
   group_sizes = jnp.sum(key[:, None] == jnp.arange(num_experts, dtype=key.dtype)[None, :], axis=0, dtype=jnp.int32)
   return SortedSlots(
@@ -548,6 +648,31 @@ def process_local_shards(mesh, axis_name: str) -> int:
   return local
 
 
+def setup_deepep(mesh, axis_name: str) -> None:
+  """Bootstraps Primus-Turbo intranode DeepEP for `dedup_dispatch_combine(..., deepep=True)`.
+
+  Its kernels take their rank from the current GPU and their rank count from
+  the process's GPU count, so at every position of the other mesh axes,
+  `axis_name` must list exactly this process's GPUs in hardware order.
+  """
+  import numpy as np  # pylint: disable=g-import-not-at-top
+  import primus_turbo.jax  # pylint: disable=g-import-not-at-top
+  from primus_turbo.jax.lax import moe as deepep_moe  # pylint: disable=g-import-not-at-top
+
+  axis = mesh.axis_names.index(axis_name)
+  devices = np.moveaxis(mesh.devices, axis, -1).reshape(-1, mesh.devices.shape[axis])
+  me, gpus = jax.process_index(), list(range(jax.local_device_count()))
+  for row in devices:
+    if any(d.process_index == me for d in row) and (
+        any(d.process_index != me for d in row) or [d.local_hardware_id for d in row] != gpus
+    ):
+      raise ValueError(f"DeepEP needs mesh axis {axis_name!r} to be this process's GPUs {gpus} in order: {row.tolist()}")
+  primus_turbo.jax.initialize()
+  # An explicit mode="inproc" is rejected once jax.process_count() > 1; left unset,
+  # a process with several GPUs still resolves to the in-process mode.
+  deepep_moe.setup()
+
+
 def _maybe_log_dedup_route(shard, tokens, send_rows, recv_rows, assignments, tier_rows, dropped):
   from maxtext.layers import moe  # pylint: disable=g-import-not-at-top
 
@@ -582,6 +707,9 @@ def dedup_dispatch_combine(
     dropless_tier_rows: int = 0,
     local_shards: int = 0,
     two_stage_ragged: Callable[..., jax.Array] = fresh_ragged_all_to_all,
+    deepep: bool = False,
+    pass_row_source: bool = False,
+    recompute_tier_switch: bool = False,
 ) -> jax.Array:
   """Routed-expert output for this shard's tokens, with one exchange row per (token, shard).
 
@@ -626,6 +754,18 @@ def dedup_dispatch_combine(
       exchange then runs as `two_stage_exchange`, so cross-process transfers
       pair only shards with the same local index; `exchange` is not used.
     two_stage_ragged: the grouped `ragged_all_to_all` of `two_stage_exchange`.
+    deepep: exchange tokens with Primus-Turbo intranode DeepEP dispatch and
+      combine, after `setup_deepep`, instead of `ragged_all_to_all`. `x` must
+      be bfloat16, every destination shard of a token receives it, and
+      `exchange`, `local_shards`, and `zero_unwritten_rows` do not apply.
+    pass_row_source: also pass `expert_fn` the keyword `lhs_rows=(received,
+      row_index)`: its row `r` is `received[row_index[r]]`, or zero for a
+      negative index, so it can read the received rows without the gathered copy.
+    recompute_tier_switch: with dropless tiers, differentiate the first tier
+      and the switch over the extra tiers with `switch_on_base`, so a step
+      without extra rows neither writes their zero-filled residuals nor zero
+      cotangents. The first tier then runs inside a `custom_vjp`: a remat
+      policy cannot save the arrays `expert_fn` names, and recomputes them.
 
   Returns:
     `[T, H_out]` weighted sum of each token's expert outputs.
@@ -640,49 +780,69 @@ def dedup_dispatch_combine(
   send_rows = tokens * max_shards_per_token
   recv_rows = tokens * num_shards
 
-  send_map, slot_shards, send_counts = build_send_map(dest, num_shards, max_shards_per_token)
-  traffic = jax.lax.all_gather(send_counts, axis_name)
-  # A saved plan spares backward the sort and the count exchange, a collective
-  # that would also wait for the slowest shard to finish its expert gradients.
-  send_map, slot_shards, traffic = checkpoint_name((send_map, slot_shards, traffic), "moe_dedup_plan")
-  on_slot = (dest[:, None, :] == slot_shards[:, :, None]) & send_map.slot_valid[:, :, None]
-  # Ids are sent as id + 1 so the zero rows of the fresh receive buffer read as empty.
-  slot_ids = jnp.where(on_slot, (expert_ids - dest * local_experts + 1)[:, None, :], 0).astype(jnp.float32)
-  slot_weights = jnp.where(on_slot, weights.astype(jnp.float32)[:, None, :], 0.0)
-  send_meta = jnp.concatenate(
-      (
-          _take(slot_ids.reshape(-1, top_k), send_map.row_slots, send_map.row_valid),
-          slots_to_rows(slot_weights, send_map),
-      ),
-      axis=1,
-  )
+  if deepep:
+    from primus_turbo.jax.lax import moe as deepep_moe  # pylint: disable=g-import-not-at-top
 
-  dispatch = exchange_params(traffic, shard_id, is_dispatch=True)
-  combine = exchange_params(traffic, shard_id, is_dispatch=False)
-  recv_starts = jnp.cumsum(dispatch[3]) - dispatch[3]
-  send_starts = jnp.cumsum(dispatch[1]) - dispatch[1]
-
-  if 0 < local_shards < num_shards:
-
-    def run_exchange(operand, matrix, params, starts, rows, site, zero):
-      del params, starts
-      # A shard sends any one shard at most one row per token.
-      return two_stage_exchange(
-          operand, matrix, shard_id, rows, tokens, axis_name, local_shards, site, zero, two_stage_ragged
-      )
-
+    recv_x, local_ids, recv_weights, handle = deepep_moe.moe_dispatch(
+        x, expert_ids, weights.astype(jnp.float32), num_experts
+    )
+    received = handle[0][num_shards - 1, shard_id]
+    # Rows past the received ones are uninitialized.
+    local_ids = jnp.where(jnp.arange(recv_rows)[:, None] < received, local_ids, -1)
+    local_ids, recv_weights = checkpoint_name((local_ids, recv_weights), "moe_dispatched_meta")
+    unsent, sent_rows = jnp.int32(0), jnp.sum(handle[4], dtype=jnp.int32)
   else:
-    exchange = exchange or moe._ragged_all_to_all_fresh  # pylint: disable=protected-access
+    send_map, slot_shards, send_counts = build_send_map(dest, num_shards, max_shards_per_token)
+    # A psum rather than an all-gather: XLA's pipelined all-gather would move
+    # this exchange, and the attention and routing it depends on, into the
+    # previous layer's iteration, computing them twice.
+    traffic = jax.lax.psum(
+        jnp.zeros((num_shards, num_shards), jnp.int32).at[shard_id].set(send_counts), axis_name
+    )
+    # A saved plan spares backward the sort and the count exchange, a collective
+    # that would also wait for the slowest shard to finish its expert gradients.
+    send_map, slot_shards, traffic = checkpoint_name((send_map, slot_shards, traffic), "moe_dedup_plan")
+    on_slot = (dest[:, None, :] == slot_shards[:, :, None]) & send_map.slot_valid[:, :, None]
+    # Ids are sent as id + 1 so the zero rows of the fresh receive buffer read as empty.
+    slot_ids = jnp.where(on_slot, (expert_ids - dest * local_experts + 1)[:, None, :], 0).astype(jnp.float32)
+    slot_weights = jnp.where(on_slot, weights.astype(jnp.float32)[:, None, :], 0.0)
+    send_meta = jnp.concatenate(
+        (
+            _take(slot_ids.reshape(-1, top_k), send_map.row_slots, send_map.row_valid),
+            slots_to_rows(slot_weights, send_map),
+        ),
+        axis=1,
+    )
 
-    def run_exchange(operand, matrix, params, starts, rows, site, zero):
-      del matrix
-      return exchange(operand, *params, starts, rows, axis_name, site, zero)
+    dispatch = exchange_params(traffic, shard_id, is_dispatch=True)
+    combine = exchange_params(traffic, shard_id, is_dispatch=False)
+    recv_starts = jnp.cumsum(dispatch[3]) - dispatch[3]
+    send_starts = jnp.cumsum(dispatch[1]) - dispatch[1]
 
-  recv_x = run_exchange(expand_rows(x, send_map), traffic, dispatch, recv_starts, recv_rows, 0, zero_unwritten_rows)
-  recv_meta = run_exchange(send_meta, traffic, dispatch, recv_starts, recv_rows, 2, True)
-  recv_meta = checkpoint_name(recv_meta, "moe_dispatched_meta")
-  local_ids = jnp.round(recv_meta[:, :top_k]).astype(jnp.int32) - 1
-  recv_weights = recv_meta[:, top_k:]
+    if 0 < local_shards < num_shards:
+
+      def run_exchange(operand, matrix, params, starts, rows, site, zero):
+        del params, starts
+        # A shard sends any one shard at most one row per token.
+        return two_stage_exchange(
+            operand, matrix, shard_id, rows, tokens, axis_name, local_shards, site, zero, two_stage_ragged
+        )
+
+    else:
+      exchange = exchange or moe._ragged_all_to_all_fresh  # pylint: disable=protected-access
+
+      def run_exchange(operand, matrix, params, starts, rows, site, zero):
+        del matrix
+        return exchange(operand, *params, starts, rows, axis_name, site, zero)
+
+    recv_x = run_exchange(expand_rows(x, send_map), traffic, dispatch, recv_starts, recv_rows, 0, zero_unwritten_rows)
+    recv_meta = run_exchange(send_meta, traffic, dispatch, recv_starts, recv_rows, 2, True)
+    recv_meta = checkpoint_name(recv_meta, "moe_dispatched_meta")
+    local_ids = jnp.round(recv_meta[:, :top_k]).astype(jnp.int32) - 1
+    recv_weights = recv_meta[:, top_k:]
+    # Assignments this shard did not send: more destination shards than `max_shards_per_token`.
+    unsent = jnp.sum(~jnp.any(on_slot, axis=1), dtype=jnp.int32)
+    sent_rows, received = jnp.sum(send_counts), jnp.sum(dispatch[3])
 
   slots = sort_slots(local_ids, local_experts)
   tiers = _tiers(slots, capacities)
@@ -693,9 +853,7 @@ def dedup_dispatch_combine(
     slots = checkpoint_name(slots, "moe_dedup_plan")
     recv_x = checkpoint_name(recv_x, "moe_dedup_received")
     tier_rows += [jnp.clip(slots.assignments - start, 0, dropless_tier_rows) for start in extra_starts]
-  # Assignments this shard did not send (more destination shards than
-  # `max_shards_per_token`) plus received ones beyond the tiers.
-  unsent = jnp.sum(~jnp.any(on_slot, axis=1), dtype=jnp.int32)
+  # Unsent assignments plus received ones beyond the tiers.
   dropped = unsent + tiers.assignments - functools.reduce(jnp.add, tier_rows)
   if check_capacity:
     jax.debug.callback(moe._check_no_tier_route_drops, dropped)  # pylint: disable=protected-access
@@ -704,8 +862,8 @@ def dedup_dispatch_combine(
         _maybe_log_dedup_route,
         shard_id,
         jnp.int32(tokens),
-        jnp.sum(send_counts),
-        jnp.sum(dispatch[3]),
+        sent_rows,
+        received,
         tiers.assignments,
         jnp.stack(tier_rows),
         dropped,
@@ -719,20 +877,24 @@ def dedup_dispatch_combine(
   maps, group_sizes, tier_rows = checkpoint_name((maps, group_sizes, tuple(tier_rows)), "moe_dedup_plan")
 
   def run_tier(row_map, sizes, *, is_overflow, save_residuals=True):
+    extra = {}
+    if pass_row_source:
+      extra["lhs_rows"] = (recv_x, jnp.where(row_map.row_valid, _slot_owner(row_map), -1))
     return expert_fn(
         expand_rows(recv_x, row_map),
         slots_to_rows(recv_weights, row_map),
         sizes,
         is_overflow=is_overflow,
         save_residuals=save_residuals,
+        **extra,
     )
 
-  def skippable_tier(tier):
+  def skippable_tier(tier, like):
     rows = maps[tier].row_slots.shape[0]
     return jax.lax.cond(
         tier_rows[tier] > 0,
         lambda _: run_tier(maps[tier], group_sizes[tier], is_overflow=True),
-        lambda _: jnp.zeros((rows,) + outputs[0].shape[1:], outputs[0].dtype),
+        lambda _: jnp.zeros((rows,) + like.shape[1:], like.dtype),
         None,
     )
 
@@ -743,22 +905,22 @@ def dedup_dispatch_combine(
       row_map, sizes = compose_row_map(row_map, layout), layout.group_sizes
     return run_tier(row_map, sizes, is_overflow=True, save_residuals=False), row_map
 
-  outputs = [run_tier(maps[0], group_sizes[0], is_overflow=False)]
+  base_tier = functools.partial(run_tier, maps[0], group_sizes[0], is_overflow=False)
   overflowed = functools.reduce(jnp.add, tier_rows[1:], jnp.int32(0)) > 0
   if extra_starts:
     starts = jnp.asarray(extra_starts, jnp.int32)
     active = jnp.sum(starts < slots.assignments, dtype=jnp.int32)
 
-    def fixed_tiers():
+    def fixed_tiers(base):
       if len(maps) == 1:
         return ()
       # Tiers fill in order, so the first overflow tier holds rows whenever a later one does.
       first = run_tier(maps[1], group_sizes[1], is_overflow=True)
-      return (first, *(skippable_tier(tier) for tier in range(2, len(maps))))
+      return (first, *(skippable_tier(tier, base) for tier in range(2, len(maps))))
 
     def with_dropless_tiers(base):
       total = sum_recomputed_tiers(active, starts, dropless_tier, (local_ids.shape[0],) + base.shape[1:])
-      for value, row_map in zip((base, *fixed_tiers()), maps):
+      for value, row_map in zip((base, *fixed_tiers(base)), maps):
         total = accumulate_rows(total, value, row_map)
       return total.astype(base.dtype)
 
@@ -768,13 +930,17 @@ def dedup_dispatch_combine(
     branches = [lambda base: reduce_rows((base,), maps[:1])]
     index = jnp.int32(0)
     if len(maps) > 1:
-      branches.append(lambda base: reduce_rows((base, *fixed_tiers()), maps))
+      branches.append(lambda base: reduce_rows((base, *fixed_tiers(base)), maps))
       index += overflowed
     branches.append(with_dropless_tiers)
     index += active > 0
-    recv_output = jax.lax.switch(index, branches, outputs[0])
+    if recompute_tier_switch:
+      recv_output = switch_on_base(index, base_tier, branches)
+    else:
+      recv_output = jax.lax.switch(index, branches, base_tier())
   elif len(maps) > 1:
-    outputs += [skippable_tier(tier) for tier in range(1, len(maps))]
+    outputs = [base_tier()]
+    outputs += [skippable_tier(tier, outputs[0]) for tier in range(1, len(maps))]
     # Each slot column costs one gather per received row even when masked, so
     # the usually empty overflow tiers join the sum only when they hold rows.
     recv_output = jax.lax.cond(
@@ -784,7 +950,9 @@ def dedup_dispatch_combine(
         tuple(outputs),
     )
   else:
-    recv_output = reduce_rows(tuple(outputs), maps)
+    recv_output = reduce_rows((base_tier(),), maps)
+  if deepep:
+    return deepep_moe.moe_combine(recv_output.astype(x.dtype), handle)
   returned = run_exchange(recv_output, traffic.T, combine, send_starts, send_rows, 1, zero_unwritten_rows)
   returned = checkpoint_name(returned, "moe_combined")
   return reduce_rows((returned,), (send_map,))

@@ -45,7 +45,9 @@ import pytest
         (4, 8, 4, 4),
         (4, 16, 2, 2),
         (12, 8, 4, 0),
-        (8, -1, 4, 0),
+        (8, -1, 4, 8),
+        (4, -1, 4, 4),
+        (16, -1, 4, 8),
     ],
 )
 def test_dedup_shards_per_token_bounds_group_limited_routing(num_ep, groups, topk_groups, expected):

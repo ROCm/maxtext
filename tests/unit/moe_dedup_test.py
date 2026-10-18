@@ -171,6 +171,18 @@ def test_composed_map_equals_padding_the_compact_rows():
     )
 
 
+@pytest.mark.parametrize("rows", [3, 40, 1000, 196608])
+def test_sort_slots_matches_stable_argsort(rows):
+  rng = np.random.default_rng(rows)
+  ids = np.where(rng.random((rows, 8)) < 0.3, rng.integers(0, 32, (rows, 8)), -1).astype(np.int32)
+  ids[rows // 2 :] = -1
+  slots = moe_dedup.sort_slots(jnp.asarray(ids), 32)
+  wanted = np.argsort(np.where(ids >= 0, ids, 32).reshape(-1), kind="stable")
+  np.testing.assert_array_equal(slots.order, wanted)
+  np.testing.assert_array_equal(np.asarray(slots.position).reshape(-1)[wanted], np.arange(wanted.size))
+  np.testing.assert_array_equal(slots.group_ends, np.cumsum(np.bincount(ids[ids >= 0], minlength=32)))
+
+
 def test_expert_tiers_with_no_slots():
   tiers = moe_dedup.build_expert_tiers(jnp.full((3, 2), -1, jnp.int32), 4, (4, 2))
   assert int(tiers.assignments) == 0
@@ -360,6 +372,7 @@ def _exchange_or_skip(exchange):
   return None
 
 
+@pytest.mark.parametrize("recompute_tier_switch", [False, True], ids=["switch", "recomputed_switch"])
 @pytest.mark.parametrize("zero_unwritten_rows", [True, False], ids=["zeroed", "unread_rows_nan"])
 @pytest.mark.parametrize("layout", ["compact", "padded"])
 @pytest.mark.parametrize("exchange", ["emulated", "fresh", "two_stage_emulated", "two_stage_fresh"])
@@ -369,8 +382,10 @@ def _exchange_or_skip(exchange):
     ids=["two_tier_dropless", "two_tier_drops", "dropless_tiers", "dropless_tiers_mixed"],
 )
 def test_dedup_dispatch_combine_matches_dense_reference(
-    capacities, dropless_tier_rows, exchange, layout, zero_unwritten_rows
+    capacities, dropless_tier_rows, exchange, layout, zero_unwritten_rows, recompute_tier_switch
 ):
+  if recompute_tier_switch and not dropless_tier_rows:
+    pytest.skip("the tier switch exists only with dropless tiers")
   two_stage = exchange.startswith("two_stage_")
   exchange_fn = _exchange_or_skip(exchange.removeprefix("two_stage_"))
   # Two emulated processes of four shards each.
@@ -438,6 +453,7 @@ def test_dedup_dispatch_combine_matches_dense_reference(
         row_layout=jax_aiter_mxfp4.expert_padding if layout == "padded" else None,
         zero_unwritten_rows=zero_unwritten_rows,
         dropless_tier_rows=dropless_tier_rows,
+        recompute_tier_switch=recompute_tier_switch,
         **two_stage_args,
     )[None]
 
@@ -503,7 +519,7 @@ def test_saved_plan_is_not_rebuilt_in_backward(saved, passes, exchange):
 
   remat = jax.checkpoint(dedup, policy=jax.checkpoint_policies.save_only_these_names("moe_dispatched_meta", *saved))
   grad_jaxpr = jax.make_jaxpr(grad(remat))(x, weights).jaxpr
-  assert _primitive_count(grad_jaxpr, "all_gather") == passes
+  assert _primitive_count(grad_jaxpr, "psum") == passes
   assert _primitive_count(grad_jaxpr, "sort") == passes
   for actual, wanted in zip(jax.jit(grad(remat))(x, weights), jax.jit(grad(dedup))(x, weights)):
     np.testing.assert_allclose(actual, wanted, rtol=1e-6, atol=1e-6)
@@ -649,3 +665,36 @@ def test_dropless_tiers_hold_one_tier_live_in_backward():
   # through backward, the overhead would not shrink.
   base = temp_bytes(0)
   assert temp_bytes(256) - base < 0.6 * (temp_bytes(1024) - base)
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+@pytest.mark.parametrize("remat", [False, True])
+def test_switch_on_base_matches_switch(index, remat):
+  rng = np.random.default_rng(3)
+  x = jnp.asarray(rng.standard_normal((8, 4)), jnp.float32)
+  w = jnp.asarray(rng.standard_normal((4, 4)), jnp.float32)
+  v = jnp.asarray(rng.standard_normal((8, 4)), jnp.float32)
+  rows = jnp.asarray(rng.permutation(8), jnp.int32)
+
+  def loss(x, w, v, index, switch):
+    branches = [
+        lambda base: 2.0 * base,
+        lambda base: 2.0 * base + jnp.sin(x[rows]) * v,
+        lambda base: 2.0 * base + jnp.tanh(x @ w.T) * v[rows],
+    ]
+    out = switch(index, lambda: jnp.tanh(x @ w) * v, branches)
+    return jnp.sum(out * jnp.cos(out))
+
+  def reference(index, base, branches):
+    return jax.lax.switch(index, branches, base())
+
+  def value_and_grads(switch):
+    f = functools.partial(loss, switch=switch)
+    if remat:
+      f = jax.checkpoint(f)
+    return jax.jit(jax.value_and_grad(f, argnums=(0, 1, 2)))(x, w, v, jnp.int32(index))
+
+  (value, grads), (wanted_value, wanted_grads) = value_and_grads(moe_dedup.switch_on_base), value_and_grads(reference)
+  np.testing.assert_allclose(value, wanted_value, rtol=1e-6)
+  for actual, wanted in zip(grads, wanted_grads):
+    np.testing.assert_allclose(actual, wanted, rtol=1e-6, atol=1e-6)

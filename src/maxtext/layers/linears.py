@@ -132,6 +132,7 @@ class DenseGeneral(nnx.Module):
       retain_gathered_weight: bool = False,
       debug_sharding: bool = False,
       use_jax_aiter_mxfp4: bool = False,
+      jax_aiter_mxfp4_dual_grad_cast: bool = False,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -161,6 +162,8 @@ class DenseGeneral(nnx.Module):
       debug_sharding: when True, log the logical/physical sharding of the
         two-stage all-gather constraints to the sharding dump files.
       use_jax_aiter_mxfp4: use the E=1 whole-loop MXFP4 training kernels.
+      jax_aiter_mxfp4_dual_grad_cast: with those kernels, quantize the output
+        gradient for both backward GEMMs with one fused cast; bit-identical.
       rngs: RNG state for initialization in nnx.
     """
     self.in_features_shape = canonicalize_tuple(in_features_shape)
@@ -180,6 +183,7 @@ class DenseGeneral(nnx.Module):
     self.retain_gathered_weight = retain_gathered_weight
     self.debug_sharding = debug_sharding
     self.use_jax_aiter_mxfp4 = use_jax_aiter_mxfp4
+    self.jax_aiter_mxfp4_dual_grad_cast = jax_aiter_mxfp4_dual_grad_cast
 
     # Parameter initialization
     kernel_shape = self.in_features_shape + self.out_features_shape
@@ -280,6 +284,25 @@ class DenseGeneral(nnx.Module):
     )
     return checkpoint_name(kernel, "gathered_weight")
 
+  def _mxfp4_gather_spec(self):
+    """Kernel sharding as `[contraction, output]` for the MXFP4 linear to gather itself.
+
+    Gathering inside its shard_map keeps the saved weight per device; a weight
+    retained outside it is resharded when scan stacks it for backward and
+    gathered again. None when the reshape would merge a non-leading sharded dim.
+    """
+    if not self.retain_gathered_weight or self.mesh is None:
+      return None
+    spec = get_physical_spec_without_axes(PartitionSpec(*self.kernel_axes), self.mesh, ()).spec
+    spec = tuple(spec) + (None,) * (len(self.kernel_axes) - len(spec))
+    n_in = len(self.in_features_shape)
+    out = []
+    for group in (spec[:n_in], spec[n_in:]):
+      if any(entry is not None for entry in group[1:]):
+        return None
+      out.append(group[0])
+    return PartitionSpec(*out)
+
   def __call__(self, inputs: Array, _initializing: bool = False, out_sharding: NamedSharding | None = None) -> Array:
     """Applies a linear transformation to the inputs along multiple dimensions.
 
@@ -313,7 +336,9 @@ class DenseGeneral(nnx.Module):
       kernel = jnp.asarray(kernel, self.dtype)
 
     kernel = self._maybe_two_stage_all_gather(kernel)
-    kernel = self._maybe_retain_gathered_weight(kernel)
+    mxfp4_rhs_spec = self._mxfp4_gather_spec() if self.use_jax_aiter_mxfp4 else None
+    if mxfp4_rhs_spec is None:
+      kernel = self._maybe_retain_gathered_weight(kernel)
 
     # out_sharding should be None for auto mesh axis
     if self.shard_mode != ShardMode.EXPLICIT:
@@ -343,6 +368,8 @@ class DenseGeneral(nnx.Module):
           matrix_inputs,
           matrix_kernel,
           self.mesh,
+          rhs_spec=mxfp4_rhs_spec,
+          dual_grad_cast=self.jax_aiter_mxfp4_dual_grad_cast,
       ).reshape(leading_shape + self.out_features_shape)
       # Match Torch's selective-AC save rule for E=1 grouped GEMMs.  Without
       # this name the MLA wq_a forward is replayed during backward remat.
@@ -566,6 +593,7 @@ class MlpBlock(nnx.Module):
             retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
             debug_sharding=self.config.debug_sharding,
             use_jax_aiter_mxfp4="mlp_up" in self.mxfp4_linear_roles,
+            jax_aiter_mxfp4_dual_grad_cast=getattr(self.config, "jax_aiter_mxfp4_dual_grad_cast", False),
             rngs=rngs,
         )
         setattr(self, dense_name, module)
@@ -586,6 +614,7 @@ class MlpBlock(nnx.Module):
         retain_gathered_weight=getattr(self.config, "dense_retain_gathered_weights", False),
         debug_sharding=self.config.debug_sharding,
         use_jax_aiter_mxfp4="mlp_down" in self.mxfp4_linear_roles,
+        jax_aiter_mxfp4_dual_grad_cast=getattr(self.config, "jax_aiter_mxfp4_dual_grad_cast", False),
         rngs=rngs,
     )
 

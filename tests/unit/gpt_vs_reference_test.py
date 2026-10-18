@@ -346,7 +346,7 @@ class GptOssMLPTest(unittest.TestCase):
             "wo_bias": to_jax(predefined_weights["experts.down_proj_bias"]),
         },
     }
-    actual_output, _ = jax.jit(jax_model.apply)(moe_variables, jax_hidden_states)
+    actual_output = jax.jit(jax_model.apply)(moe_variables, jax_hidden_states)[0]
     # Add normalization to let logits at same scale
     normalized_expected = to_jax(expected_output) / jnp.linalg.norm(to_jax(expected_output))
     normalized_actual = actual_output / jnp.linalg.norm(actual_output)

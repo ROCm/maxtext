@@ -937,6 +937,11 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to cast inputs to fp32 to compute MoE gate logits for numerical stability.",
   )
+  gate_dot_algorithm: str = Field(
+      "",
+      description="Name of a jax.lax.DotAlgorithmPreset for the MoE gate matmul (e.g. BF16_BF16_F32_X3); "
+      "empty uses matmul_precision.",
+  )
   prefuse_moe_weights: bool = Field(
       False,
       description="Whether to pre-fuse MoE weights (w0 and w1) during initialization. "
@@ -968,13 +973,12 @@ class MoEKernels(BaseModel):
           "change attention, routing, collectives, or shared experts."
       ),
   )
-  jax_aiter_mxfp4_grouped_kernel: Literal["ragged", "wholeloop"] = Field(
+  jax_aiter_mxfp4_grouped_kernel: Literal["wholeloop"] = Field(
       "wholeloop",
       description=(
           "Grouped-GEMM kernel family for moe_local_expert_backend=jax_aiter_mxfp4. "
-          "wholeloop uses the collaborator whole-loop kernels, pads each expert's "
-          "rows to 256, and requires emb_dim and moe_mlp_dim divisible by 256. "
-          "ragged pads each expert's rows to 128."
+          "wholeloop uses the JAX-AITER whole-loop kernels, pads each expert's "
+          "rows to 256, and requires emb_dim and moe_mlp_dim divisible by 256."
       ),
   )
   jax_aiter_mxfp4_check_route_capacity: bool = Field(
@@ -1004,6 +1008,15 @@ class MoEKernels(BaseModel):
           "within what the MXFP4 quantizer can index, runs only in steps "
           "where the overflow tiers hold rows, and is recomputed in backward "
           "from the received rows (remat name 'moe_dedup_received')."
+      ),
+  )
+  jax_aiter_mxfp4_dedup_recompute_tier_switch: bool = Field(
+      False,
+      description=(
+          "With dropless tiers, give the first tier and the switch over the "
+          "extra tiers one custom gradient, so steps without extra rows write "
+          "no zero-filled residuals or cotangents for them. The remat policy "
+          "then cannot save arrays named inside the expert computation."
       ),
   )
   rail_aligned_embedding_lookup: bool = Field(
@@ -1045,6 +1058,25 @@ class MoEKernels(BaseModel):
           "two partial gradients plus their sum."
       ),
   )
+  jax_aiter_mxfp4_fsdp_weight_gather: bool = Field(
+      False,
+      description=(
+          "Pass routed-expert weights into the MoE shard_map still sharded "
+          "over FSDP, quantize each shard to MXFP4 there and all-gather the "
+          "packed values and scales instead of the bfloat16 weight. Both GEMM "
+          "layouts are gathered; results are bit-identical to quantizing the "
+          "gathered weight. Weight gradients are reduce-scattered at the "
+          "gather."
+      ),
+  )
+  jax_aiter_mxfp4_expert_grad_reduce: Literal["bf16", "fp8"] = Field(
+      "bf16",
+      description=(
+          "Payload of the routed-expert weight-gradient reduce-scatter at the "
+          "MXFP4 FSDP gather. 'fp8' is lossy: E4M3 values with one power-of-two "
+          "scale per 32, exchanged by all-to-all and summed in float32."
+      ),
+  )
   jax_aiter_mxfp4_dedup_dispatch: bool = Field(
       False,
       description=(
@@ -1063,6 +1095,39 @@ class MoEKernels(BaseModel):
           "are not received and the grouped GEMM rows past the last expert "
           "group, in the forward and backward passes. Only masked gathers "
           "read those rows, so results are unchanged."
+      ),
+  )
+  jax_aiter_mxfp4_gathered_quant: bool = Field(
+      False,
+      description=(
+          "With dedup dispatch, quantize the gate/up GEMM input, in both "
+          "passes, straight from the received rows instead of from their "
+          "padded copy, which then never forms. Results are unchanged."
+      ),
+  )
+  jax_aiter_mxfp4_dual_grad_cast: bool = Field(
+      False,
+      description=(
+          "Quantize each MXFP4 GEMM output gradient for the input and weight "
+          "gradients with one fused Primus-Turbo dual cast instead of two "
+          "casts. Results are unchanged."
+      ),
+  )
+  jax_aiter_mxfp4_requantize_input_grad_weight: bool = Field(
+      False,
+      description=(
+          "With the MXFP4 FSDP gather, derive each expert weight's "
+          "input-gradient operand by requantizing its gathered forward operand "
+          "along the other axis instead of gathering it. Lossy: the input "
+          "gradient uses weights rounded twice."
+      ),
+  )
+  jax_aiter_mxfp4_dedup_deepep: bool = Field(
+      False,
+      description=(
+          "With dedup dispatch, exchange tokens with Primus-Turbo intranode "
+          "DeepEP dispatch and combine instead of ragged all-to-all. The "
+          "expert axis must be exactly each process's GPUs."
       ),
   )
   jax_aiter_mxfp4_linear_roles: list[
@@ -1410,6 +1475,26 @@ class RematAndOffload(BaseModel):
   moe_mlpwo: RematLocation = Field(
       RematLocation.REMAT,
       description="Remat policy for the second MoE layer's output.",
+  )
+  moe_gathered_weight: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for the forward-layout MXFP4 expert weights gathered over FSDP.",
+  )
+  moe_gathered_wi_0_bwd: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for the input-gradient-layout MXFP4 gate weight gathered over FSDP.",
+  )
+  moe_gathered_wi_1_bwd: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for the input-gradient-layout MXFP4 up weight gathered over FSDP.",
+  )
+  moe_gathered_wo_bwd: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for the input-gradient-layout MXFP4 down weight gathered over FSDP.",
+  )
+  gathered_weight: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for dense kernels gathered by dense_retain_gathered_weights.",
   )
   query_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the query projection.")
   key_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the key projection.")
@@ -3394,6 +3479,11 @@ class MaxTextConfig(
           "moe_mlpwi_0",
           "moe_mlpwi_1",
           "moe_mlpwo",
+          "moe_gathered_weight",
+          "moe_gathered_wi_0_bwd",
+          "moe_gathered_wi_1_bwd",
+          "moe_gathered_wo_bwd",
+          "gathered_weight",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",
@@ -4323,6 +4413,11 @@ class RLConfig(
           "moe_mlpwi_0",
           "moe_mlpwi_1",
           "moe_mlpwo",
+          "moe_gathered_weight",
+          "moe_gathered_wi_0_bwd",
+          "moe_gathered_wi_1_bwd",
+          "moe_gathered_wo_bwd",
+          "gathered_weight",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",

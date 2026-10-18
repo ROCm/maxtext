@@ -555,6 +555,7 @@ class GateLogit(nnx.Module):
       shard_mode: ShardMode = ShardMode.AUTO,
       matmul_precision: str = "default",
       bias_dtype: Optional[ctypes.DType] = None,
+      dot_algorithm: str = "",
   ):
     """Initializes the GateLogit module.
 
@@ -575,6 +576,7 @@ class GateLogit(nnx.Module):
       quant: The quantization configuration. If None, no quantization is applied.
       matmul_precision: The precision level for the matrix multiplication.
       bias_dtype: Storage dtype of the bias; None uses weight_dtype.
+      dot_algorithm: jax.lax.DotAlgorithmPreset name for the matmul; empty uses matmul_precision.
     """
     self.in_features_shape = linears.canonicalize_tuple(in_features_shape)
     self.out_features_shape = linears.canonicalize_tuple(out_features_shape)
@@ -590,6 +592,7 @@ class GateLogit(nnx.Module):
     self.quant = quant
     self.shard_mode = shard_mode
     self.matmul_precision = matmul_precision
+    self.dot_algorithm = jax.lax.DotAlgorithmPreset[dot_algorithm] if dot_algorithm else None
 
     # Parameter initialization
     kernel_shape = self.in_features_shape + self.out_features_shape
@@ -652,16 +655,25 @@ class GateLogit(nnx.Module):
         if self.shard_mode == ShardMode.EXPLICIT
         else None
     )
-    output = linears._compute_dot_general_nnx(
-        inputs,
-        kernel,
-        norm_axis,
-        contract_ind,
-        self.matmul_precision,
-        self.quant_dot_general,
-        _initializing,
-        out_sharding=output_sharding,
-    )
+    if self.dot_algorithm is not None and self.quant_dot_general is None:
+      output = jax.lax.dot_general(
+          inputs,
+          kernel,
+          ((norm_axis, contract_ind), ((), ())),
+          precision=self.dot_algorithm,
+          out_sharding=output_sharding,
+      )
+    else:
+      output = linears._compute_dot_general_nnx(
+          inputs,
+          kernel,
+          norm_axis,
+          contract_ind,
+          self.matmul_precision,
+          self.quant_dot_general,
+          _initializing,
+          out_sharding=output_sharding,
+      )
     pre_bias_logits = None
 
     if self.score_func:
@@ -792,6 +804,7 @@ class RoutedMoE(nnx.Module):
         shard_mode=config.shard_mode,
         rngs=self.rngs,
         bias_dtype=jnp.dtype(self.config.routed_bias_dtype) if self.config.routed_bias_dtype else None,
+        dot_algorithm=self.config.gate_dot_algorithm,
     )
     rule = qpl.get_current_rule("gmm")
     sparsity_rule = None
@@ -983,14 +996,15 @@ class RoutedMoE(nnx.Module):
     return self.mesh.shape.get(self._expert_parallelism_name, 1)
 
   def _dedup_shards_per_token(self) -> int:
-    """Bound on the distinct expert shards one token routes to under group-limited routing, or 0 if none applies.
+    """Bound on the distinct expert shards one token routes to, or 0 if none applies.
 
-    A token picks `topk_routing_group` of `n_routing_groups` contiguous groups,
-    so it reaches at most that many groups' worth of shards.
+    Without group-limited routing a token reaches at most `num_experts_per_tok`
+    shards. With it, a token picks `topk_routing_group` of `n_routing_groups`
+    contiguous groups, so it reaches at most that many groups' worth of shards.
     """
     num_ep, groups = self.get_expert_parallelism_size(), self.config.n_routing_groups
     if groups <= 0:
-      return 0
+      return min(self.num_experts_per_tok, num_ep)
     if num_ep % groups == 0:
       return min(self.config.topk_routing_group * (num_ep // groups), self.num_experts_per_tok, num_ep)
     if groups % num_ep == 0:
@@ -1823,7 +1837,31 @@ class RoutedMoE(nnx.Module):
         group_offset,
         partial_sum=None,
         zero_tail=True,
+        lhs_rows=None,
     ):
+      if self.config.moe_local_expert_backend == "jax_aiter_mxfp4":
+        if inputs.shape[0] != expert_assignments.shape[0]:
+          raise ValueError("The number of input tokens must match the number of expert assignments!")
+        if partial_sum is not None:
+          raise ValueError("jax_aiter_mxfp4 does not support partial GMM accumulation")
+        if weight_gather_axes:
+          raise ValueError("jax_aiter_mxfp4 requires complete EP-local expert weights")
+        if group_offset not in (None, 0):
+          raise ValueError("jax_aiter_mxfp4 does not support nonzero group_offset")
+        from maxtext.kernels import jax_aiter_mxfp4
+
+        if not isinstance(kernel, jax_aiter_mxfp4.GatheredExpertWeight):
+          kernel = kernel.astype(jnp.bfloat16)
+        return jax_aiter_mxfp4.grouped_gmm(
+            inputs.astype(jnp.bfloat16),
+            kernel,
+            group_sizes.astype(jnp.int32),
+            grouped_kernel=self.config.jax_aiter_mxfp4_grouped_kernel,
+            zero_tail=zero_tail,
+            lhs_rows=lhs_rows,
+            dual_grad_cast=self.config.jax_aiter_mxfp4_dual_grad_cast,
+        )
+
       def extract_vma(tensor):
         # Parses the varying mesh axes from JAX's type string for a tensor inside shard_map.
         # jax.typeof(t) renders as e.g. 'f32[128,256]{V:(expert, fsdp)}'; this extracts
@@ -1840,23 +1878,6 @@ class RoutedMoE(nnx.Module):
       rhs_vma_axes = extract_vma(kernel)
       if inputs.shape[0] != expert_assignments.shape[0]:
         raise ValueError("The number of input tokens must match the number of expert assignments!")
-
-      if self.config.moe_local_expert_backend == "jax_aiter_mxfp4":
-        if partial_sum is not None:
-          raise ValueError("jax_aiter_mxfp4 does not support partial GMM accumulation")
-        if weight_gather_axes:
-          raise ValueError("jax_aiter_mxfp4 requires complete EP-local expert weights")
-        if group_offset not in (None, 0):
-          raise ValueError("jax_aiter_mxfp4 does not support nonzero group_offset")
-        from maxtext.kernels import jax_aiter_mxfp4
-
-        return jax_aiter_mxfp4.grouped_gmm(
-            inputs.astype(jnp.bfloat16),
-            kernel.astype(jnp.bfloat16),
-            group_sizes.astype(jnp.int32),
-            grouped_kernel=self.config.jax_aiter_mxfp4_grouped_kernel,
-            zero_tail=zero_tail,
-        )
 
       tokamax_group_sizes = get_tokamax_group_sizes(group_sizes, inputs, kernel)
       orig_inputs_shape = inputs.shape  # save shape of inputs before potentially padding.
@@ -2000,6 +2021,11 @@ class RoutedMoE(nnx.Module):
         w0_pspec = self._logical_to_mesh_axes((None, "mlp_no_fsdp", None))
         w1_pspec = self._logical_to_mesh_axes((None, "mlp_no_fsdp", None))
         wo_pspec = self._logical_to_mesh_axes((None, "mlp_no_fsdp", None))
+      elif use_mxfp4_fsdp_gather:
+        # Stay FSDP-sharded on the embedding dim; the body gathers MXFP4.
+        w0_pspec = self._logical_to_mesh_axes(("exp", "embed_moe", "mlp_no_fsdp"))
+        w1_pspec = self._logical_to_mesh_axes(("exp", "embed_moe", "mlp_no_fsdp"))
+        wo_pspec = self._logical_to_mesh_axes(("exp", "mlp_no_fsdp", "embed_moe"))
       else:
         # These are the main shardings used by default - they use funky rules to AG over FSDP.
         w0_pspec = self._logical_to_mesh_axes(("exp", None, "mlp_no_fsdp"))
@@ -2026,6 +2052,10 @@ class RoutedMoE(nnx.Module):
         and is_batch_sharded_by_expert
     )
     weight_gather = explicitly_weight_ag(self.config.shard_exp_on_fsdp)
+    use_mxfp4_fsdp_gather = (
+        self.config.moe_local_expert_backend == "jax_aiter_mxfp4"
+        and self.config.jax_aiter_mxfp4_fsdp_weight_gather
+    )
     (
         batch_logical_axis,
         input_partition_pspec,
@@ -2742,8 +2772,8 @@ class RoutedMoE(nnx.Module):
           unsupported.append("use_ring_of_experts")
         if self.config.prefuse_moe_weights:
           unsupported.append("prefuse_moe_weights")
-        if self.config.mlp_bias:
-          unsupported.append("mlp_bias")
+        if self.config.mlp_bias and not use_mxfp4_dedup:
+          unsupported.append("mlp_bias without dedup dispatch")
         if self.config.quantization:
           unsupported.append("global quantization")
         if self.get_tensor_parallelism_size() != 1:
@@ -2769,13 +2799,33 @@ class RoutedMoE(nnx.Module):
             unsupported.append("dedup dispatch with in-branch weight collectives")
           if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
             unsupported.append("dedup dispatch with Llama4 input scaling")
+          if self.config.jax_aiter_mxfp4_dedup_deepep:
+            if self.config.jax_aiter_mxfp4_two_stage_exchange:
+              unsupported.append("DeepEP with two-stage exchange")
+            if self.dtype != jnp.bfloat16:
+              unsupported.append("DeepEP with non-bfloat16 activations")
         else:
+          if self.config.jax_aiter_mxfp4_dedup_deepep:
+            unsupported.append("DeepEP without dedup dispatch")
           if self.config.jax_aiter_mxfp4_dedup_skip_unread_zeroing:
             unsupported.append("skipping unread-row zeroing without dedup dispatch")
           if self.config.jax_aiter_mxfp4_dropless_tiers:
             unsupported.append("dropless tiers without dedup dispatch")
           if self.config.jax_aiter_mxfp4_two_stage_exchange:
             unsupported.append("two-stage exchange without dedup dispatch")
+          if self.config.jax_aiter_mxfp4_gathered_quant:
+            unsupported.append("gathered quantization without dedup dispatch")
+        if self.config.jax_aiter_mxfp4_dedup_recompute_tier_switch and not (
+            use_mxfp4_dedup and self.config.jax_aiter_mxfp4_dropless_tiers
+        ):
+          unsupported.append("a recomputed tier switch without dedup dispatch and dropless tiers")
+        if self.config.jax_aiter_mxfp4_requantize_input_grad_weight and not use_mxfp4_fsdp_gather:
+          unsupported.append("input-gradient weight requantization without the MXFP4 FSDP gather")
+        if use_mxfp4_fsdp_gather:
+          if self.config.shard_exp_on_fsdp or self.config.use_2d_fsdp_sharding:
+            unsupported.append("MXFP4 FSDP weight gather with shard_exp_on_fsdp or 2D FSDP sharding")
+          if self.config.moe_fsdp_use_two_stage_all_gather:
+            unsupported.append("MXFP4 FSDP weight gather with two-stage all-gather")
         if unsupported:
           raise ValueError(
               "jax_aiter_mxfp4 initial DeepSeek path does not support: " + ", ".join(unsupported)
@@ -2783,8 +2833,53 @@ class RoutedMoE(nnx.Module):
 
         from maxtext.kernels import jax_aiter_mxfp4
 
+        w01 = None
+        if use_mxfp4_fsdp_gather:
+          # Gathered here, outside the tier conditionals that run the GEMMs.
+          wi_fsdp_axes = tuple(ax for ax, _ in get_active_sharding_axes(w0_pspec[1], 1))
+          wo_fsdp_axes = tuple(ax for ax, _ in get_active_sharding_axes(wo_pspec[2], 2))
+          grad_reduce = self.config.jax_aiter_mxfp4_expert_grad_reduce
+          if wi_fsdp_axes and self.config.jax_aiter_mxfp4_fuse_gate_up:
+            # Gathering [w0 | w1] gives the [E, 2N, K] forward operand and the
+            # [E, K, 2N] input-gradient operand of one gate/up GEMM, whose input
+            # gradient contracts over both halves without a partial-sum add.
+            w01 = jax_aiter_mxfp4.gather_expert_weight(
+                jnp.concatenate((w0, w1), axis=2).astype(jnp.bfloat16), wi_fsdp_axes, 1, grad_reduce
+            )
+          elif wi_fsdp_axes:
+            w0 = jax_aiter_mxfp4.gather_expert_weight(w0.astype(jnp.bfloat16), wi_fsdp_axes, 1, grad_reduce)
+            w1 = jax_aiter_mxfp4.gather_expert_weight(w1.astype(jnp.bfloat16), wi_fsdp_axes, 1, grad_reduce)
+          if wo_fsdp_axes:
+            wo = jax_aiter_mxfp4.gather_expert_weight(wo.astype(jnp.bfloat16), wo_fsdp_axes, 2, grad_reduce)
+          # Saving an input-gradient layout moves its gather into the forward pass.
+          def name_layouts(w, bwd_name):
+            w = w._replace(
+                fwd_packed=adc.checkpoint_name(w.fwd_packed, "moe_gathered_weight"),
+                fwd_scales=adc.checkpoint_name(w.fwd_scales, "moe_gathered_weight"),
+            )
+            if self.config.jax_aiter_mxfp4_requantize_input_grad_weight:
+              w = jax_aiter_mxfp4.requantize_input_grad_operand(w)
+            return w._replace(
+                bwd_packed=adc.checkpoint_name(w.bwd_packed, bwd_name),
+                bwd_scales=adc.checkpoint_name(w.bwd_scales, bwd_name),
+            )
+
+          w0, w1, wo, w01 = (
+              name_layouts(w, bwd_name) if isinstance(w, jax_aiter_mxfp4.GatheredExpertWeight) else w
+              for w, bwd_name in zip(
+                  (w0, w1, wo, w01),
+                  ("moe_gathered_wi_0_bwd", "moe_gathered_wi_1_bwd", "moe_gathered_wo_bwd", "moe_gathered_wi_0_bwd"),
+              )
+          )
+
         def run_padded_mxfp4_experts(
-            padded_inputs, padded_group_sizes, *, is_overflow, row_weights=None, save_residuals=True
+            padded_inputs,
+            padded_group_sizes,
+            *,
+            is_overflow,
+            row_weights=None,
+            save_residuals=True,
+            lhs_rows=None,
         ):
           if padded_group_sizes.shape != (w0.shape[0],):
             raise ValueError(
@@ -2822,17 +2917,27 @@ class RoutedMoE(nnx.Module):
               raise ValueError("jax_aiter_mxfp4 requires complete EP-local expert weights")
             # Saving the fused output, not its halves, keeps the GEMM result
             # as the only saved buffer instead of two sliced copies.
-            local_output01 = name(
-                jax_aiter_mxfp4.grouped_gmm_gate_up(
-                    padded_inputs.astype(jnp.bfloat16),
-                    w0.astype(jnp.bfloat16),
-                    w1.astype(jnp.bfloat16),
-                    padded_group_sizes,
-                    grouped_kernel=self.config.jax_aiter_mxfp4_grouped_kernel,
-                    zero_tail=not skip_unread_zeroing,
-                ),
-                "mlpwi",
-            )
+            if w01 is not None:
+              local_output01 = local_gmm(
+                  padded_inputs,
+                  w01,
+                  tiling=get_wi_gmm_params()[1],
+                  weight_gather_axes=(),
+                  lhs_rows=lhs_rows,
+              )
+            else:
+              if lhs_rows is not None:
+                raise ValueError("jax_aiter_mxfp4_gathered_quant needs the MXFP4 FSDP weight gather with fused gate/up")
+              local_output01 = jax_aiter_mxfp4.grouped_gmm_gate_up(
+                  padded_inputs.astype(jnp.bfloat16),
+                  w0.astype(jnp.bfloat16),
+                  w1.astype(jnp.bfloat16),
+                  padded_group_sizes,
+                  grouped_kernel=self.config.jax_aiter_mxfp4_grouped_kernel,
+                  zero_tail=not skip_unread_zeroing,
+                  dual_grad_cast=self.config.jax_aiter_mxfp4_dual_grad_cast,
+              )
+            local_output01 = name(local_output01, "mlpwi")
             local_output0, local_output1 = jax.lax.split(
                 local_output01, (w0.shape[-1], w1.shape[-1]), axis=1
             )
@@ -2841,12 +2946,18 @@ class RoutedMoE(nnx.Module):
                 padded_inputs,
                 w0,
                 w1,
-                w0_bias,
-                w1_bias,
-                local_gmm,
+                None,
+                None,
+                functools.partial(local_gmm, lhs_rows=lhs_rows),
                 weight_gather,
                 save_residuals=save_residuals,
             )
+          row_experts = None
+          if self.config.mlp_bias:
+            # Biases are per EP-local expert; rows are grouped by expert.
+            row_experts = jax_aiter_mxfp4.expert_row_ids(padded_group_sizes, local_output0.shape[0])
+            local_output0 = local_output0 + w0_bias.at[row_experts].get(mode="fill", fill_value=0)
+            local_output1 = local_output1 + w1_bias.at[row_experts].get(mode="fill", fill_value=0)
           local_intermediate = self.apply_ffn_activation(
               local_output0, local_output1
           )
@@ -2859,12 +2970,18 @@ class RoutedMoE(nnx.Module):
                 * row_weights.astype(jnp.float32)[:, None]
             ).astype(local_intermediate.dtype)
           wo_gather_axes, wo_tile_size = get_wo_gmm_params()
-          return local_gmm(
+          local_output = local_gmm(
               local_intermediate,
               wo,
               tiling=wo_tile_size,
               weight_gather_axes=wo_gather_axes,
           )
+          if row_experts is not None:
+            out_bias = wo_bias.at[row_experts].get(mode="fill", fill_value=0).astype(jnp.float32)
+            if row_weights is not None:
+              out_bias = out_bias * row_weights.astype(jnp.float32)[:, None]
+            local_output = (local_output.astype(jnp.float32) + out_bias).astype(local_output.dtype)
+          return local_output
 
         def run_mxfp4_experts(routed_inputs, routed_group_sizes, *, is_overflow):
           padded_inputs, padding = jax_aiter_mxfp4.pad_expert_rows(
@@ -2911,15 +3028,17 @@ class RoutedMoE(nnx.Module):
           dropless_tier_rows = min(
               capacities[-1],
               jax_aiter_mxfp4.max_compact_capacity(
-                  embed_dim, w0.shape[0], self.config.jax_aiter_mxfp4_grouped_kernel
-              ),
-          )
+              embed_dim, w0.shape[0], self.config.jax_aiter_mxfp4_grouped_kernel
+          ),
+        )
+        if self.config.jax_aiter_mxfp4_dedup_deepep:
+          moe_dedup.setup_deepep(self.mesh, self._expert_parallelism_name)
         output = moe_dedup.dedup_dispatch_combine(
             jnp.reshape(x, (tokens, embed_dim)).astype(self.dtype),
             jnp.reshape(selected_experts, (tokens, self.num_experts_per_tok)),
             jnp.reshape(weights, (tokens, self.num_experts_per_tok)),
-            lambda rows, row_weights, group_sizes, *, is_overflow, save_residuals: run_padded_mxfp4_experts(
-                rows, group_sizes, is_overflow=is_overflow, row_weights=row_weights, save_residuals=save_residuals
+            lambda rows, row_weights, group_sizes, **kwargs: run_padded_mxfp4_experts(
+                rows, group_sizes, row_weights=row_weights, **kwargs
             ),
             num_experts=self.config.num_experts,
             num_shards=num_ep,
@@ -2938,6 +3057,9 @@ class RoutedMoE(nnx.Module):
                 if self.config.jax_aiter_mxfp4_two_stage_exchange
                 else 0
             ),
+            deepep=self.config.jax_aiter_mxfp4_dedup_deepep,
+            pass_row_source=self.config.jax_aiter_mxfp4_gathered_quant,
+            recompute_tier_switch=self.config.jax_aiter_mxfp4_dedup_recompute_tier_switch,
         )
         return output.reshape(batch_size, sequence_length, -1).astype(self.dtype), lb_loss, bias_updates
 
@@ -3994,6 +4116,9 @@ class RoutedMoE(nnx.Module):
     gate_dtype = jnp.float32 if cfg.float32_gate_logits else cfg.dtype
     routing_inputs = inputs if gate_inputs is None else gate_inputs.astype(gate_dtype)
     gate_logits, pre_bias_logits = self.gate(routing_inputs)
+    if not (self.uses_deepseek_pre_bias_scores() or self.is_hash_routing):
+      # A router bias that also weights the experts (GPT-OSS) has no separate selection scores.
+      pre_bias_logits = None
 
     wo_kernel = jnp.asarray(self.wo[...], self.dtype)
 

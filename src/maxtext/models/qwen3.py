@@ -282,74 +282,48 @@ def jax_chunk_gated_delta_rule(
   # =========================================================================
   # STAGE 3: INTER-CHUNK RECURRENCE (Scan)
   # =========================================================================
-  scan_perm_vec = (1, 0, 2, 3, 4)
-  scan_perm_scl = (1, 0, 2, 3)
+  # Only the state update is sequential. Every term that does not read the state
+  # is computed for all chunks at once, and the scan returns each chunk's
+  # incoming state so the outputs are also batched matmuls after it: a scan
+  # step is a few small kernels, each launched per chunk per layer.
+  prec = jax.lax.Precision.HIGHEST
 
-  w_scan = w_chunks.transpose(scan_perm_vec)
-  u_scan = u_chunks.transpose(scan_perm_vec)
-  k_scan = k_c.transpose(scan_perm_vec)
-  q_scan = q_c.transpose(scan_perm_vec)
-  g_scan = g_cumsum.transpose(scan_perm_scl)
+  # Inter-chunk query: q(dtype) * exp(g)(f32) -> f32
+  q_g = q_c.astype(jnp.float32) * jnp.exp(g_cumsum)[..., None]
+
+  # Intra-chunk scores: q(dtype) @ k(dtype) -> f32, masked before exp. Beta is
+  # not applied here: the delta rule absorbed it into v_new (via u).
+  attn = jnp.matmul(q_c, k_c.swapaxes(-1, -2), precision=prec).astype(jnp.float32)
+  g_diff_intra = g_cumsum[..., :, None] - g_cumsum[..., None, :]
+  mask_intra = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=bool))
+  attn_i = jnp.where(mask_intra, attn * jnp.exp(jnp.where(mask_intra, g_diff_intra, -1e30)), 0.0)
+
+  # State decay over a chunk, and each key decayed to the chunk end.
+  chunk_decay = jnp.exp(g_cumsum[..., -1])
+  k_g = k_c.astype(jnp.float32) * jnp.exp(g_cumsum[..., -1:] - g_cumsum)[..., None]
 
   if initial_state is None:
     h_init = jnp.zeros((B, H, K_dim, V_dim), dtype=jnp.float32)
   else:
     h_init = initial_state.astype(jnp.float32)
 
-  xs = (w_scan, u_scan, q_scan, k_scan, g_scan)
-
   def scan_body(h, args):
-    w, u, q, k, g = args
-    prec = jax.lax.Precision.HIGHEST
+    w, u, k_g, decay = args
+    # w serves as k_cumdecay, u serves as value_intra.
+    v_new = u.astype(jnp.float32) - jnp.matmul(w.astype(jnp.float32), h, precision=prec)
+    h_new = h * decay[..., None, None] + jnp.matmul(k_g.swapaxes(-1, -2), v_new, precision=prec)
+    return h_new, (h, v_new)
 
-    # --- Output Computation ---
-    # 1. Inter-chunk: q(dtype) * exp(g)(f32) -> f32
-    q_g = q.astype(jnp.float32) * jnp.exp(g)[..., None]
-    attn_inter = jnp.matmul(q_g, h, precision=prec)
+  xs = tuple(x.swapaxes(0, 1) for x in (w_chunks, u_chunks, k_g, chunk_decay))
+  final_h, (h_prev, v_new) = lax.scan(scan_body, h_init, xs)
+  h_prev, v_new = h_prev.swapaxes(0, 1), v_new.swapaxes(0, 1)
 
-    # 2. Delta Rule Subtraction (v_prime and v_new)
-    # w serves as k_cumdecay, u serves as value_intra
-    v_prime = jnp.matmul(w.astype(jnp.float32), h, precision=prec)
-    v_new = u.astype(jnp.float32) - v_prime
-
-    # 3. Intra-chunk: q(dtype) @ k(dtype) -> f32
-    attn = jnp.matmul(q, k.swapaxes(-1, -2), precision=prec)
-    attn = attn.astype(jnp.float32)
-
-    # Mask before exp
-    g_diff = g[..., :, None] - g[..., None, :]
-    mask_intra = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=bool))
-    g_diff = jnp.where(mask_intra, g_diff, -1e30)
-
-    attn_i = attn * jnp.exp(g_diff)
-    attn_i = jnp.where(mask_intra, attn_i, 0.0)
-
-    # Note: We do NOT multiply attn_i by beta here. The Delta rule mathematically
-    # absorbed beta inside v_new (via u).
-
-    # 4. Combine Core Output
-    term2 = jnp.matmul(attn_i, v_new, precision=prec)
-    o_c = attn_inter + term2
-
-    # --- State Update ---
-    g_i_last_exp = jnp.exp(g[..., -1, None, None])
-    h_new = h * g_i_last_exp
-
-    # Apply Delta Rule K decay to state
-    g_diff_exp_state = jnp.exp(g[..., -1, None] - g)[..., None]
-    k_i_g_diff = k.astype(jnp.float32) * g_diff_exp_state
-
-    update_term = jnp.matmul(k_i_g_diff.swapaxes(-1, -2), v_new, precision=prec)
-    h_new = h_new + update_term
-
-    return h_new, o_c
-
-  final_h, o_chunks = lax.scan(scan_body, h_init, xs)
+  o_chunks = jnp.matmul(q_g, h_prev, precision=prec) + jnp.matmul(attn_i, v_new, precision=prec)
 
   # =========================================================================
   # STAGE 4: FINALIZATION
   # =========================================================================
-  o = o_chunks.transpose(1, 0, 3, 2, 4)
+  o = o_chunks.transpose(0, 1, 3, 2, 4)
   o = o.reshape(B, -1, H, V_dim)
 
   if pad_len > 0:
@@ -358,6 +332,21 @@ def jax_chunk_gated_delta_rule(
   o = o.astype(initial_dtype)
 
   return o, (final_h if initial_state is not None else None)
+
+
+def causal_depthwise_conv1d(conv_input: Array, kernel: Array, out_len: int, dtype: jnp.dtype) -> Array:
+  """The last `out_len` outputs of a CAUSAL depthwise `nnx.Conv` with `kernel` (K, 1, C).
+
+  Computed as K shifted multiply-adds, which XLA fuses into elementwise kernels;
+  as a convolution, ROCm lowers it to MIOpen grouped-conv and layout-transpose
+  kernels that cost milliseconds per call for a few-tap filter.
+  """
+  taps = kernel.shape[0]
+  start = conv_input.shape[1] - out_len - (taps - 1)
+  x = conv_input.astype(jnp.float32)
+  w = kernel.astype(dtype).astype(jnp.float32)[:, 0, :]
+  out = sum(x[:, start + j : start + j + out_len, :] * w[j] for j in range(taps))
+  return out.astype(dtype)
 
 
 def jax_ar_gated_delta_rule(
@@ -793,10 +782,8 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     else:
       conv_input = jnp.pad(qkv, ((0, 0), (conv_kernel_size - 1, 0), (0, 0)))
 
-    # Perform the convolution.
-    conv_out = self.conv1d(conv_input)
-    # Slice the output to match the original input sequence length.
-    conv_out = conv_out[:, -seq_len:, :]
+    # Perform the convolution, keeping only the outputs for the current tokens.
+    conv_out = causal_depthwise_conv1d(conv_input, self.conv1d.kernel[...], seq_len, cfg.dtype)
     qkv_conv = jax.nn.silu(conv_out.astype(jnp.float32)).astype(cfg.dtype)
     # q_conv shape: (B, S, key_dim), k_conv shape: (B, S, key_dim), v_conv shape: (B, S, value_dim)
     q_conv, k_conv, v_conv = jnp.split(qkv_conv, [self.key_dim, 2 * self.key_dim], axis=-1)
