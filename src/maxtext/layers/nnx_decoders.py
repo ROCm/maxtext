@@ -1397,11 +1397,18 @@ class NNXDecoder(nnx.Module):
         "mlpwi_1",
         "mlpwi",
         "mlpwo",
+        "mxfp4_linear",
+        "gathered_weight",
     ]
     if with_context:
       names.append("context")
     if with_quantization:
       names.append("quantization")
+    if self.config.jax_aiter_mxfp4_dedup_dispatch:
+      # Backward reuses the forward dispatch plan and expert ids. A recomputed
+      # top-k can differ from the forward one, which would misalign gradients
+      # with the saved expert rows.
+      names.extend(["moe_topk_indices", "moe_dedup_plan"])
     return jax.checkpoint_policies.save_only_these_names(*names)
 
   def get_remat_policy(self):

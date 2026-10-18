@@ -569,6 +569,8 @@ class Attention(nnx.Module):
         shard_mode=self.config.shard_mode,
         weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
         block_size=block_size,
+        mesh=self.mesh,
+        retain_gathered_weight=self.config.dense_retain_gathered_weights,
         rngs=self.rngs,
     )
 
@@ -610,6 +612,8 @@ class Attention(nnx.Module):
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
         block_size=block_size,
+        mesh=self.mesh,
+        retain_gathered_weight=self.config.dense_retain_gathered_weights,
         rngs=self.rngs,
     )
 
@@ -652,6 +656,8 @@ class Attention(nnx.Module):
         weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        mesh=self.mesh,
+        retain_gathered_weight=self.config.dense_retain_gathered_weights,
         rngs=self.rngs,
     )
 
@@ -710,6 +716,10 @@ class Attention(nnx.Module):
         matmul_precision=self.config.matmul_precision,
         use_bias=False if self.is_qwen2 else self.use_bias_in_projections,
         block_size=block_size,
+        mesh=self.mesh,
+        retain_gathered_weight=self.config.dense_retain_gathered_weights,
+        use_jax_aiter_mxfp4=("attention_wo" in self.config.jax_aiter_mxfp4_linear_roles),
+        jax_aiter_mxfp4_dual_grad_cast=self.config.jax_aiter_mxfp4_dual_grad_cast,
         rngs=self.rngs,
     )
 

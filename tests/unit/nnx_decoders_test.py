@@ -481,6 +481,11 @@ class TestNNXDecoderRematPolicy(unittest.TestCase):
     policy = self.decoder.minimal_policy(with_context=True, with_quantization=True)
     self.assertIsNotNone(policy)
 
+  def test_minimal_policy_saves_mxfp4_linear_and_gathered_weight(self):
+    with mock.patch.object(jax.checkpoint_policies, "save_only_these_names", return_value=object()) as save_only:
+      self.decoder.minimal_policy(with_context=True)
+    self.assertTrue({"context", "mxfp4_linear", "gathered_weight"}.issubset(save_only.call_args.args))
+
   def test_minimal_policy_returns_distinct_objects_for_different_flags(self):
     """Different flag combinations should produce different policy objects."""
     p1 = self.decoder.minimal_policy(with_context=False)

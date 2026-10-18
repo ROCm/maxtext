@@ -1574,6 +1574,133 @@ class MoEKernels(BaseModel):
 
   megablox: bool = Field(True, description="Whether to use Megablox kernels for MoE.")
   sparse_matmul: bool = Field(True, description="Whether to use sparse matmul kernels for MoE.")
+  moe_local_expert_backend: Literal["default", "jax_aiter_mxfp4"] = Field(
+      "default",
+      description=(
+          "Backend for local routed-expert gate/up/down grouped matrix multiplications. "
+          "The jax_aiter_mxfp4 backend is a gfx950 training path and does not "
+          "change attention, routing, collectives, or shared experts. Its "
+          "whole-loop kernels pad each expert's rows to 256 and require emb_dim "
+          "and moe_mlp_dim divisible by 256."
+      ),
+  )
+  jax_aiter_mxfp4_check_route_capacity: bool = Field(
+      True,
+      description=(
+          "Check routed-token capacity with a host callback before MXFP4 expert "
+          "padding. Disable only after validating ragged_buffer_factor for the "
+          "workload; disabling removes the callback from the training graph."
+      ),
+  )
+  jax_aiter_mxfp4_overflow_buffer_factor: float = Field(
+      0.0,
+      ge=0.0,
+      description=(
+          "Optional second ragged route buffer for the JAX-AITER MXFP4 expert "
+          "path, measured relative to the balanced rows per EP rank. Zero "
+          "disables it. The primary buffer remains controlled by "
+          "ragged_buffer_factor."
+      ),
+  )
+  jax_aiter_mxfp4_dropless_tiers: bool = Field(
+      False,
+      description=(
+          "With dedup dispatch, add expert tiers after the primary and "
+          "overflow tiers until every received assignment has a row, so no "
+          "assignment drops. Each added tier matches the last configured tier, "
+          "within what the MXFP4 quantizer can index, runs only in steps "
+          "where the overflow tiers hold rows, and is recomputed in backward "
+          "from the received rows (remat name 'moe_dedup_received')."
+      ),
+  )
+  jax_aiter_mxfp4_dedup_recompute_tier_switch: bool = Field(
+      False,
+      description=(
+          "With dropless tiers, give the first tier and the switch over the "
+          "extra tiers one custom gradient, so steps without extra rows write "
+          "no zero-filled residuals or cotangents for them. The remat policy "
+          "then cannot save arrays named inside the expert computation."
+      ),
+  )
+  jax_aiter_mxfp4_fresh_a2a_buffers: bool = Field(
+      False,
+      description=(
+          "Give each MXFP4 routed ragged all-to-all a fresh uninitialized "
+          "destination buffer and mask the rows it does not write, instead of "
+          "a zero buffer that XLA hoists out of the layer scan and copies "
+          "every iteration. Results are unchanged."
+      ),
+  )
+  jax_aiter_mxfp4_fsdp_weight_gather: bool = Field(
+      False,
+      description=(
+          "Pass routed-expert weights into the MoE shard_map still sharded "
+          "over FSDP, quantize each shard to MXFP4 there and all-gather the "
+          "packed values and scales instead of the bfloat16 weight. Both GEMM "
+          "layouts are gathered; results are bit-identical to quantizing the "
+          "gathered weight. Weight gradients are reduce-scattered at the "
+          "gather."
+      ),
+  )
+  jax_aiter_mxfp4_dedup_dispatch: bool = Field(
+      False,
+      description=(
+          "Send each token to each expert shard once, with its local expert "
+          "ids and routing weights, and sum each shard's expert outputs before "
+          "the return all-to-all. The receive buffer holds the worst case; "
+          "ragged_buffer_factor and jax_aiter_mxfp4_overflow_buffer_factor "
+          "size the local expert tiers. Routing weights scale the "
+          "down-projection input instead of its output."
+      ),
+  )
+  jax_aiter_mxfp4_dedup_skip_unread_zeroing: bool = Field(
+      False,
+      description=(
+          "With dedup dispatch, leave uninitialized the all-to-all rows that "
+          "are not received and the grouped GEMM rows past the last expert "
+          "group, in the forward and backward passes. Only masked gathers "
+          "read those rows, so results are unchanged."
+      ),
+  )
+  jax_aiter_mxfp4_gathered_quant: bool = Field(
+      False,
+      description=(
+          "With dedup dispatch, quantize the gate/up GEMM input, in both "
+          "passes, straight from the received rows instead of from their "
+          "padded copy, which then never forms. Results are unchanged."
+      ),
+  )
+  jax_aiter_mxfp4_dual_grad_cast: bool = Field(
+      False,
+      description=(
+          "Quantize each MXFP4 GEMM output gradient for the input and weight "
+          "gradients with one fused Primus-Turbo dual cast instead of two "
+          "casts. Results are unchanged."
+      ),
+  )
+  jax_aiter_mxfp4_dedup_deepep: bool = Field(
+      False,
+      description=(
+          "With dedup dispatch, exchange tokens with Primus-Turbo intranode "
+          "DeepEP dispatch and combine instead of ragged all-to-all. The "
+          "expert axis must be exactly each process's GPUs."
+      ),
+  )
+  jax_aiter_mxfp4_linear_roles: list[
+      Literal[
+          "attention_wo",
+          "attention_wq_a",
+          "attention_wq_b",
+          "mlp_up",
+          "mlp_down",
+      ]
+  ] = Field(
+      default_factory=list,
+      description=(
+          "Dense linear roles that use the JAX-AITER E=1 whole-loop MXFP4 "
+          "training path. Empty keeps every non-routed-expert linear unchanged."
+      ),
+  )
   wi_tile_fwd_batch_seq: int = Field(
       512,
       description="forward pass tiling dimension for batch/sequence in GMM for wi.",
@@ -1676,6 +1803,10 @@ class DeepSeekMoE(BaseModel):
       description="Append to every training step's log line: pre-clip and post-clip global grad norm, param norm,"
       " max |grad|, the routed-bias checksum (sum over MoE layers of sum(bias)), the number of nonzero routed-bias"
       " update entries and the MoE overflow flag.",
+  )
+  routed_bias_zero_mean_update: bool = Field(
+      False,
+      description="Subtract the mean correction-bias update, matching the TorchTitan router update.",
   )
   mlp_bias: bool = Field(
       False,
@@ -2042,6 +2173,13 @@ class LayoutAndSharding(BaseModel):
           "unchanged -- only kernels are touched, and every consumer already casts them to config.dtype."
       ),
   )
+  dense_retain_gathered_weights: bool = Field(
+      False,
+      description=(
+          "Save data-parallel-gathered dense weights across rematerialized "
+          "forward/backward, analogous to FSDP reshard_after_forward=never."
+      ),
+  )
   internal_compile: bool = Field(
       False,
       description="Use internal_compile to bypass open-source topology mappings.",
@@ -2199,6 +2337,18 @@ class RematAndOffload(BaseModel):
   moe_mlpwo: RematLocation = Field(
       RematLocation.REMAT,
       description="Remat policy for the second MoE layer's output.",
+  )
+  moe_gathered_weight: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for the forward-layout MXFP4 expert weights gathered over FSDP.",
+  )
+  moe_gathered_wo_bwd: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for the input-gradient-layout MXFP4 down weight gathered over FSDP.",
+  )
+  gathered_weight: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for dense kernels gathered by dense_retain_gathered_weights.",
   )
   query_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the query projection.")
   key_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the key projection.")
@@ -5057,6 +5207,9 @@ class MaxTextConfig(
           "moe_mlpwi_1",
           "moe_mlpwo",
           "te_moe_dispatch_remat_location",
+          "moe_gathered_weight",
+          "moe_gathered_wo_bwd",
+          "gathered_weight",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",
@@ -6725,6 +6878,9 @@ class RLConfig(
           "moe_mlpwi_1",
           "moe_mlpwo",
           "te_moe_dispatch_remat_location",
+          "moe_gathered_weight",
+          "moe_gathered_wo_bwd",
+          "gathered_weight",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",

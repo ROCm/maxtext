@@ -677,6 +677,8 @@ class MLA(Attention):
           matmul_precision=self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
           weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
+          mesh=self.mesh,
+          retain_gathered_weight=self.config.dense_retain_gathered_weights,
           rngs=self.rngs,
       )
     else:
@@ -693,6 +695,10 @@ class MLA(Attention):
           matmul_precision=self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
           weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
+          mesh=self.mesh,
+          retain_gathered_weight=self.config.dense_retain_gathered_weights,
+          use_jax_aiter_mxfp4=("attention_wq_a" in self.config.jax_aiter_mxfp4_linear_roles),
+          jax_aiter_mxfp4_dual_grad_cast=self.config.jax_aiter_mxfp4_dual_grad_cast,
           rngs=self.rngs,
       )
       self.q_norm = RMSNorm(
@@ -715,6 +721,10 @@ class MLA(Attention):
           matmul_precision=self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
           weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
+          mesh=self.mesh,
+          retain_gathered_weight=self.config.dense_retain_gathered_weights,
+          use_jax_aiter_mxfp4=("attention_wq_b" in self.config.jax_aiter_mxfp4_linear_roles),
+          jax_aiter_mxfp4_dual_grad_cast=self.config.jax_aiter_mxfp4_dual_grad_cast,
           rngs=self.rngs,
       )
 
@@ -731,6 +741,8 @@ class MLA(Attention):
         matmul_precision=self.config.matmul_precision,
         shard_mode=self.config.shard_mode,
         weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
+        mesh=self.mesh,
+        retain_gathered_weight=self.config.dense_retain_gathered_weights,
         rngs=self.rngs,
     )
     self.kv_norm = RMSNorm(
@@ -756,6 +768,8 @@ class MLA(Attention):
         matmul_precision=self.config.matmul_precision,
         shard_mode=self.config.shard_mode,
         weight_grad_in_kernel_order=self.config.dense_weight_grad_in_kernel_order,
+        mesh=self.mesh,
+        retain_gathered_weight=self.config.dense_retain_gathered_weights,
         rngs=self.rngs,
     )
 

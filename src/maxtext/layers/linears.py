@@ -44,6 +44,9 @@ from maxtext.utils.sharding import FSDP_MESH_AXES
 from maxtext.utils.sharding import truncate_out_sharding
 
 
+_DENSE_BATCH_MESH_AXES = ("data", "fsdp", "fsdp_transpose", "expert")
+
+
 def _convert_to_activation_function(fn_or_string: str | Callable[..., Any]) -> Callable[..., Any]:
   """Convert a string to an activation function."""
   if fn_or_string == "linear":
@@ -235,6 +238,7 @@ class DenseGeneral(nnx.Module):
       parameter_memory_host_offload: bool = False,
       mesh: Mesh | None = None,
       use_two_stage_all_gather: bool = False,
+      retain_gathered_weight: bool = False,
       debug_sharding: bool = False,
       has_scale: bool | None = None,
       kernel_scale_init: Initializer | None = None,
@@ -244,6 +248,8 @@ class DenseGeneral(nnx.Module):
       block_size: int | tuple[int, ...] | None = None,
       weight_quant: quantizations.WeightQuantConfig | None = None,
       weight_grad_in_kernel_order: bool = False,
+      use_jax_aiter_mxfp4: bool = False,
+      jax_aiter_mxfp4_dual_grad_cast: bool = False,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -268,6 +274,8 @@ class DenseGeneral(nnx.Module):
         fsdp_transpose axes, gather the two axes with two separate all-gather
         calls (separated by an optimization barrier) to avoid the relayout
         transpose XLA emits for a single combined 2-axis all-gather.
+      retain_gathered_weight: save the data-parallel-gathered kernel across
+        rematerialized forward/backward instead of gathering it twice.
       debug_sharding: when True, log the logical/physical sharding of the
         two-stage all-gather constraints to the sharding dump files.
       has_scale: whether to initialize a separate scale parameter (kernel_scale).
@@ -285,6 +293,9 @@ class DenseGeneral(nnx.Module):
         stored kernel, its initialization and the arithmetic are all untouched,
         so gradients are bit-identical to the default rule. Only takes effect
         under `shard_mode: explicit`; ignored when the layer is quantized.
+      use_jax_aiter_mxfp4: use the E=1 whole-loop MXFP4 training kernels.
+      jax_aiter_mxfp4_dual_grad_cast: with those kernels, quantize the output
+        gradient for both backward GEMMs with one fused cast; bit-identical.
       rngs: RNG state for initialization in nnx.
     """
     if weight_quant is not None:
@@ -309,12 +320,15 @@ class DenseGeneral(nnx.Module):
     self.parameter_memory_host_offload = parameter_memory_host_offload
     self.mesh = mesh
     self.use_two_stage_all_gather = use_two_stage_all_gather
+    self.retain_gathered_weight = retain_gathered_weight
     self.debug_sharding = debug_sharding
     self.has_scale = has_scale
     self.scale_dtype = scale_dtype
     self.block_size = block_size
     self.weight_quant = weight_quant
     self.weight_grad_in_kernel_order = weight_grad_in_kernel_order
+    self.use_jax_aiter_mxfp4 = use_jax_aiter_mxfp4
+    self.jax_aiter_mxfp4_dual_grad_cast = jax_aiter_mxfp4_dual_grad_cast
 
     # Parameter initialization
     kernel_shape = self.in_features_shape + self.out_features_shape
@@ -454,6 +468,46 @@ class DenseGeneral(nnx.Module):
     kernel = shard(kernel, stage2)
     return kernel
 
+  def _maybe_retain_gathered_weight(self, kernel):
+    """Gather data-parallel kernel shards once and save them for backward."""
+    if not self.retain_gathered_weight:
+      return kernel
+    if self.mesh is None:
+      raise ValueError("Retaining gathered dense weights requires a device mesh")
+
+    full_logical = PartitionSpec(*self.kernel_axes)
+    gathered_sharding = get_physical_spec_without_axes(
+        full_logical,
+        self.mesh,
+        _DENSE_BATCH_MESH_AXES,
+    )
+    kernel = maybe_shard_with_name(
+        kernel,
+        gathered_sharding,
+        shard_mode=self.shard_mode,
+        debug_sharding=self.debug_sharding,
+    )
+    return checkpoint_name(kernel, "gathered_weight")
+
+  def _mxfp4_gather_spec(self):
+    """Kernel sharding as `[contraction, output]` for the MXFP4 linear to gather itself.
+
+    Gathering inside its shard_map keeps the saved weight per device; a weight
+    retained outside it is resharded when scan stacks it for backward and
+    gathered again. None when the reshape would merge a non-leading sharded dim.
+    """
+    if not self.retain_gathered_weight or self.mesh is None:
+      return None
+    spec = get_physical_spec_without_axes(PartitionSpec(*self.kernel_axes), self.mesh, ()).spec
+    spec = tuple(spec) + (None,) * (len(self.kernel_axes) - len(spec))
+    n_in = len(self.in_features_shape)
+    out = []
+    for group in (spec[:n_in], spec[n_in:]):
+      if any(entry is not None for entry in group[1:]):
+        return None
+      out.append(group[0])
+    return PartitionSpec(*out)
+
   def __call__(
       self,
       inputs: Array,
@@ -529,42 +583,77 @@ class DenseGeneral(nnx.Module):
       kernel = kernel[..., begin:end]
 
     kernel = self._maybe_two_stage_all_gather(kernel)
+    mxfp4_rhs_spec = self._mxfp4_gather_spec() if self.use_jax_aiter_mxfp4 else None
+    if mxfp4_rhs_spec is None:
+      kernel = self._maybe_retain_gathered_weight(kernel)
 
     # out_sharding should be None for auto mesh axis
     if self.shard_mode != ShardMode.EXPLICIT:
       out_sharding = None
 
     contract_ind = tuple(range(0, len(self.axis)))
-    native_fp8_compute = isinstance(self.quant, quantizations.ServeFp8WeightQuantization)
-    quant_dot_general = self.quant_dot_general if slice_bounds is None else None
-    # The auto-axes region only buys anything where XLA refuses to fold the
-    # transpose away, and it has to own the whole dot to do it -- so it is off
-    # under auto sharding and under any quantized path. `self.quant` only covers
-    # AQT; weight-only fp8 leaves it None and is identified by the scale instead.
-    weight_grad_in_kernel_order = (
-        self.weight_grad_in_kernel_order
-        and self.shard_mode == ShardMode.EXPLICIT
-        and self.quant is None
-        and quant_dot_general is None
-        and kernel_scale is None
-        and not is_fp8_dtype(getattr(kernel, "dtype", None))
-    )
-    output = _compute_dot_general_nnx(
-        inputs,
-        kernel,
-        norm_axis,
-        contract_ind,
-        self.matmul_precision,
-        quant_dot_general,
-        _initializing,
-        out_sharding,
-        kernel_scale=kernel_scale,
-        compute_dtype=self.dtype,
-        native_fp8_compute=native_fp8_compute,
-        scale_block_size=self.block_size,
-        act_calibration_method=self.quant.act_calibration_method if native_fp8_compute else "absmax",
-        weight_grad_in_kernel_order=weight_grad_in_kernel_order,
-    )
+    if self.use_jax_aiter_mxfp4:
+      if self.quant_dot_general is not None or kernel_scale is not None or slice_bounds is not None:
+        raise ValueError("JAX-AITER MXFP4 DenseGeneral cannot be combined with another quantizer or slice_bounds")
+      if self.mesh is None:
+        raise ValueError("JAX-AITER MXFP4 DenseGeneral requires a device mesh")
+      trailing_axes = tuple(range(inputs.ndim - len(norm_axis), inputs.ndim))
+      if norm_axis != trailing_axes:
+        raise ValueError(
+            "JAX-AITER MXFP4 DenseGeneral requires trailing contraction axes; "
+            f"got axes {norm_axis} for rank {inputs.ndim}"
+        )
+
+      from maxtext.kernels import jax_aiter_mxfp4  # pylint: disable=import-outside-toplevel
+
+      leading_shape = inputs.shape[: inputs.ndim - len(norm_axis)]
+      contraction = int(np.prod(self.in_features_shape))
+      output_features = int(np.prod(self.out_features_shape))
+      matrix_inputs = inputs.reshape((-1, contraction))
+      matrix_kernel = kernel.reshape((contraction, output_features))
+      output = jax_aiter_mxfp4.dense_linear(
+          matrix_inputs,
+          matrix_kernel,
+          self.mesh,
+          rhs_spec=mxfp4_rhs_spec,
+          dual_grad_cast=self.jax_aiter_mxfp4_dual_grad_cast,
+      ).reshape(leading_shape + self.out_features_shape)
+      # Match Torch's selective-AC save rule for E=1 grouped GEMMs.  Without
+      # this name the MLA wq_a forward is replayed during backward remat.
+      output = checkpoint_name(output, "mxfp4_linear")
+      if out_sharding is not None:
+        output = jax.lax.with_sharding_constraint(output, out_sharding)
+    else:
+      native_fp8_compute = isinstance(self.quant, quantizations.ServeFp8WeightQuantization)
+      quant_dot_general = self.quant_dot_general if slice_bounds is None else None
+      # The auto-axes region only buys anything where XLA refuses to fold the
+      # transpose away, and it has to own the whole dot to do it -- so it is off
+      # under auto sharding and under any quantized path. `self.quant` only covers
+      # AQT; weight-only fp8 leaves it None and is identified by the scale instead.
+      weight_grad_in_kernel_order = (
+          self.weight_grad_in_kernel_order
+          and self.shard_mode == ShardMode.EXPLICIT
+          and self.quant is None
+          and quant_dot_general is None
+          and kernel_scale is None
+          and not is_fp8_dtype(getattr(kernel, "dtype", None))
+      )
+      output = _compute_dot_general_nnx(
+          inputs,
+          kernel,
+          norm_axis,
+          contract_ind,
+          self.matmul_precision,
+          quant_dot_general,
+          _initializing,
+          out_sharding,
+          kernel_scale=kernel_scale,
+          compute_dtype=self.dtype,
+          native_fp8_compute=native_fp8_compute,
+          scale_block_size=self.block_size,
+          act_calibration_method=self.quant.act_calibration_method if native_fp8_compute else "absmax",
+          weight_grad_in_kernel_order=weight_grad_in_kernel_order,
+      )
 
     if self.bias is not None:
       bias = jnp.asarray(self.bias[...], self.dtype)
@@ -668,6 +757,7 @@ class MlpBlock(nnx.Module):
     self.use_pre_norm = use_pre_norm
     self.quant = quant
     self.model_mode = model_mode
+    self.mxfp4_linear_roles = frozenset(self.config.jax_aiter_mxfp4_linear_roles)
 
     if self.use_pre_norm:
       self.mlp_layer_norm = self.get_norm_layer(num_features=in_features)(
@@ -703,9 +793,11 @@ class MlpBlock(nnx.Module):
           matmul_precision=self.config.matmul_precision,
           mesh=self.mesh,
           use_two_stage_all_gather=self.config.dense_fsdp_use_two_stage_all_gather,
+          retain_gathered_weight=self.config.dense_retain_gathered_weights,
           debug_sharding=self.config.debug_sharding,
           block_size=block_size,
           weight_quant=weight_quant,
+          use_jax_aiter_mxfp4=False,
           rngs=rngs,
       )
     else:
@@ -725,9 +817,12 @@ class MlpBlock(nnx.Module):
             matmul_precision=self.config.matmul_precision,
             mesh=self.mesh,
             use_two_stage_all_gather=self.config.dense_fsdp_use_two_stage_all_gather,
+            retain_gathered_weight=self.config.dense_retain_gathered_weights,
             debug_sharding=self.config.debug_sharding,
             block_size=block_size,
             weight_quant=weight_quant,
+            use_jax_aiter_mxfp4="mlp_up" in self.mxfp4_linear_roles,
+            jax_aiter_mxfp4_dual_grad_cast=self.config.jax_aiter_mxfp4_dual_grad_cast,
             rngs=rngs,
         )
         setattr(self, dense_name, module)
@@ -746,9 +841,12 @@ class MlpBlock(nnx.Module):
         matmul_precision=self.config.matmul_precision,
         mesh=self.mesh,
         use_two_stage_all_gather=self.config.dense_fsdp_use_two_stage_all_gather,
+        retain_gathered_weight=self.config.dense_retain_gathered_weights,
         debug_sharding=self.config.debug_sharding,
         block_size=block_size,
         weight_quant=weight_quant,
+        use_jax_aiter_mxfp4="mlp_down" in self.mxfp4_linear_roles,
+        jax_aiter_mxfp4_dual_grad_cast=self.config.jax_aiter_mxfp4_dual_grad_cast,
         rngs=rngs,
     )
 
