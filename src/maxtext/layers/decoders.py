@@ -31,6 +31,7 @@ from maxtext.common.common_types import Config, DecoderBlockType, ShardMode
 from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_PREFILL, MODEL_MODE_TRAIN
 from maxtext.layers import linears
 from maxtext.layers import mhc
+from maxtext.layers import moe_remat_names
 from maxtext.layers import normalizations
 from maxtext.layers import pipeline
 from maxtext.layers.nnx_decoders import NNXDecoderLayer, NNXSequentialPipelineStage, NNXScannedPipelineStage
@@ -323,7 +324,7 @@ class Decoder(nn.Module):
           config=self.config, layers=build_pipeline_stage_layers, mesh=self.mesh, remat_policy=remat_policy
       )
 
-  def minimal_policy(self, with_context=False, with_quantization=False):
+  def minimal_policy(self, with_context=False, with_quantization=False, with_moe_io=False, with_moe_routing=False):
     """Helper for creating minimal checkpoint policies."""
     names = [
         "query_proj",
@@ -341,6 +342,10 @@ class Decoder(nn.Module):
       names.append("context")
     if with_quantization:
       names.append("quantization")
+    if with_moe_io:
+      names.extend(moe_remat_names.MOE_IO_NAMES)
+    if with_moe_routing:
+      names.extend(moe_remat_names.MOE_ROUTING_NAMES)
     return jax.checkpoint_policies.save_only_these_names(*names)
 
   def get_remat_policy(self):
@@ -354,6 +359,10 @@ class Decoder(nn.Module):
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
         policy = self.minimal_policy(with_context=True)
+      elif cfg.remat_policy == "minimal_with_context_moe":
+        policy = self.minimal_policy(with_context=True, with_moe_io=True)
+      elif cfg.remat_policy == "minimal_with_context_moe_routing":
+        policy = self.minimal_policy(with_context=True, with_moe_io=True, with_moe_routing=True)
       elif cfg.remat_policy == "minimal":
         # save all except context
         policy = self.minimal_policy()

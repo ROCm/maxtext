@@ -38,7 +38,7 @@ from maxtext.common.common_types import (
     ShardMode,
 )
 from maxtext.configs.types import check_forced_routing_support
-from maxtext.layers import initializers, linears, mhc, moe, normalizations, quantizations
+from maxtext.layers import initializers, linears, mhc, moe, moe_remat_names, normalizations, quantizations
 from maxtext.layers import nnx_scan, nnx_wrappers
 from maxtext.layers.attentions import Attention
 from maxtext.layers.embeddings import Embed, PositionalEmbedding, attend_on_embedding
@@ -1199,7 +1199,7 @@ class NNXDecoder(nnx.Module):
 
     return layer_map[cfg.decoder_block]
 
-  def minimal_policy(self, with_context=False, with_quantization=False):
+  def minimal_policy(self, with_context=False, with_quantization=False, with_moe_io=False, with_moe_routing=False):
     """Helper for creating minimal checkpoint policies."""
     names = [
         "query_proj",
@@ -1217,6 +1217,10 @@ class NNXDecoder(nnx.Module):
       names.append("context")
     if with_quantization:
       names.append("quantization")
+    if with_moe_io:
+      names.extend(moe_remat_names.MOE_IO_NAMES)
+    if with_moe_routing:
+      names.extend(moe_remat_names.MOE_ROUTING_NAMES)
     return jax.checkpoint_policies.save_only_these_names(*names)
 
   def get_remat_policy(self):
@@ -1228,6 +1232,10 @@ class NNXDecoder(nnx.Module):
         if cfg.remat_policy == "minimal_flash":
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
         policy = self.minimal_policy(with_context=True)
+      elif cfg.remat_policy == "minimal_with_context_moe":
+        policy = self.minimal_policy(with_context=True, with_moe_io=True)
+      elif cfg.remat_policy == "minimal_with_context_moe_routing":
+        policy = self.minimal_policy(with_context=True, with_moe_io=True, with_moe_routing=True)
       elif cfg.remat_policy == "minimal":
         policy = self.minimal_policy()
       elif cfg.remat_policy == "minimal_with_quantization":
