@@ -557,6 +557,8 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         shard_mode=cfg.shard_mode,
         block_size=block_size,
         quant=get_quant(cfg, "in_proj_qkvz", self.quant),
+        mesh=self.mesh,
+        retain_gathered_weight=cfg.dense_retain_gathered_weights,
         rngs=rngs,
     )
     self.in_proj_ba = DenseGeneral(
@@ -568,6 +570,8 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         matmul_precision=cfg.matmul_precision,
         shard_mode=cfg.shard_mode,
         quant=get_quant(cfg, "in_proj_ba", self.quant),
+        mesh=self.mesh,
+        retain_gathered_weight=cfg.dense_retain_gathered_weights,
         rngs=rngs,
     )
 
@@ -618,6 +622,8 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         shard_mode=cfg.shard_mode,
         block_size=block_size,
         quant=get_quant(cfg, "out_proj", self.quant),
+        mesh=self.mesh,
+        retain_gathered_weight=cfg.dense_retain_gathered_weights,
         rngs=rngs,
     )
 
