@@ -2480,7 +2480,8 @@ class AttentionOp(nnx.Module):
     """Causal attention through the FlyDSL gfx950 flash kernels (`jax_flydsl.ops.flash_attn`).
 
     Handles MLA's separate value width (Q/K 192, V 128) in both directions. Full rows only: synthetic data or no
-    segment ids. MaxText pre-scales the query, so the kernel's softmax scale is 1.0.
+    segment ids, or unpacked rows (right-padded); packed documents go through `_flydsl_flash_packed`.
+    MaxText pre-scales the query, so the kernel's softmax scale is 1.0.
     """
     from jax_flydsl.ops.flash_attn import flash_attn  # pylint: disable=import-outside-toplevel
 
@@ -2496,15 +2497,10 @@ class AttentionOp(nnx.Module):
       raise NotImplementedError("attention=flydsl_flash does not implement attention dropout.")
     if self.mesh.shape[self.config.context_sharding] > 1:
       raise NotImplementedError("attention=flydsl_flash does not support context parallelism.")
-    if decoder_segment_ids is not None and self.config.dataset_type != "synthetic":
-      raise NotImplementedError("attention=flydsl_flash has no packed-document path yet; use synthetic data.")
-
-    batch_axes = tuple(
-        axis
-        for axis in ("data", "fsdp", "fsdp_transpose", "expert")
-        if axis in self.mesh.axis_names and self.mesh.shape[axis] > 1
-    )
-    spec = jax.sharding.PartitionSpec(batch_axes, None, None, None)
+    # Unpacked rows are right-padded, so plain causal attention is exact for the real tokens.
+    if decoder_segment_ids is not None and self.config.dataset_type != "synthetic" and self.config.packing:
+      return self._flydsl_flash_packed(query, key, value, decoder_segment_ids)
+    spec = jax.sharding.PartitionSpec(self._flydsl_batch_axes(), None, None, None)
     return jax.shard_map(
         functools.partial(flash_attn, scale=1.0),
         mesh=self.mesh,
@@ -2512,6 +2508,52 @@ class AttentionOp(nnx.Module):
         out_specs=spec,
         check_vma=False,
     )(query, key, value)
+
+  def _flydsl_batch_axes(self):
+    """Mesh axes the batch is sharded over, for the shard_map around the FlyDSL attention kernels."""
+    return tuple(
+        axis
+        for axis in ("data", "fsdp", "fsdp_transpose", "expert")
+        if axis in self.mesh.axis_names and self.mesh.shape[axis] > 1
+    )
+
+  def _flydsl_flash_packed(self, query, key, value, decoder_segment_ids):
+    """Packed documents: each device's rows become one token stream with a boundary at every id change.
+
+    Padding (id 0) is its own run, so the offsets stay tight and the padded tokens attend only among
+    themselves; their outputs are masked out of the loss.
+    """
+    from jax_flydsl.ops.flash_attn import causal_flash_attn_varlen  # pylint: disable=import-outside-toplevel
+
+    max_segments = int(self.config.max_segments_per_seq)
+    if max_segments <= 0:
+      raise ValueError("attention=flydsl_flash with packing requires max_segments_per_seq > 0.")
+    batch_axes = self._flydsl_batch_axes()
+    spec = jax.sharding.PartitionSpec(batch_axes, None, None, None)
+
+    def local(q, k, v, sid):
+      batch, seq_len = sid.shape
+      total = batch * seq_len
+      flat = sid.reshape(-1)
+      row_start = jnp.arange(total) % seq_len == 0
+      starts = row_start | jnp.concatenate([jnp.ones((1,), bool), flat[1:] != flat[:-1]])
+      # shortcut: each row is assumed to hold at most max_segments documents (the packer caps them at the same value),
+      # so a row has at most max_segments + 1 runs with padding; extra runs would merge into the last slot and
+      # attention would cross documents. Upgrade if segment ids can come from a source that does not cap them.
+      n_runs = batch * (max_segments + 1)
+      first = jnp.nonzero(starts, size=n_runs, fill_value=total)[0]
+      cu_seqlens = jnp.concatenate([first, jnp.full((1,), total)]).astype(jnp.int32)
+      flat_qkv = [x.reshape(total, *x.shape[2:]) for x in (q, k, v)]
+      out = causal_flash_attn_varlen(*flat_qkv, cu_seqlens, seq_len, scale=1.0)
+      return out.reshape(batch, seq_len, *out.shape[1:])
+
+    return jax.shard_map(
+        local,
+        mesh=self.mesh,
+        in_specs=(spec, spec, spec, jax.sharding.PartitionSpec(batch_axes, None)),
+        out_specs=spec,
+        check_vma=False,
+    )(query, key, value, decoder_segment_ids)
 
   def cudnn_jax_flash_attention(
       self,
