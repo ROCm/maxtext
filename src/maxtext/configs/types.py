@@ -1096,6 +1096,25 @@ class MoEKernels(BaseModel):
       "Requires sparse_matmul=True, expert_parallelism > 1, bfloat16 activations, "
       "and ici_expert_parallelism == jax.local_device_count(). Requires primus_turbo (DeepEP).",
   )
+  use_deepep_dedup_receive: bool = Field(
+      False,
+      description="With use_turbo_deepep_dispatch, feed the expert GEMMs from fixed-capacity expert tiers built "
+      "from the received rows instead of a top_k-fold fan-out of the worst-case receive buffer. The tier capacity "
+      "follows ragged_buffer_factor; assignments past it are dropped. Router weights multiply the down-projection "
+      "input instead of its output, and each GPU sums a token's expert outputs before the combine. "
+      "Requires use_flydsl_moe and mlp_bias=False.",
+  )
+  check_deepep_dedup_drops: bool = Field(
+      False,
+      description="With use_deepep_dedup_receive, stop the run (a host callback raises) as soon as any received "
+      "assignment does not fit the expert tier, instead of silently dropping it. Use it to prove a run is dropless.",
+  )
+  use_deepep_dedup_dropless_tiers: bool = Field(
+      False,
+      description="With use_deepep_dedup_receive, assignments past the primary expert tier run in extra tiers of the same "
+      "size (a loop that executes only as many as the load needs), so nothing is dropped whatever the router imbalance. "
+      "Requires ici/dcn tensor parallelism 1: the loop holds no collectives, so GPUs may run different trip counts.",
+  )
   wi_tile_fwd_batch_seq: int = Field(
       512,
       description="forward pass tiling dimension for batch/sequence in GMM for wi.",
@@ -1165,6 +1184,14 @@ class DeepSeekMoE(BaseModel):
   routed_score_func: str = Field("", description="Scoring function for routing (e.g., 'softmax', 'sigmoid').")
   routed_bias: bool = Field(False, description="Whether to add a bias term for routing.")
   routed_bias_update_rate: float = Field(0.0, description="Update rate applied to the router bias term.")
+  routed_bias_zero_mean_update: bool = Field(
+      False,
+      description="Subtract the mean correction-bias update, matching the TorchTitan router update.",
+  )
+  routed_bias_dtype: str = Field(
+      "",
+      description="Storage dtype of the router correction bias (e.g. 'float32'); empty uses weight_dtype.",
+  )
   log_moe_bias_norms: bool = Field(False, description="Whether to log the norms of MoE router biases.")
   mlp_bias: bool = Field(
       False,
@@ -4178,6 +4205,20 @@ class MaxTextConfig(
           raise ValueError(
               "use_turbo_deepep_dispatch requires the primus_turbo package with DeepEP JAX bindings."
           ) from e
+      if self.use_deepep_dedup_receive:
+        if not self.use_turbo_deepep_dispatch:
+          raise ValueError("use_deepep_dedup_receive requires use_turbo_deepep_dispatch=True.")
+        if not self.use_flydsl_moe:
+          raise ValueError("use_deepep_dedup_receive requires use_flydsl_moe=True.")
+        if self.mlp_bias:
+          raise ValueError("use_deepep_dedup_receive does not support mlp_bias (the bias would need the router weight).")
+      if self.use_deepep_dedup_dropless_tiers:
+        if not self.use_deepep_dedup_receive:
+          raise ValueError("use_deepep_dedup_dropless_tiers requires use_deepep_dedup_receive=True.")
+        if self.ici_tensor_parallelism * self.dcn_tensor_parallelism > 1:
+          raise ValueError("use_deepep_dedup_dropless_tiers requires tensor parallelism 1.")
+      if self.check_deepep_dedup_drops and not self.use_deepep_dedup_receive:
+        raise ValueError("check_deepep_dedup_drops requires use_deepep_dedup_receive=True.")
       if (
           self.routed_bias
           and self.routed_bias_update_rate > 0.0

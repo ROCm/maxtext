@@ -17,6 +17,7 @@
 
 import enum
 import functools
+import os
 import math
 import random
 from typing import Callable, Iterable, NamedTuple, Optional, Tuple, Union
@@ -34,7 +35,7 @@ from maxtext.common import common_types as ctypes
 from maxtext.common.common_types import ShardMode
 from maxtext.kernels import megablox as mblx
 from maxtext.kernels import sort_activations
-from maxtext.layers import attentions, linears, nnx_wrappers, quantizations
+from maxtext.layers import attentions, linears, moe_dedup, nnx_wrappers, quantizations
 from maxtext.layers.initializers import NdInitializer, default_bias_init, nd_dense_init, variable_to_logically_partitioned
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_sort
 from maxtext.kernels.ragged.ragged_sort import a2a_ragged_unsort
@@ -224,6 +225,38 @@ class _DeepEPCombineState(NamedTuple):
   combine_fn: Callable
 
 
+class _DeepEPRows(NamedTuple):
+  """What the router and the DeepEP dispatch hand to the expert side: the rows delivered to this GPU."""
+
+  recv_x: jax.Array  # [R, H] received rows (R = tokens * ep, the worst case; only the first `actual_num_recv` are real)
+  recv_idx: jax.Array  # [R, K] local expert id of each received slot, -1 when not on this GPU (and for unreal rows)
+  recv_weights: jax.Array  # [R, K] router weight of each received slot
+  handle: Tuple  # DeepEP layout handle, needed by the combine
+  weights: jax.Array  # the router's top-k weights
+  lb_loss: Optional[jax.Array]
+  bias_updates: Optional[jax.Array]
+
+
+def _log_deepep_dedup_drops(dropped, assignments):
+  """Host callback (MAXTEXT_DEEPEP_DEDUP_STATS=1): received assignments that did not fit the expert tier."""
+  max_logging.log(f"deepep dedup: dropped {int(dropped)} of {int(assignments)} received assignments")
+
+
+def _scale_rows(h, row_weights):
+  """`h * row_weights` in h's dtype. The product feeds an fp8 quantization (about 6% error), so one bf16 rounding is
+  negligible, and it avoids a float32 copy of the whole [rows, width] activation."""
+  return h * row_weights.astype(h.dtype)
+
+
+def _check_no_deepep_dedup_drops(dropped, assignments):
+  """Host callback (check_deepep_dedup_drops): stop the run if any received assignment did not fit the expert tier."""
+  if int(dropped):
+    raise RuntimeError(
+        f"deepep dedup dropped {int(dropped)} of {int(assignments)} received assignments: they exceed the expert tier "
+        "capacity. Raise ragged_buffer_factor, or run without check_deepep_dedup_drops to accept dropping."
+    )
+
+
 @functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
 def _deepep_dispatch_fan_out(recv_x: jax.Array, sort_idx: jax.Array, num_topk: int) -> jax.Array:
   """Fan recv_x out onto the sorted expert-dispatch layout: x[i] = recv_x[sort_idx[i] // num_topk].
@@ -322,7 +355,7 @@ def valid_expert_mask(indices, num_experts):
   return (indices >= 0) & (indices < num_experts)
 
 
-def calculate_load_balance_updates(top_k_indices, num_experts, rate):
+def calculate_load_balance_updates(top_k_indices, num_experts, rate, psum_axes=None, zero_mean=False):
   """
   Computes a bias adjustment update based on expert load.
   Used in DeepSeek V3: https://arxiv.org/html/2412.19437v1.
@@ -332,6 +365,9 @@ def calculate_load_balance_updates(top_k_indices, num_experts, rate):
       top_k_indices: Shape (batch, sequence, top_k).
       num_experts: Total number of experts.
       rate: The update rate.
+      psum_axes: Mesh axes to sum expert counts over when called inside a shard_map, so every shard
+        applies the same globally balanced update (otherwise each applies its own batch's, and one is kept).
+      zero_mean: Subtract the mean update, so the bias does not drift (TorchTitan's router update).
 
   Returns:
       update: The value to add to the expert bias. Shape (num_experts,).
@@ -340,10 +376,14 @@ def calculate_load_balance_updates(top_k_indices, num_experts, rate):
   # one_hot rather than bincount: bincount clips out-of-range values, so the -1
   # padding that forced routing uses would all be counted as expert 0.
   expert_counts = jnp.sum(jax.nn.one_hot(flat_indices, num_experts, dtype=jnp.int32), axis=0)
+  if psum_axes:
+    expert_counts = jax.lax.psum(expert_counts, psum_axes)
   total_tokens = jnp.sum(expert_counts)
   average_load = total_tokens / num_experts
   direction = jnp.sign(average_load - expert_counts)
   output = direction * rate
+  if zero_mean:
+    output = output - jnp.mean(output)
   return output
 
 
@@ -372,6 +412,7 @@ class GateLogit(nnx.Module):
       kernel_axes: Tuple[Optional[str], ...] = (),
       use_bias: bool = False,
       score_func: str = "",
+      bias_dtype: Optional[ctypes.DType] = None,
       quant: Optional[quantizations.AqtQuantization] = None,
       shard_mode: ShardMode = ShardMode.AUTO,
       matmul_precision: str = "default",
@@ -392,6 +433,7 @@ class GateLogit(nnx.Module):
         this bias aids expert load balancing (like in DeepSeek V3), and is not
         part of the loss calculation.
       score_func: Scoring function for output normalization before applying bias.
+      bias_dtype: Storage dtype of the bias; None uses weight_dtype.
       quant: The quantization configuration. If None, no quantization is applied.
       matmul_precision: The precision level for the matrix multiplication.
     """
@@ -433,12 +475,12 @@ class GateLogit(nnx.Module):
       if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
         # DeepSeek uses MoEBiasVar to naturally isolate from sequence-wise updates
         self.bias = MoEBiasVar(
-            default_bias_init(rngs.params(), bias_shape, self.weight_dtype),
+            default_bias_init(rngs.params(), bias_shape, bias_dtype or self.weight_dtype),
             out_sharding=bias_axes,
         )
       else:
         self.bias = nnx.Param(
-            default_bias_init(rngs.params(), bias_shape, self.weight_dtype),
+            default_bias_init(rngs.params(), bias_shape, bias_dtype or self.weight_dtype),
             out_sharding=bias_axes,
         )
     else:
@@ -625,6 +667,7 @@ class RoutedMoE(nnx.Module):
         matmul_precision=self.config.matmul_precision,
         shard_mode=config.shard_mode,
         rngs=self.rngs,
+        bias_dtype=jnp.dtype(self.config.routed_bias_dtype) if self.config.routed_bias_dtype else None,
     )
     rule = qpl.get_current_rule("gmm")
     sparsity_rule = None
@@ -1048,6 +1091,8 @@ class RoutedMoE(nnx.Module):
     bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
     inputs_2d = jnp.reshape(inputs, (bsz_times_seq_len, inputs_shape[2]))
     weights, selected_experts = self.get_topk(gate_logits, pre_bias_logits, rngs, input_ids, forced_routed_experts)
+    weights = adc.checkpoint_name(weights, "moe_topk_weights")
+    selected_experts = adc.checkpoint_name(selected_experts, "moe_topk_indices")
 
     lb_loss = None
     # Using pre_bias_logits ensures the router bias does not leak into the auxiliary loss gradient
@@ -1061,6 +1106,8 @@ class RoutedMoE(nnx.Module):
           selected_experts,
           self.config.num_experts,
           self.config.routed_bias_update_rate,
+          psum_axes=tuple(self.mesh.axis_names),
+          zero_mean=self.config.routed_bias_zero_mean_update,
       )
     else:
       bias_updates = None
@@ -1140,7 +1187,7 @@ class RoutedMoE(nnx.Module):
       else:
         flatten_selected_experts_safe = flatten_selected_experts
 
-      sorted_selected_experts = jnp.argsort(flatten_selected_experts_safe)
+      sorted_selected_experts = adc.checkpoint_name(jnp.argsort(flatten_selected_experts_safe), "moe_sort_order")
       if self.config.moe_use_direct_token_gather:
         sorted_inputs = _route_activations(inputs_2d, flatten_selected_experts_safe).astype(self.dtype)
       else:
@@ -1148,7 +1195,9 @@ class RoutedMoE(nnx.Module):
         sorted_inputs = _sort_activations(replicated_inputs_2d, sorted_selected_experts, use_custom_sort_vjp).astype(
             self.dtype
         )
-      group_size = jnp.bincount(flatten_selected_experts_safe, length=self.num_experts)
+      group_size = adc.checkpoint_name(
+          jnp.bincount(flatten_selected_experts_safe, length=self.num_experts), "moe_group_sizes"
+      )
 
     num_tokens = bsz_times_seq_len * self.num_experts_per_tok
     use_truncated_buffer = use_ragged_in_permute and buffer_size is not None and buffer_size < num_tokens
@@ -2062,11 +2111,15 @@ class RoutedMoE(nnx.Module):
         batch_axis = self._expert_parallelism_name if is_batch_sharded_by_expert else "data"
         # get group sizes for all shards
         local_expert_size = self.config.num_experts // num_ep
-        reshaped_group_sizes = jnp.sum(group_sizes.reshape(-1, local_expert_size), axis=1)
+        reshaped_group_sizes = adc.checkpoint_name(
+            jnp.sum(group_sizes.reshape(-1, local_expert_size), axis=1), "moe_reshaped_group_sizes"
+        )
         global_group_sizes = group_sizes
 
         if is_batch_sharded_by_expert:
-          all_shards_group_sizes = jax.lax.all_gather(reshaped_group_sizes, axis_name=batch_axis)
+          all_shards_group_sizes = adc.checkpoint_name(
+              jax.lax.all_gather(reshaped_group_sizes, axis_name=batch_axis), "moe_all_shards_group_sizes"
+          )
           buffer_size = self.get_ragged_buffer_size(
               jnp.shape(x)[0],
               num_ep,
@@ -2093,7 +2146,9 @@ class RoutedMoE(nnx.Module):
               recv_sizes,
               axis_name=self._expert_parallelism_name,
           )
-          global_group_sizes = jax.lax.all_gather(group_sizes, axis_name=self._expert_parallelism_name)
+          global_group_sizes = adc.checkpoint_name(
+              jax.lax.all_gather(group_sizes, axis_name=self._expert_parallelism_name), "moe_global_group_sizes"
+          )
           x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
               x,
               global_group_sizes,
@@ -2104,6 +2159,10 @@ class RoutedMoE(nnx.Module):
               ragged_buffer_factor=self.config.ragged_buffer_factor,
               use_single_sparsecore=self.config.ragged_sort_use_single_sparsecore,
           )
+          # Expert-sorted rows after the exchange: saving them keeps backward from replaying the all-to-all.
+          x = adc.checkpoint_name(x, "moe_dispatched")
+          local_sorted_indices = adc.checkpoint_name(local_sorted_indices, "moe_local_sort_order")
+          group_sizes = adc.checkpoint_name(group_sizes, "moe_local_group_sizes")
         else:
           x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
               x,
@@ -2139,7 +2198,7 @@ class RoutedMoE(nnx.Module):
 
     deepep_combine_state = []
 
-    def deepep_and_route(
+    def deepep_dispatch_rows(
         x,
         logits,
         pre_bias_logits,
@@ -2149,11 +2208,8 @@ class RoutedMoE(nnx.Module):
         input_ids=None,
         forced_routed_experts=None,
     ):
-      """Dispatch tokens to expert shards with Primus-Turbo DeepEP and sort them by local expert."""
-      from primus_turbo.jax.lax.moe import (  # pylint: disable=g-import-not-at-top
-          moe_combine as deepep_moe_combine,
-          moe_dispatch as deepep_moe_dispatch,
-      )
+      """Router, then DeepEP dispatch: the rows delivered to this GPU, with each row's local expert ids and weights."""
+      from primus_turbo.jax.lax.moe import moe_dispatch as deepep_moe_dispatch  # pylint: disable=g-import-not-at-top
 
       _ensure_deepep_setup(self.mesh, self.config)
       global _deepep_dispatch_logged  # pylint: disable=global-statement
@@ -2165,6 +2221,8 @@ class RoutedMoE(nnx.Module):
 
       num_tokens = x.shape[0] * x.shape[1]
       weights, selected_experts_raw = self.get_topk(logits, pre_bias_logits, rngs, input_ids, forced_routed_experts)
+      weights = adc.checkpoint_name(weights, "moe_topk_weights")
+      selected_experts_raw = adc.checkpoint_name(selected_experts_raw, "moe_topk_indices")
 
       lb_loss = None
       probs_logits = pre_bias_logits if pre_bias_logits is not None else logits
@@ -2176,7 +2234,8 @@ class RoutedMoE(nnx.Module):
             selected_experts_raw,
             self.config.num_experts,
             self.config.routed_bias_update_rate,
-            axis_names=bias_update_axis_names,
+            psum_axes=tuple(self.mesh.axis_names),
+            zero_mean=self.config.routed_bias_zero_mean_update,
         )
       else:
         bias_updates = None
@@ -2191,10 +2250,37 @@ class RoutedMoE(nnx.Module):
           num_experts=self.num_experts,
           expert_alignment=1,
       )
+      # Saving the exchange outputs keeps backward from replaying the DeepEP dispatch. recv_x (not its
+      # top_k-fold fan-out) is saved: the fan-out is a local gather and 8x larger. Names are listed in
+      # moe_remat_names.py ("moe_dispatched" means recv_x here, but the expert-sorted rows on the ragged path).
+      recv_x = adc.checkpoint_name(recv_x, "moe_dispatched")
+      recv_topk_idx = adc.checkpoint_name(recv_topk_idx, "moe_dispatched_meta")
+      recv_topk_weights = adc.checkpoint_name(recv_topk_weights, "moe_dispatched_meta")
+      deepep_handle = jax.tree_util.tree_map(lambda h: adc.checkpoint_name(h, "moe_dispatched_meta"), deepep_handle)
       rank_prefix_matrix = deepep_handle[0]
       actual_num_recv = rank_prefix_matrix[num_ep - 1, expert_shard_id]
       valid_recv_rows = jnp.arange(recv_topk_idx.shape[0]) < actual_num_recv
       recv_topk_idx = jnp.where(valid_recv_rows[:, None], recv_topk_idx, -1)
+      return _DeepEPRows(recv_x, recv_topk_idx, recv_topk_weights, deepep_handle, weights, lb_loss, bias_updates)
+
+    def deepep_and_route(
+        x,
+        logits,
+        pre_bias_logits,
+        num_ep,
+        expert_shard_id,
+        rngs,
+        input_ids=None,
+        forced_routed_experts=None,
+    ):
+      """Dispatch tokens to expert shards with Primus-Turbo DeepEP and sort them by local expert."""
+      from primus_turbo.jax.lax.moe import moe_combine as deepep_moe_combine  # pylint: disable=g-import-not-at-top
+
+      rows = deepep_dispatch_rows(
+          x, logits, pre_bias_logits, num_ep, expert_shard_id, rngs, input_ids, forced_routed_experts
+      )
+      recv_x, recv_topk_idx, recv_topk_weights, deepep_handle = rows.recv_x, rows.recv_idx, rows.recv_weights, rows.handle
+      weights, lb_loss, bias_updates = rows.weights, rows.lb_loss, rows.bias_updates
 
       local_expert_size = self.config.num_experts // num_ep
       flat_idx = recv_topk_idx.reshape(-1)
@@ -2600,6 +2686,63 @@ class RoutedMoE(nnx.Module):
       )
       return output0, output1, gmm_fn, routing, route_metadata, wo_bias
 
+    def deepep_dedup_moe(x, logits, pre_bias_logits, w0, w1, wo, rngs, input_ids, forced_routed_experts):
+      """DeepEP dispatch, expert FFN on one row per received token, DeepEP combine (use_deepep_dedup_receive)."""
+      from maxtext.integration.flydsl import moe_bridge  # pylint: disable=g-import-not-at-top
+      from primus_turbo.jax.lax.moe import moe_combine as deepep_moe_combine  # pylint: disable=g-import-not-at-top
+
+      batch_size, sequence_length, _ = x.shape
+      num_ep = self.get_expert_parallelism_size()
+      expert_shard_id = jax.lax.axis_index(self._expert_parallelism_name)
+      rows = deepep_dispatch_rows(
+          x, logits, pre_bias_logits, num_ep, expert_shard_id, rngs, input_ids, forced_routed_experts
+      )
+      capacity = self.get_ragged_buffer_size(
+          batch_size * sequence_length * self.num_experts_per_tok,
+          num_ep,
+          self.config.num_experts,
+          self.num_experts_per_tok,
+          self.config.ragged_buffer_factor,
+      )
+      clamp_limit = None
+      if (
+          self.config.decoder_block in (ctypes.DecoderBlockType.DEEPSEEK, ctypes.DecoderBlockType.DEEPSEEK4)
+          and self.config.mlp_activations_limit > 0.0
+      ):
+        clamp_limit = float(self.config.mlp_activations_limit)
+
+      def expert_fn(expert_rows, row_weights, group_sizes, *, save_residuals):
+        group_offsets = moe_bridge.group_offsets_from_sizes(group_sizes)
+        if self.config.use_flydsl_glu_epilogue:
+          activated = moe_bridge.grouped_gemm_mxfp8_glu(expert_rows, w0, group_offsets, clamp_limit)
+        else:
+          # `w1` is only read on this path; the GLU epilogue reads the packed `w0` alone.
+          output0, output1 = moe_bridge.grouped_gemm_mxfp8_gate_up(expert_rows, w0, w1, group_offsets)
+          activated = self.apply_ffn_activation(output0, output1)
+        # The router weight goes on the down-projection input: each received row is summed over its experts before the
+        # combine, so it can no longer be applied afterwards.
+        out = moe_bridge.grouped_gemm_mxfp8_experts(_scale_rows(activated, row_weights[:, None]), wo, group_offsets)
+        return adc.checkpoint_name(adc.checkpoint_name(out, "mlpwo"), "moe_mlpwo") if save_residuals else out
+
+      aggregated, dropped, assignments = moe_dedup.dedup_receive_combine(
+          rows.recv_x,
+          rows.recv_idx,
+          rows.recv_weights,
+          expert_fn,
+          num_experts=self.config.num_experts // num_ep,
+          capacity=capacity,
+          dropless=self.config.use_deepep_dedup_dropless_tiers,
+      )
+      if self.config.check_deepep_dedup_drops:
+        jax.debug.callback(_check_no_deepep_dedup_drops, dropped, assignments)
+      if os.environ.get("MAXTEXT_DEEPEP_DEDUP_STATS"):
+        jax.debug.callback(_log_deepep_dedup_drops, dropped, assignments)
+      combined = adc.checkpoint_name(
+          deepep_moe_combine(aggregated.astype(jnp.bfloat16), handle=rows.handle), "moe_combined"
+      )
+      output = combined.reshape(batch_size, sequence_length, -1).astype(self.dtype)
+      return output, rows.lb_loss, rows.bias_updates
+
     def _moe_body(
         x,
         logits,
@@ -2614,6 +2757,12 @@ class RoutedMoE(nnx.Module):
         rngs,
         forced_routed_experts=None,
     ):
+      if (
+          self.config.use_turbo_deepep_dispatch
+          and self.config.use_deepep_dedup_receive
+          and self.get_expert_parallelism_size() > 1
+      ):
+        return deepep_dedup_moe(x, logits, pre_bias_logits, w0, w1, wo, rngs, sharded_input_ids, forced_routed_experts)
       batch_size, sequence_length, embed_dim = x.shape
       # Set by the MXFP8 / TE-CK branches below and read again after the activation,
       # which is shared with the megablox path. `None` means that path is not in use.
@@ -2671,7 +2820,7 @@ class RoutedMoE(nnx.Module):
               clamp_limit = float(self.config.mlp_activations_limit)
             # w0 is the packed [G, K, 2I] parameter. w1 is the same tensor and
             # is not read on this path.
-            activated = moe_bridge.grouped_gemm_mxfp8_glu(x, w0, group_offsets, clamp_limit)
+            activated = so .grouped_gemm_mxfp8_glu(x, w0, group_offsets, clamp_limit)
           else:
             # Gate and up share one quantization of x. Each weight still quantizes
             # on its own, and the down projection below quantizes the activation.
@@ -2767,7 +2916,7 @@ class RoutedMoE(nnx.Module):
             cs.num_recv_tokens,
             float32_weight_sum=self.config.float32_weight_sum,
         )
-        combined_x = cs.combine_fn(aggregated.astype(jnp.bfloat16), handle=cs.handle)
+        combined_x = adc.checkpoint_name(cs.combine_fn(aggregated.astype(jnp.bfloat16), handle=cs.handle), "moe_combined")
         output = combined_x.reshape(batch_size, sequence_length, -1).astype(self.dtype)
         return output, routing.lb_loss, routing.bias_updates
 
@@ -2790,6 +2939,7 @@ class RoutedMoE(nnx.Module):
             output_shape,
             is_batch_sharded_by_expert,
         )
+      intermediate_output = adc.checkpoint_name(intermediate_output, "moe_combined")
 
       output = self.unpermute(
           intermediate_output,
