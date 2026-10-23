@@ -3336,6 +3336,7 @@ class RoutedMoE(nnx.Module):
       overflow_inputs = None
       overflow_local_sorted_indices = None
       overflow_group_sizes = None
+      required_rbf = None
       (
           x,
           sorted_selected_experts,
@@ -3383,6 +3384,14 @@ class RoutedMoE(nnx.Module):
               self.config.num_experts_per_tok,
               self.get_ragged_buffer_factor(),
           )
+          if getattr(self.config, "log_required_ragged_buffer_factor", False):
+            # Rows routed to this shard over the rows of a factor-1 buffer; the
+            # factor-f buffer truncates rows iff this exceeds f.
+            routed_rows = jax.lax.dynamic_slice_in_dim(
+                global_group_sizes, expert_shard_id * local_expert_size, local_expert_size, axis=1
+            )
+            required_rbf = jnp.sum(routed_rows).astype(jnp.float32) / jnp.float32(jnp.shape(x)[0])
+            required_rbf = jax.lax.pmax(required_rbf, tuple(self.mesh.axis_names))
           use_mxfp4_overflow = (
               self.config.moe_local_expert_backend == "jax_aiter_mxfp4"
               and self.config.jax_aiter_mxfp4_overflow_buffer_factor > 0.0
@@ -3562,6 +3571,7 @@ class RoutedMoE(nnx.Module):
               bias_updates=bias_updates,
               local_group_sizes=local_group_sizes,
               overflow_group_sizes=overflow_group_sizes,
+              required_rbf=required_rbf,
           ),
           RouteMetadata(
               expert_shard_id=expert_shard_id,
