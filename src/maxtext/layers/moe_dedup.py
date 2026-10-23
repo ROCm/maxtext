@@ -481,12 +481,15 @@ def exchange_params(traffic: jax.Array, shard_id, *, is_dispatch: bool):
   return input_offsets, send_sizes, output_offsets, recv_sizes
 
 
-def setup_deepep(mesh, axis_name: str) -> None:
+def setup_deepep(mesh, axis_name: str, hidden_bytes: int | None = None) -> None:
   """Bootstraps Primus-Turbo intranode DeepEP for `dedup_dispatch_combine(..., deepep=True)`.
 
-  Its kernels take their rank from the current GPU and their rank count from
-  the process's GPU count, so at every position of the other mesh axes,
-  `axis_name` must list exactly this process's GPUs in hardware order.
+  With several GPUs per process its kernels take their rank from the current
+  GPU and their rank count from the process's GPU count, so at every position
+  of the other mesh axes, `axis_name` must list exactly this process's GPUs in
+  hardware order. With one GPU per process, `axis_name` spans one process per
+  GPU and DeepEP shares buffers across them; `hidden_bytes` (row bytes) sizes
+  those buffers.
   """
   import numpy as np
   import primus_turbo.jax
@@ -494,6 +497,15 @@ def setup_deepep(mesh, axis_name: str) -> None:
 
   axis = mesh.axis_names.index(axis_name)
   devices = np.moveaxis(mesh.devices, axis, -1).reshape(-1, mesh.devices.shape[axis])
+  if jax.local_device_count() == 1 and jax.process_count() > 1:
+    if hidden_bytes is None:
+      raise ValueError("DeepEP with one GPU per process needs hidden_bytes")
+    # Larger groups take Primus-Turbo's internode path, which this has not used.
+    if devices.shape[1] > 8:
+      raise ValueError(f"DeepEP with one GPU per process supports at most 8 ranks on {axis_name!r}")
+    primus_turbo.jax.initialize()
+    deepep_moe.setup(mesh=mesh, ep_axis_name=axis_name, hidden_bytes=hidden_bytes, mode="per_process")
+    return
   me, gpus = jax.process_index(), list(range(jax.local_device_count()))
   for row in devices:
     if any(d.process_index == me for d in row) and (
