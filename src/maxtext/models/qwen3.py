@@ -380,6 +380,36 @@ def jax_chunk_gated_delta_rule(
   return o, (final_h.astype(compute_dtype) if initial_state is not None else None)
 
 
+def jax_aiter_fla_gated_delta_rule(
+    query: Array,
+    key: Array,
+    value: Array,
+    g: Array,
+    beta: Array,
+    use_qk_norm_in_gdn: bool = False,
+    compute_dtype: jnp.dtype = jnp.bfloat16,
+) -> Array:
+  """Training-only Gated Delta Rule with flash-linear-attention Triton kernels.
+
+  Query and key keep their H_k heads; FLA maps each of the H_v value heads to
+  key head ``i // (H_v // H_k)``, the same grouping as ``jnp.repeat``.
+  """
+  from jax_aiter.triton.gdn import chunk_gated_delta_rule_fla  # pytype: disable=import-error
+
+  initial_dtype = query.dtype
+  if use_qk_norm_in_gdn:
+    query = l2norm(query, dim=-1, eps=1e-6)
+    key = l2norm(key, dim=-1, eps=1e-6)
+  out = chunk_gated_delta_rule_fla(
+      query.astype(compute_dtype),
+      key.astype(compute_dtype),
+      value.astype(compute_dtype),
+      g.astype(jnp.float32),
+      beta.astype(compute_dtype),
+  )
+  return out.astype(initial_dtype)
+
+
 def causal_depthwise_conv1d(conv_input: Array, kernel: Array, out_len: int, dtype: jnp.dtype) -> Array:
   """The last `out_len` outputs of a CAUSAL depthwise `nnx.Conv` with `kernel` (K, 1, C).
 
@@ -1076,7 +1106,11 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       value = jnp.where(mask[..., None, None], value, 0.0)
       g = jnp.where(mask[..., None], g, 0.0)
 
-    if self.num_v_heads > self.num_k_heads and self.num_v_heads % self.num_k_heads == 0:
+    use_fla = cfg.gdn_kernel == "jax_aiter_fla" and model_mode == MODEL_MODE_TRAIN
+    if use_fla and gdn_context_axes(cfg):
+      raise ValueError("gdn_kernel=jax_aiter_fla does not support context parallelism.")
+
+    if not use_fla and self.num_v_heads > self.num_k_heads and self.num_v_heads % self.num_k_heads == 0:
       repeats = self.num_v_heads // self.num_k_heads
       # query shape after repeat: (B, S, H_v, D_k)
       query = jnp.repeat(query, repeats, axis=2, out_sharding=head_sharding)
@@ -1169,6 +1203,11 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
           check_vma=False,
       )
       def shard_mapped_delta_rule(q, k, v, g_val, beta_val, init_h):
+        if use_fla:
+          out = jax_aiter_fla_gated_delta_rule(
+              q, k, v, g_val, beta_val, use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn, compute_dtype=cfg.dtype
+          )
+          return out, init_h
         return jax_chunk_gated_delta_rule(
             query=q,
             key=k,
@@ -1183,6 +1222,11 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         )
 
       core_attn_out, next_recurrent_state = shard_mapped_delta_rule(query, key, value, g, beta, recurrent_state_arg)
+    elif use_fla:
+      core_attn_out = jax_aiter_fla_gated_delta_rule(
+          query, key, value, g, beta, use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn, compute_dtype=cfg.dtype
+      )
+      next_recurrent_state = recurrent_state
     else:
       core_attn_out, next_recurrent_state = jax_chunk_gated_delta_rule(
           query,

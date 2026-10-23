@@ -1902,6 +1902,14 @@ class Qwen3Next(BaseModel):
       True,
       description="Whether to apply L2 normalization to query and key tensors inside the Gated Delta Rule kernel.",
   )
+  gdn_kernel: Literal["jax", "jax_aiter_fla"] = Field(
+      "jax",
+      description=(
+          "Gated Delta Rule implementation for training: 'jax' is the chunked lax.scan; "
+          "'jax_aiter_fla' runs flash-linear-attention Triton kernels through JAX-AITER "
+          "(ROCm, equal-length sequences, no context parallelism)."
+      ),
+  )
   gdn_mamba_block_size: int = Field(
       0,
       description=(

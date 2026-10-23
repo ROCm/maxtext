@@ -1613,6 +1613,8 @@ gdn_num_value_heads: 32
 gdn_chunk_size: 64
 # Whether to apply L2 normalization to query and key tensors inside the Gated Delta Rule kernel.
 use_qk_norm_in_gdn: true
+# Gated Delta Rule training kernel: "jax" (lax.scan) or "jax_aiter_fla" (FLA Triton via JAX-AITER).
+gdn_kernel: "jax"
 # The ratio of dimension to apply ROPE on
 partial_rotary_factor: 1.0
 
