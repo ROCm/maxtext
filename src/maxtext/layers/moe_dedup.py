@@ -481,7 +481,7 @@ def exchange_params(traffic: jax.Array, shard_id, *, is_dispatch: bool):
   return input_offsets, send_sizes, output_offsets, recv_sizes
 
 
-def setup_deepep(mesh, axis_name: str, hidden_bytes: int | None = None) -> None:
+def setup_deepep(mesh, axis_name: str, hidden_bytes: int | None = None, num_sms: int = 0) -> None:
   """Bootstraps Primus-Turbo intranode DeepEP for `dedup_dispatch_combine(..., deepep=True)`.
 
   With several GPUs per process its kernels take their rank from the current
@@ -489,7 +489,8 @@ def setup_deepep(mesh, axis_name: str, hidden_bytes: int | None = None) -> None:
   of the other mesh axes, `axis_name` must list exactly this process's GPUs in
   hardware order. With one GPU per process, `axis_name` spans one process per
   GPU and DeepEP shares buffers across them; `hidden_bytes` (row bytes) sizes
-  those buffers.
+  those buffers. A positive `num_sms` sets the compute units of each dispatch
+  and combine kernel; every call in a process must pass the same value.
   """
   import numpy as np
   import primus_turbo.jax
@@ -504,7 +505,9 @@ def setup_deepep(mesh, axis_name: str, hidden_bytes: int | None = None) -> None:
     if devices.shape[1] > 8:
       raise ValueError(f"DeepEP with one GPU per process supports at most 8 ranks on {axis_name!r}")
     primus_turbo.jax.initialize()
-    deepep_moe.setup(mesh=mesh, ep_axis_name=axis_name, hidden_bytes=hidden_bytes, mode="per_process")
+    deepep_moe.setup(
+        mesh=mesh, ep_axis_name=axis_name, hidden_bytes=hidden_bytes, mode="per_process", num_sms=num_sms or None
+    )
     return
   me, gpus = jax.process_index(), list(range(jax.local_device_count()))
   for row in devices:
@@ -515,7 +518,7 @@ def setup_deepep(mesh, axis_name: str, hidden_bytes: int | None = None) -> None:
   primus_turbo.jax.initialize()
   # An explicit mode="inproc" is rejected once jax.process_count() > 1; left unset,
   # a process with several GPUs still resolves to the in-process mode.
-  deepep_moe.setup()
+  deepep_moe.setup(num_sms=num_sms or None)
 
 
 def dedup_dispatch_combine(

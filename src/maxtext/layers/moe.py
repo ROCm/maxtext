@@ -4286,7 +4286,12 @@ class RoutedMoE(nnx.Module):
           # quantizer can index.
           dropless_tier_rows = min(capacities[-1], jax_aiter_mxfp4.max_compact_capacity(embed_dim, w0.shape[0]))
         if self.config.jax_aiter_mxfp4_dedup_deepep:
-          moe_dedup.setup_deepep(self.mesh, self._expert_parallelism_name, hidden_bytes=embed_dim * 2)
+          moe_dedup.setup_deepep(
+              self.mesh,
+              self._expert_parallelism_name,
+              hidden_bytes=embed_dim * 2,
+              num_sms=self.config.jax_aiter_mxfp4_dedup_deepep_num_sms,
+          )
         output = moe_dedup.dedup_dispatch_combine(
             jnp.reshape(x, (tokens, embed_dim)).astype(self.dtype),
             jnp.reshape(selected_experts, (tokens, self.num_experts_per_tok)),

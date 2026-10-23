@@ -1686,6 +1686,13 @@ class MoEKernels(BaseModel):
           "expert axis must be exactly each process's GPUs."
       ),
   )
+  jax_aiter_mxfp4_dedup_deepep_num_sms: int = Field(
+      0,
+      description=(
+          "Compute units for each DeepEP dispatch and combine kernel. Zero "
+          "keeps Primus-Turbo's default."
+      ),
+  )
   jax_aiter_mxfp4_linear_roles: list[
       Literal[
           "attention_wo",

@@ -1225,7 +1225,9 @@ def train_loop(config, recorder, state=None, elastic_retry_cache=None):
     # setup call with the same arguments is then a no-op.
     from maxtext.layers import moe_dedup  # pylint: disable=import-outside-toplevel
 
-    moe_dedup.setup_deepep(mesh, "expert", hidden_bytes=config.emb_dim * 2)
+    moe_dedup.setup_deepep(
+        mesh, "expert", hidden_bytes=config.emb_dim * 2, num_sms=config.jax_aiter_mxfp4_dedup_deepep_num_sms
+    )
 
   start_step = get_first_step(model, state)  # this is the start_step for training
   train_utils.validate_completed_steps(start_step, config.steps)

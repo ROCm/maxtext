@@ -291,6 +291,7 @@ jax_aiter_mxfp4_dedup_skip_unread_zeroing: false # with dedup dispatch, skip zer
 jax_aiter_mxfp4_gathered_quant: false # with dedup dispatch, quantize gate/up GEMM input straight from received rows, so the padded copy never forms
 jax_aiter_mxfp4_dual_grad_cast: false # quantize each MXFP4 GEMM output gradient for the input and weight gradients with one fused Primus-Turbo dual cast; bit-identical
 jax_aiter_mxfp4_dedup_deepep: false # with dedup dispatch, Primus-Turbo intranode DeepEP dispatch/combine instead of ragged all-to-all; the expert axis must be each process's GPUs
+jax_aiter_mxfp4_dedup_deepep_num_sms: 0 # compute units per DeepEP dispatch/combine kernel; 0 keeps Primus-Turbo's default
 jax_aiter_mxfp4_linear_roles: [] # opt-in E=1 whole-loop MXFP4 dense roles: attention_wo, attention_wq_a, attention_wq_b, mlp_up, mlp_down
 capacity_factor: -1.0 # a factor to decide expert capacity for token dropping, and no dropping by default
 num_moe_token_chunks: 1 # split routed-MoE tokens into N chunks (ring-of-experts path) so each chunk's EP all-gather / reduce-scatter overlaps the previous chunk's GMM compute. 1 = disabled (identical to baseline).
