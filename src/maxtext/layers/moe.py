@@ -3050,7 +3050,7 @@ class RoutedMoE(nnx.Module):
           " (shard_embed_moe_on_fsdp + fixed weight calibration)."
       )
     use_fresh_a2a_buffers = (
-        self.config.moe_local_expert_backend == "jax_aiter_mxfp4"
+        (self.config.moe_local_expert_backend == "jax_aiter_mxfp4" or self.config.use_te_grouped_gemm)
         and self.config.jax_aiter_mxfp4_fresh_a2a_buffers
         and is_batch_sharded_by_expert
     )
@@ -4068,11 +4068,23 @@ class RoutedMoE(nnx.Module):
     ):
       batch_size, sequence_length, embed_dim = x.shape
       use_jax_aiter_mxfp4 = self.config.moe_local_expert_backend == "jax_aiter_mxfp4"
-      use_mxfp4_overflow = use_jax_aiter_mxfp4 and self.config.jax_aiter_mxfp4_overflow_buffer_factor > 0.0
-      use_mxfp4_dedup = use_jax_aiter_mxfp4 and self.config.jax_aiter_mxfp4_dedup_dispatch
+      # BF16 TE grouped GEMM experts behind the same dedup dispatch and tiers.
+      use_te_dedup = (
+          not use_jax_aiter_mxfp4 and self.config.use_te_grouped_gemm and self.config.jax_aiter_mxfp4_dedup_dispatch
+      )
+      use_mxfp4_overflow = (
+          use_jax_aiter_mxfp4 or use_te_dedup
+      ) and self.config.jax_aiter_mxfp4_overflow_buffer_factor > 0.0
+      use_mxfp4_dedup = (use_jax_aiter_mxfp4 or use_te_dedup) and self.config.jax_aiter_mxfp4_dedup_dispatch
       skip_unread_zeroing = use_mxfp4_dedup and self.config.jax_aiter_mxfp4_dedup_skip_unread_zeroing
-      if use_jax_aiter_mxfp4:
+      if use_jax_aiter_mxfp4 or use_te_dedup:
         unsupported = []
+        if use_te_dedup:
+          # TE grouped GEMM runs one process per GPU; DeepEP here needs one per host.
+          if self.config.jax_aiter_mxfp4_dedup_deepep:
+            unsupported.append("DeepEP with TE grouped GEMM")
+          if self.config.jax_aiter_mxfp4_gathered_quant:
+            unsupported.append("gathered quantization with TE grouped GEMM")
         if self.config.num_moe_emb_chunks > 0:
           unsupported.append("num_moe_emb_chunks")
         if self.config.num_moe_token_chunks > 1:
@@ -4291,7 +4303,8 @@ class RoutedMoE(nnx.Module):
             max_shards_per_token=self._dedup_shards_per_token(),
             capacities=capacities,
             check_capacity=self.config.jax_aiter_mxfp4_check_route_capacity,
-            row_layout=jax_aiter_mxfp4.expert_padding,
+            # TE grouped GEMM takes unaligned groups; the MXFP4 kernels need padded ones.
+            row_layout=None if use_te_dedup else jax_aiter_mxfp4.expert_padding,
             zero_unwritten_rows=not skip_unread_zeroing,
             dropless_tier_rows=dropless_tier_rows,
             deepep=self.config.jax_aiter_mxfp4_dedup_deepep,
