@@ -262,6 +262,35 @@ def expert_row_ids(group_sizes: jax.Array, rows: int) -> jax.Array:
   return jnp.searchsorted(ends, jnp.arange(rows, dtype=jnp.int32), side="right").astype(jnp.int32)
 
 
+@jax.custom_vjp
+def gather_expert_rows(values: jax.Array, row_ids: jax.Array) -> jax.Array:
+  """``values[row_ids]``, with zeros for the out-of-range ids of ``expert_row_ids``.
+
+  The backward sums the cotangent rows of each expert with a one-hot GEMM. The
+  gather's own transpose is a scatter-add of every row into a few expert rows,
+  which serializes on the destination rows.
+  """
+  return values.at[row_ids].get(mode="fill", fill_value=0)
+
+
+def _gather_expert_rows_fwd(values, row_ids):
+  return gather_expert_rows(values, row_ids), (values, row_ids)
+
+
+def _gather_expert_rows_bwd(res, grad):
+  values, row_ids = res
+  num_experts = values.shape[0]
+  # Out-of-range rows can carry uninitialized cotangents. Select them away
+  # before the GEMM, where a zero one-hot weight would not stop a NaN.
+  grad = jnp.where((row_ids < num_experts)[:, None], grad, jnp.zeros((), grad.dtype))
+  one_hot = jax.nn.one_hot(row_ids, num_experts, dtype=grad.dtype)
+  dvalues = jax.lax.dot_general(one_hot, grad, (((0,), (0,)), ((), ())), preferred_element_type=jnp.float32)
+  return dvalues.astype(values.dtype), None
+
+
+gather_expert_rows.defvjp(_gather_expert_rows_fwd, _gather_expert_rows_bwd)
+
+
 def _group_bounds(group_sizes: jax.Array) -> jax.Array:
   """``[0, end_0, ..., end_{E-1}]``, the whole-loop kernels' group bounds."""
   ends = jnp.cumsum(group_sizes.astype(jnp.int32), dtype=jnp.int32)

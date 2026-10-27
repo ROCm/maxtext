@@ -4215,8 +4215,8 @@ class RoutedMoE(nnx.Module):
           if self.config.mlp_bias:
             # Biases are per EP-local expert; rows are grouped by expert.
             row_experts = jax_aiter_mxfp4.expert_row_ids(padded_group_sizes, local_output0.shape[0])
-            local_output0 = local_output0 + w0_bias.at[row_experts].get(mode="fill", fill_value=0)
-            local_output1 = local_output1 + w1_bias.at[row_experts].get(mode="fill", fill_value=0)
+            local_output0 = local_output0 + jax_aiter_mxfp4.gather_expert_rows(w0_bias, row_experts)
+            local_output1 = local_output1 + jax_aiter_mxfp4.gather_expert_rows(w1_bias, row_experts)
           local_intermediate = self.apply_ffn_activation(local_output0, local_output1)
           if row_weights is not None:
             # The down projection is linear, so scaling its input equals
@@ -4233,7 +4233,7 @@ class RoutedMoE(nnx.Module):
               weight_gather_axes=wo_gather_axes,
           )
           if row_experts is not None:
-            out_bias = wo_bias.at[row_experts].get(mode="fill", fill_value=0).astype(jnp.float32)
+            out_bias = jax_aiter_mxfp4.gather_expert_rows(wo_bias, row_experts).astype(jnp.float32)
             if row_weights is not None:
               out_bias = out_bias * row_weights.astype(jnp.float32)[:, None]
             local_output = (local_output.astype(jnp.float32) + out_bias).astype(local_output.dtype)
