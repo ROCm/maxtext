@@ -306,6 +306,13 @@ def _quant_row_limit(group_sizes: jax.Array, zero_tail: bool) -> dict:
   return {"row_limit": jnp.sum(group_sizes.astype(jnp.int32))}
 
 
+def _cast_layout(lhs_rows_layout: tuple[int, int] | None) -> dict:
+  """Gather-cast keywords for ``lhs_rows_layout``; none without one, which JAX-AITER builds without ``col_layout`` accept."""
+  if lhs_rows_layout is None:
+    return {}
+  return {"col_layout": lhs_rows_layout}
+
+
 def _check_grouped_operands(lhs, rhs, group_sizes):
   if lhs.ndim != 2 or rhs.ndim != 3:
     raise ValueError(f"Expected lhs[M,K] and rhs[E,K,N], got {lhs.shape}, {rhs.shape}")
@@ -354,11 +361,14 @@ def _grouped_gmm_quantized_rhs(
     zero_tail: bool = True,
     lhs_rows: tuple[jax.Array, jax.Array] | None = None,
     lhs_quantized: tuple[jax.Array, jax.Array] | None = None,
+    lhs_rows_layout: tuple[int, int] | None = None,
 ) -> jax.Array:
   """Grouped ``lhs[M,K] @ rhs`` with rhs already in the kernel's MXFP4 ``[E, out, contraction/2]`` layout.
 
   ``lhs`` is quantized here unless ``lhs_quantized`` supplies it; ``lhs_rows``
-  quantizes gathered rows of a larger source instead of ``lhs``.
+  quantizes gathered rows of a larger source instead of ``lhs``. With
+  ``lhs_rows_layout = (segment, padded_segment)``, the source is unpadded and
+  the cast zero-pads every ``segment`` columns to ``padded_segment``.
   """
   from jax_aiter.ops.moe_mxfp4 import (
       grouped_mxfp4_fwd_da_wholeloop,
@@ -375,7 +385,7 @@ def _grouped_gmm_quantized_rhs(
   elif lhs_rows is None:
     lhs_packed, lhs_scales = quantize_mxfp4_dim0(lhs, **row_limit)
   else:
-    lhs_packed, lhs_scales = quantize_mxfp4_dim0_gather(*lhs_rows, **row_limit)
+    lhs_packed, lhs_scales = quantize_mxfp4_dim0_gather(*lhs_rows, **row_limit, **_cast_layout(lhs_rows_layout))
   return grouped_mxfp4_fwd_da_wholeloop(
       lhs_packed, rhs_packed, lhs_scales, rhs_scales, _group_bounds(group_sizes), zero_tail=zero_tail
   )
@@ -412,10 +422,12 @@ def _grouped_weight_grad(
     zero_tail: bool = True,
     lhs_rows: tuple[jax.Array, jax.Array] | None = None,
     grad_quantized: tuple[jax.Array, jax.Array] | None = None,
+    lhs_rows_layout: tuple[int, int] | None = None,
 ) -> jax.Array:
   """d(lhs @ rhs)/d rhs for lhs[M,K] and grad_output[M,N], as [E,K,N].
 
   ``grad_quantized`` is ``grad_output`` already in the dim1 cast layout.
+  ``lhs_rows_layout`` is as in :func:`_grouped_gmm_quantized_rhs`.
   """
   from jax_aiter.ops.moe_mxfp4 import (
       grouped_mxfp4_dw_wholeloop,
@@ -431,7 +443,7 @@ def _grouped_weight_grad(
   if lhs_rows is None:
     lhs_transposed, lhs_scales = quantize_mxfp4_dim1(lhs, **row_limit)
   else:
-    lhs_transposed, lhs_scales = quantize_mxfp4_dim1_gather(*lhs_rows, **row_limit)
+    lhs_transposed, lhs_scales = quantize_mxfp4_dim1_gather(*lhs_rows, **row_limit, **_cast_layout(lhs_rows_layout))
   # Raw dW is [E,N,K]; MaxText stores expert weights as [E,K,N].
   return grouped_mxfp4_dw_wholeloop(
       grad_transposed,
@@ -648,8 +660,13 @@ def _float0_zeros(shape):
 def _gathered_grouped_gmm(zero_tail: bool, dual_grad_cast: bool, layout: GatherLayout | None):
   """Grouped MXFP4 GEMM on a :class:`GatheredExpertWeight`, returning its gradient on ``grad_carrier``.
 
-  Operands and output are in the weight's padded ``layout``.
+  Operands and output are in the weight's padded ``layout``, except the
+  source of ``lhs_rows``, which stays unpadded; the gather casts pad it.
   """
+  rows_layout = None
+  if layout is not None and layout.k[0] != layout.k[1]:
+    size, padded, shards = layout.k
+    rows_layout = (size // shards, padded // shards)
 
   def forward_output(lhs, weight, group_sizes, lhs_rows):
     _check_grouped_operands(lhs, weight.grad_carrier, group_sizes)
@@ -660,6 +677,7 @@ def _gathered_grouped_gmm(zero_tail: bool, dual_grad_cast: bool, layout: GatherL
         group_sizes,
         zero_tail=zero_tail,
         lhs_rows=lhs_rows,
+        lhs_rows_layout=rows_layout,
     )
 
   @jax.custom_vjp
@@ -685,7 +703,9 @@ def _gathered_grouped_gmm(zero_tail: bool, dual_grad_cast: bool, layout: GatherL
         zero_tail=zero_tail,
         lhs_quantized=grad_rows,
     )
-    grad_rhs = _grouped_weight_grad(lhs, grad_output, group_sizes, zero_tail, lhs_rows, grad_quantized=grad_cols)
+    grad_rhs = _grouped_weight_grad(
+        lhs, grad_output, group_sizes, zero_tail, lhs_rows, grad_quantized=grad_cols, lhs_rows_layout=rows_layout
+    )
     # bwd_packed is [E, K, N/2]; the forward operand is [E, N, K/2].
     experts, k_dim, packed_n = bwd_packed.shape
     n_dim = packed_n * 2
@@ -747,8 +767,6 @@ def grouped_gmm(
     if layout is None:
       return gathered_gmm(lhs, rhs, group_sizes, lhs_rows)
     lhs = _to_layout(lhs, 1, layout.k)
-    if lhs_rows is not None:
-      lhs_rows = (_to_layout(lhs_rows[0], 1, layout.k), lhs_rows[1])
     return _from_layout(gathered_gmm(lhs, rhs, group_sizes, lhs_rows), 1, layout.n)
   _, k_dim, n_dim = rhs.shape
   k_padded = padded_feature_dim(k_dim)

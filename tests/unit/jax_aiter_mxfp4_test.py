@@ -332,25 +332,23 @@ def test_gathered_unaligned_shards_match_shard_padded_reference(shard_dim, use_l
     out = jax_aiter_mxfp4.grouped_gmm(x, full, group_sizes, lhs_rows=rows_arg(x), dual_grad_cast=True)
     return jax_aiter_mxfp4._from_layout(out, 1, layout.n)
 
-  def per_shard(x, w, g):
-    results = []
-    for reference in (False, True):
-      value, pullback = jax.vjp(functools.partial(project, reference=reference), x, w)
-      results += [value, *pullback(g)]
-    return tuple(results)
+  def per_shard(x, w, g, *, reference):
+    value, pullback = jax.vjp(functools.partial(project, reference=reference), x, w)
+    return value, *pullback(g)
 
   rows_spec = PartitionSpec("fsdp", None)
   weight_spec = PartitionSpec(None, "fsdp", None) if shard_dim == 1 else PartitionSpec(None, None, "fsdp")
-  run = jax.jit(
+  # One jit per path: in a shared jit XLA may combine both reduce-scatters, which changes their bf16 summation order.
+  run = lambda reference: jax.jit(
       jax.shard_map(
-          per_shard,
+          functools.partial(per_shard, reference=reference),
           mesh=mesh,
           in_specs=(rows_spec, weight_spec, rows_spec),
-          out_specs=(rows_spec, rows_spec, weight_spec) * 2,
+          out_specs=(rows_spec, rows_spec, weight_spec),
           check_vma=False,
       )
-  )
-  results = run(lhs, weight, cotangent)
+  )(lhs, weight, cotangent)
+  results = run(False) + run(True)
   for name, actual, expected in zip(("output", "grad_lhs", "grad_w"), results[:3], results[3:]):
     assert actual.shape == expected.shape, name
     np.testing.assert_array_equal(np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16), err_msg=name)
