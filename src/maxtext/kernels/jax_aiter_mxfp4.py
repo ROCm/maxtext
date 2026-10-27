@@ -22,7 +22,9 @@ supplies the explicit grouped-GEMM backward rule.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
+import math
 from typing import NamedTuple
 
 import jax
@@ -491,7 +493,60 @@ _GROUPED_GMM = {
 }
 
 
-class GatheredExpertWeight(NamedTuple):
+class GatherLayout(NamedTuple):
+  """Padded layout of a gathered ``[E,K,N]`` weight whose K or N the shards or kernels cannot take as is.
+
+  ``k`` and ``n`` are each ``(size, padded, shards)``: the logical size is split
+  into ``shards`` equal segments, each zero-padded at its end to
+  ``padded // shards``, a whole number of 32-wide MXFP4 blocks. An unsharded
+  dimension has one segment.
+  """
+
+  k: tuple[int, int, int]
+  n: tuple[int, int, int]
+
+
+def _gather_layout(local_shape, shard_dim: int, shards: int) -> GatherLayout | None:
+  """Layout for gathering ``shards`` local ``[E,K,N]`` slices on ``shard_dim``, or None when none is needed."""
+  dims = []
+  for dim in (1, 2):
+    dim_shards = shards if dim == shard_dim else 1
+    # Each segment holds whole blocks and the gathered size meets the kernels' K % 256.
+    alignment = math.lcm(32, _GROUP_ALIGNMENT // math.gcd(_GROUP_ALIGNMENT, dim_shards))
+    segment = -(-local_shape[dim] // alignment) * alignment
+    dims.append((local_shape[dim] * dim_shards, segment * dim_shards, dim_shards))
+  if all(size == padded for size, padded, _ in dims):
+    return None
+  return GatherLayout(*dims)
+
+
+def _to_layout(value: jax.Array, axis: int, dim: tuple[int, int, int]) -> jax.Array:
+  size, padded, shards = dim
+  if size == padded:
+    return value
+  shape = value.shape
+  value = value.reshape(shape[:axis] + (shards, size // shards) + shape[axis + 1 :])
+  value = _pad_axis(value, axis + 1, padded // shards)
+  return value.reshape(shape[:axis] + (padded,) + shape[axis + 1 :])
+
+
+def _from_layout(value: jax.Array, axis: int, dim: tuple[int, int, int]) -> jax.Array:
+  size, padded, shards = dim
+  if size == padded:
+    return value
+  shape = value.shape
+  value = value.reshape(shape[:axis] + (shards, padded // shards) + shape[axis + 1 :])
+  value = jax.lax.slice_in_dim(value, 0, size // shards, axis=axis + 1)
+  return value.reshape(shape[:axis] + (size,) + shape[axis + 1 :])
+
+
+@functools.partial(
+    jax.tree_util.register_dataclass,
+    data_fields=["fwd_packed", "fwd_scales", "bwd_packed", "bwd_scales", "grad_carrier"],
+    meta_fields=["layout"],
+)
+@dataclasses.dataclass(frozen=True)
+class GatheredExpertWeight:
   """EP-local expert weight ``[E,K,N]`` gathered as MXFP4 in both GEMM layouts.
 
   ``fwd_*`` is the forward kernel operand and ``bwd_*`` the input-gradient
@@ -499,6 +554,9 @@ class GatheredExpertWeight(NamedTuple):
   gathered weight gradient; it lets every grouped GEMM that reads this weight,
   including ones inside tier conditionals, return its gradient without a
   collective, leaving one reduce-scatter at the gather.
+
+  With a ``layout``, every field is in that padded layout and ``shape`` is the
+  logical ``[E,K,N]``.
   """
 
   fwd_packed: jax.Array
@@ -506,10 +564,16 @@ class GatheredExpertWeight(NamedTuple):
   bwd_packed: jax.Array
   bwd_scales: jax.Array
   grad_carrier: jax.Array
+  layout: GatherLayout | None = None
 
   @property
   def shape(self):
-    return self.grad_carrier.shape
+    if self.layout is None:
+      return self.grad_carrier.shape
+    return (self.grad_carrier.shape[0], self.layout.k[0], self.layout.n[0])
+
+  def _replace(self, **changes):
+    return dataclasses.replace(self, **changes)
 
 
 def _kernel_shard_axis(shard_dim: int, transpose_rhs: bool) -> int:
@@ -537,18 +601,25 @@ def _gather_expert_weight_fwd(rhs_shard, axis_name, shard_dim):
   """Forward of :func:`gather_expert_weight`; it saves no residuals."""
   if rhs_shard.ndim != 3 or rhs_shard.dtype != jnp.bfloat16:
     raise TypeError(f"Expected bfloat16 rhs[E,K,N] shard, got {rhs_shard.dtype}{rhs_shard.shape}")
-  if rhs_shard.shape[1] % 32 or rhs_shard.shape[2] % 32:
-    raise ValueError(f"MXFP4 FSDP gather needs both local weight dims divisible by 32, got {rhs_shard.shape}")
+  shards = jax.lax.axis_size(axis_name)
+  layout = _gather_layout(rhs_shard.shape, shard_dim, shards)
+  if layout is not None:
+    for axis, (_, padded, dim_shards) in ((1, layout.k), (2, layout.n)):
+      rhs_shard = _pad_axis(rhs_shard, axis, padded // dim_shards)
   fwd_packed, fwd_scales = _gather_quantized_rhs(rhs_shard, transpose_rhs=False, axis_name=axis_name, shard_dim=shard_dim)
   bwd_packed, bwd_scales = _gather_quantized_rhs(rhs_shard, transpose_rhs=True, axis_name=axis_name, shard_dim=shard_dim)
   full_shape = list(rhs_shard.shape)
-  full_shape[shard_dim] *= jax.lax.axis_size(axis_name)
+  full_shape[shard_dim] *= shards
   carrier = jnp.zeros(full_shape, rhs_shard.dtype)
-  return GatheredExpertWeight(fwd_packed, fwd_scales, bwd_packed, bwd_scales, carrier), None
+  return GatheredExpertWeight(fwd_packed, fwd_scales, bwd_packed, bwd_scales, carrier, layout), None
 
 
 def _gather_expert_weight_bwd(axis_name, shard_dim, _, cotangent):
-  return (jax.lax.psum_scatter(cotangent.grad_carrier, axis_name, scatter_dimension=shard_dim, tiled=True),)
+  grad = jax.lax.psum_scatter(cotangent.grad_carrier, axis_name, scatter_dimension=shard_dim, tiled=True)
+  if cotangent.layout is not None:
+    for axis, (size, _, dim_shards) in ((1, cotangent.layout.k), (2, cotangent.layout.n)):
+      grad = jax.lax.slice_in_dim(grad, 0, size // dim_shards, axis=axis)
+  return (grad,)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2))
@@ -558,6 +629,10 @@ def gather_expert_weight(rhs_shard: jax.Array, axis_name, shard_dim: int) -> Gat
   ``rhs_shard`` is the local ``[E,K,N]`` slice sharded over ``axis_name`` on
   ``shard_dim``. Its gradient is the sum over ``axis_name`` of the gathered
   weight gradient, reduce-scattered back to the shard.
+
+  A slice that is not whole MXFP4 blocks, or a gathered size the kernels cannot
+  take, is zero-padded per shard (:class:`GatherLayout`). MXFP4 blocks then
+  follow shard boundaries rather than running across them.
   """
   return _gather_expert_weight_fwd(rhs_shard, axis_name, shard_dim)[0]
 
@@ -569,8 +644,12 @@ def _float0_zeros(shape):
   return np.zeros(shape, dtype=jax.dtypes.float0)
 
 
-def _make_gathered_grouped_gmm(zero_tail: bool, dual_grad_cast: bool):
-  """Grouped MXFP4 GEMM on a :class:`GatheredExpertWeight`, returning its gradient on ``grad_carrier``."""
+@functools.cache
+def _gathered_grouped_gmm(zero_tail: bool, dual_grad_cast: bool, layout: GatherLayout | None):
+  """Grouped MXFP4 GEMM on a :class:`GatheredExpertWeight`, returning its gradient on ``grad_carrier``.
+
+  Operands and output are in the weight's padded ``layout``.
+  """
 
   def forward_output(lhs, weight, group_sizes, lhs_rows):
     _check_grouped_operands(lhs, weight.grad_carrier, group_sizes)
@@ -616,18 +695,12 @@ def _make_gathered_grouped_gmm(zero_tail: bool, dual_grad_cast: bool):
         _float0_zeros(bwd_packed.shape),
         _float0_zeros(bwd_scales.shape),
         grad_rhs.astype(jnp.bfloat16),
+        layout,
     )
     return grad_lhs, weight_cotangent, None, None
 
   gathered_gmm_for_kernel.defvjp(forward, backward)
   return gathered_gmm_for_kernel
-
-
-_GATHERED_GROUPED_GMM = {
-    (zero_tail, dual): _make_gathered_grouped_gmm(zero_tail, dual)
-    for zero_tail in (True, False)
-    for dual in (False, True)
-}
 
 
 def grouped_gmm(
@@ -668,13 +741,18 @@ def grouped_gmm(
   if lhs_rows is not None:
     values, row_index = lhs_rows
     lhs_rows = (jax.lax.stop_gradient(values).astype(jnp.bfloat16), row_index.astype(jnp.int32))
+  if isinstance(rhs, GatheredExpertWeight):
+    layout = rhs.layout
+    gathered_gmm = _gathered_grouped_gmm(zero_tail, dual_grad_cast, layout)
+    if layout is None:
+      return gathered_gmm(lhs, rhs, group_sizes, lhs_rows)
+    lhs = _to_layout(lhs, 1, layout.k)
+    if lhs_rows is not None:
+      lhs_rows = (_to_layout(lhs_rows[0], 1, layout.k), lhs_rows[1])
+    return _from_layout(gathered_gmm(lhs, rhs, group_sizes, lhs_rows), 1, layout.n)
   _, k_dim, n_dim = rhs.shape
   k_padded = padded_feature_dim(k_dim)
   n_padded = padded_feature_dim(n_dim)
-  if isinstance(rhs, GatheredExpertWeight):
-    if (k_padded, n_padded) != (k_dim, n_dim):
-      raise ValueError(f"MXFP4 FSDP weight gather needs kernel-aligned expert weights, got {rhs.shape}")
-    return _GATHERED_GROUPED_GMM[zero_tail, dual_grad_cast](lhs, rhs, group_sizes, lhs_rows)
   if (k_padded, n_padded) == (k_dim, n_dim):
     return _GROUPED_GMM[zero_tail, dual_grad_cast](lhs, rhs, group_sizes, lhs_rows)
   lhs = _pad_axis(lhs, 1, k_padded)

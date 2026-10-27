@@ -282,6 +282,95 @@ def test_dual_grad_cast_matches_separate_casts(projection, zero_tail):
     np.testing.assert_array_equal(np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16), err_msg=name)
 
 
+@pytest.mark.parametrize(
+    ("local_shape", "shard_dim"),
+    [
+        ((32, 896, 2048), 1),  # DeepSeek-V3 wi over 8 shards
+        ((32, 2048, 896), 2),  # DeepSeek-V3 wo
+        ((64, 512, 1024), 1),  # Qwen3.5-397B wi
+        ((64, 1024, 512), 2),  # Qwen3.5-397B wo
+    ],
+)
+def test_block_aligned_shards_gather_without_layout(local_shape, shard_dim):
+  assert jax_aiter_mxfp4._gather_layout(local_shape, shard_dim, 8) is None  # pylint: disable=protected-access
+
+
+@pytest.mark.skipif(jax.device_count() != 8, reason="requires an 8-way FSDP mesh")
+@pytest.mark.parametrize("use_lhs_rows", [False, True])
+@pytest.mark.parametrize("shard_dim", [1, 2])
+def test_gathered_unaligned_shards_match_shard_padded_reference(shard_dim, use_lhs_rows):
+  """GPT-OSS K = N = 2880 over 8 FSDP shards is 360 per shard, not whole MXFP4 blocks."""
+  # pylint: disable=protected-access
+  experts, rows, size, shards = 3, 1024, 2880, 8
+  keys = jax.random.split(jax.random.key(71), 3)
+  lhs = jax.random.normal(keys[0], (shards * rows, size), jnp.float32).astype(jnp.bfloat16)
+  weight = jax.random.normal(keys[1], (experts, size, size), jnp.float32).astype(jnp.bfloat16)
+  cotangent = jax.random.normal(keys[2], (shards * rows, size), jnp.float32).astype(jnp.bfloat16)
+  group_sizes = jnp.asarray([256, 0, 512], dtype=jnp.int32)
+  mesh = Mesh(np.asarray(jax.devices()), ("fsdp",))
+  layout = jax_aiter_mxfp4._gather_layout((experts, size // shards, size) if shard_dim == 1 else (experts, size, size // shards), shard_dim, shards)
+  assert layout == ((size, 3072, shards if shard_dim == 1 else 1), (size, 3072, shards if shard_dim == 2 else 1))
+  expected_layout = np.asarray(weight)
+  for axis, (size_, padded, dim_shards) in zip((1, 2), layout):
+    pieces = np.split(expected_layout, dim_shards, axis=axis)
+    widths = [(0, 0)] * 3
+    widths[axis] = (0, (padded - size_) // dim_shards)
+    expected_layout = np.concatenate([np.pad(piece, widths) for piece in pieces], axis=axis)
+  actual_layout = jax_aiter_mxfp4._to_layout(jax_aiter_mxfp4._to_layout(weight, 1, layout.k), 2, layout.n)
+  np.testing.assert_array_equal(np.asarray(actual_layout).view(np.uint16), expected_layout.view(np.uint16))
+
+  def project(x, w, *, reference):
+    rows_arg = lambda v: (v, jnp.arange(rows, dtype=jnp.int32)) if use_lhs_rows else None
+    if not reference:
+      gathered = jax_aiter_mxfp4.gather_expert_weight(w, "fsdp", shard_dim)
+      return jax_aiter_mxfp4.grouped_gmm(x, gathered, group_sizes, lhs_rows=rows_arg(x), dual_grad_cast=True)
+    # Padding before the gather keeps the reduce-scatter shape, and so its bf16 summation order, identical.
+    padding = [(0, 0, 0)] + [(0, (padded - size) // dim_shards, 0) for size, padded, dim_shards in layout]
+    full = jax.lax.pad(w, jnp.zeros((), w.dtype), padding)
+    full = jax.lax.all_gather(full, "fsdp", axis=shard_dim, tiled=True)
+    x = jax_aiter_mxfp4._to_layout(x, 1, layout.k)
+    out = jax_aiter_mxfp4.grouped_gmm(x, full, group_sizes, lhs_rows=rows_arg(x), dual_grad_cast=True)
+    return jax_aiter_mxfp4._from_layout(out, 1, layout.n)
+
+  def per_shard(x, w, g):
+    results = []
+    for reference in (False, True):
+      value, pullback = jax.vjp(functools.partial(project, reference=reference), x, w)
+      results += [value, *pullback(g)]
+    return tuple(results)
+
+  rows_spec = PartitionSpec("fsdp", None)
+  weight_spec = PartitionSpec(None, "fsdp", None) if shard_dim == 1 else PartitionSpec(None, None, "fsdp")
+  run = jax.jit(
+      jax.shard_map(
+          per_shard,
+          mesh=mesh,
+          in_specs=(rows_spec, weight_spec, rows_spec),
+          out_specs=(rows_spec, rows_spec, weight_spec) * 2,
+          check_vma=False,
+      )
+  )
+  results = run(lhs, weight, cotangent)
+  for name, actual, expected in zip(("output", "grad_lhs", "grad_w"), results[:3], results[3:]):
+    assert actual.shape == expected.shape, name
+    np.testing.assert_array_equal(np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16), err_msg=name)
+
+  output, grad_lhs, grad_w = (np.asarray(value, np.float32) for value in results[:3])
+  x, w, g = (np.asarray(value, np.float32) for value in (lhs, weight, cotangent))
+  local = lambda value: value.reshape(shards, rows, -1)
+  segments = ((0, slice(0, 256)), (2, slice(256, 768)))
+  checks = []
+  for e, s in segments:
+    checks.append((f"output {e}", local(output)[:, s], local(x)[:, s] @ w[e]))
+    checks.append((f"grad_lhs {e}", local(grad_lhs)[:, s], local(g)[:, s] @ w[e].T))
+    checks.append((f"grad_w {e}", grad_w[e], np.einsum("dmk,dmn->kn", local(x)[:, s], local(g)[:, s])))
+  for name, actual, expected in checks:
+    error = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+    assert error < 0.25, (name, error)
+  np.testing.assert_array_equal(local(output)[:, 768:], 0)
+  np.testing.assert_array_equal(grad_w[1], 0)
+
+
 @pytest.mark.skipif(jax.device_count() != 8, reason="requires the target EP=8 mesh")
 def test_dense_linear_ep8_sharding_and_gradients():
   rows, contraction, output = 2048, 256, 256
