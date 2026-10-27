@@ -2477,6 +2477,14 @@ class DatasetGeneral(BaseModel):
           "calls in place on one output and one set of gradients."
       ),
   )
+  cudnn_te_pad_v_head_dim: bool = Field(
+      False,
+      description=(
+          "attention=cudnn_flash_te on packed (THD) rows whose value head dim is below the query/key head dim "
+          "(DeepSeek MLA 192/128): zero-extend V to the query head dim and slice the output back, so the "
+          "backward can reach AITER's equal-head-dim group-mode kernels. Pair with NVTE_CK_IS_V3_ATOMIC_FP32=1."
+      ),
+  )
   use_stream_chunking: bool | None = Field(
       None,
       description=(

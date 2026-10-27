@@ -2880,7 +2880,12 @@ class AttentionOp(nnx.Module):
           sequence_descriptor=dummy_attn_mask,
       )
       _inject_te_softmax_offset(dpa_layer, _sinks_to_te_softmax_offset(sinks, self.num_query_heads))
-    return dpa_layer(query, key, value, sequence_descriptor=attn_mask)
+    v_head_dim = value.shape[-1]
+    pad_v = self.config.cudnn_te_pad_v_head_dim and qkv_layout == "THD_THD_THD" and v_head_dim < head_dim
+    if pad_v:
+      value = jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, head_dim - v_head_dim)))
+    out = dpa_layer(query, key, value, sequence_descriptor=attn_mask)
+    return out[..., :v_head_dim] if pad_v else out
 
   def _align_qkv_for_cudnn_flash(
       self,

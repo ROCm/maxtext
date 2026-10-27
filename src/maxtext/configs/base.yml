@@ -983,6 +983,7 @@ generate_padding_batch_eval: false
 # Set this to something like 32 for GPUs when using TransformerEngine
 max_segments_per_seq: -1
 jax_aiter_flash_varlen_buckets: 'shared' # attention=jax_aiter_flash packed MLA schedule: none, separate, shared
+cudnn_te_pad_v_head_dim: false # attention=cudnn_flash_te packed rows: zero-extend V to the QK head dim
 # Reorder packed rows across local device shards to balance quadratic attention
 # work. This preserves the global batch but can change floating-point reduction order.
 balance_packed_rows_by_attention_work: false
