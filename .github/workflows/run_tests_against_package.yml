@@ -113,7 +113,7 @@ permissions:
 jobs:
   run:
     name: ${{ inputs.flavor }}
-    runs-on: ${{ inputs.cloud_runner != '' && inputs.cloud_runner || (inputs.device_type == 'rocm' && 'amd-do-linux.jax.gpu.gfx950.4') || fromJson(format('["self-hosted", "{0}", "{1}"]', inputs.device_type, inputs.device_name)) }}
+    runs-on: ${{ inputs.cloud_runner != '' && inputs.cloud_runner || (inputs.device_type == 'rocm' && 'amd-do-linux.maxtext.gpu.gfx950.4-dpx-test') || fromJson(format('["self-hosted", "{0}", "{1}"]', inputs.device_type, inputs.device_name)) }}
     # ROCm runs its whole selection on one worker (calculate_workers.py gives rocm-* a single one), ~105-115 min.
     # 180 is temporary headroom while the post-2026-10-23 runtime is measured; bring it back down after.
     timeout-minutes: ${{ inputs.device_type == 'rocm' && 180 || 90 }}
