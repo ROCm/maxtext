@@ -202,8 +202,8 @@ jobs:
           "cpu-integration": "linux-x86-n4-32",
           "cpu-post-training-unit": "linux-x86-n4-32",
           "cpu-post-training-integration": "linux-x86-n4-32",
-          "rocm-unit": "amd-do-linux.maxtext.gpu.gfx950.4-dpx-test",
-          "rocm-decoupled": "amd-do-linux.maxtext.gpu.gfx950.4-dpx-test"
+          "rocm-unit": "amd-do-linux.maxtext.gpu.gfx950.4",
+          "rocm-decoupled": "amd-do-linux.maxtext.gpu.gfx950.4"
         }')[inputs.flavor] }}
       # Pytest Marker Mapping
       # The rocm flavors omit `not cpu_only` on purpose. conftest auto-marks every test without an
