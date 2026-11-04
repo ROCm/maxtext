@@ -12,7 +12,7 @@ permissions:
 jobs:
   build_upload_prune:
     # AMD GPU runner (GitHub-hosted large runner label).
-    runs-on: amd-do-linux.jax.gpu.gfx950.4
+    runs-on: amd-do-linux.maxtext.gpu.gfx950.4
     container:
       image: ghcr.io/rocm/jax-dev-ubu24.therock-10.1:10.1
       # Per-job GPU isolation on the shared gfx950 runners is via the podinfo env-file (mirrors
