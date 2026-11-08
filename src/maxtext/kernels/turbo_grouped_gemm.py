@@ -55,7 +55,28 @@ def _ck_gmm(fn, lhs, rhs, group_sizes):
   return jnp.where(valid, out, jnp.zeros_like(out))
 
 
-def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "ck", exact_rows: bool = False) -> jax.Array:
+def _fp8_gmm(lhs, rhs, group_sizes, backend):
+  """Per-tensor fp8 (e4m3) grouped GEMM with fp8 forward, dA and dW."""
+  import primus_turbo.jax  # pylint: disable=import-outside-toplevel
+
+  primus_turbo.jax.initialize()
+  if backend == "flydsl":
+    from primus_turbo.jax.lax import grouped_gemm_flydsl_fp8 as mod  # pylint: disable=import-outside-toplevel
+
+    fn = mod.grouped_gemm_fp8_flydsl
+  elif backend == "hipblaslt":
+    from primus_turbo.jax.lax import grouped_gemm_hipblaslt_fp8 as mod  # pylint: disable=import-outside-toplevel
+
+    fn = mod.grouped_gemm_fp8_hipblaslt
+  else:
+    raise ValueError(f"turbo_grouped_gemm_quant=fp8 needs backend flydsl or hipblaslt, got {backend!r}.")
+  if f"fp8-{backend}" not in _logged:
+    max_logging.log(f"Using primus_turbo fp8 grouped_gemm ({backend}) in MoE sparse matmul: lhs {lhs.shape}, rhs {rhs.shape}")
+    _logged.add(f"fp8-{backend}")
+  return fn(lhs, rhs, group_sizes.astype(jnp.int32))
+
+
+def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "ck", exact_rows: bool = False, quant: str = "none") -> jax.Array:
   """Grouped matmul with `jax.lax.ragged_dot` semantics.
 
   Args:
@@ -70,6 +91,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "
   """
   if backend not in BACKENDS:
     raise ValueError(f"Unknown turbo grouped GEMM backend {backend!r}; expected one of {BACKENDS}.")
+  if quant == "fp8":
+    return _fp8_gmm(lhs, rhs, group_sizes, backend)
   fn = _import(backend)
   if backend not in _logged:
     max_logging.log(f"Using primus_turbo grouped_gemm ({backend}) in MoE sparse matmul: lhs {lhs.shape}, rhs {rhs.shape}")

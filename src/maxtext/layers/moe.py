@@ -2459,6 +2459,7 @@ class RoutedMoE(nnx.Module):
             group_sizes,
             backend=self.config.turbo_grouped_gemm_backend,
             exact_rows=self.get_expert_parallelism_size() == 1,
+            quant=self.config.turbo_grouped_gemm_quant,
         )
       else:
         # jax.lax.ragged_dot
