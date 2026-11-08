@@ -1487,7 +1487,7 @@ class MoEKernels(BaseModel):
       "Requires sparse_matmul=True and megablox=False. "
       "Requires the primus_turbo package to be installed.",
   )
-  turbo_grouped_gemm_backend: Literal["ck", "hipblaslt"] = Field(
+  turbo_grouped_gemm_backend: Literal["ck", "hipblaslt", "flydsl"] = Field(
       "ck",
       description="Primus-Turbo grouped GEMM backend: 'ck' (CK grouped GEMM kernels) or 'hipblaslt' "
       "(one hipBLASLt grouped GEMM launch for all experts, group sizes stay on the device; needs a "
@@ -5342,6 +5342,8 @@ class MaxTextConfig(
       try:
         if self.turbo_grouped_gemm_backend == "hipblaslt":
           import primus_turbo.jax.lax.grouped_gemm_hipblaslt  # pylint: disable=import-outside-toplevel,unused-import
+        elif self.turbo_grouped_gemm_backend == "flydsl":
+          import primus_turbo.jax.lax.grouped_gemm_flydsl  # pylint: disable=import-outside-toplevel,unused-import
         else:
           import primus_turbo.jax.lax.grouped_gemm  # pylint: disable=import-outside-toplevel,unused-import
       except ImportError as e:

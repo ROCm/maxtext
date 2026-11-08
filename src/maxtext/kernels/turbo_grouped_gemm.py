@@ -19,7 +19,7 @@ import jax.numpy as jnp
 
 from maxtext.utils import max_logging
 
-BACKENDS = ("ck", "hipblaslt")
+BACKENDS = ("ck", "hipblaslt", "flydsl")
 
 _logged = set()
 
@@ -30,6 +30,8 @@ def _import(backend):
 
     if backend == "ck":
       from primus_turbo.jax.lax.grouped_gemm import grouped_gemm as fn  # pylint: disable=import-outside-toplevel
+    elif backend == "flydsl":
+      from primus_turbo.jax.lax.grouped_gemm_flydsl import grouped_gemm_flydsl as fn  # pylint: disable=import-outside-toplevel
     else:
       from primus_turbo.jax.lax.grouped_gemm_hipblaslt import grouped_gemm_hipblaslt as fn  # pylint: disable=import-outside-toplevel
   except ImportError as e:
@@ -76,4 +78,6 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "
     raise ValueError(f"primus_turbo grouped_gemm needs matching bf16/fp16 operands, got {lhs.dtype} and {rhs.dtype}.")
   if backend == "ck":
     return _ck_gmm(fn, lhs, rhs, group_sizes)
+  if backend == "flydsl":
+    return fn(lhs, rhs, group_sizes.astype(jnp.int32))
   return fn(lhs, rhs, group_sizes)
