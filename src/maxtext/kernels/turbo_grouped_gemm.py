@@ -55,7 +55,7 @@ def _ck_gmm(fn, lhs, rhs, group_sizes):
   return jnp.where(valid, out, jnp.zeros_like(out))
 
 
-def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "ck") -> jax.Array:
+def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "ck", exact_rows: bool = False) -> jax.Array:
   """Grouped matmul with `jax.lax.ragged_dot` semantics.
 
   Args:
@@ -79,5 +79,6 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "
   if backend == "ck":
     return _ck_gmm(fn, lhs, rhs, group_sizes)
   if backend == "flydsl":
-    return fn(lhs, rhs, group_sizes.astype(jnp.int32))
+    # exact_rows: sum(group_sizes) == m, so there are no padding rows to zero (flydsl skips a memset).
+    return fn(lhs, rhs, group_sizes.astype(jnp.int32), not exact_rows)
   return fn(lhs, rhs, group_sizes)
