@@ -88,6 +88,19 @@ class TurboGroupedGemmTest(unittest.TestCase):
   def test_hipblaslt_single_group(self):
     self._check("hipblaslt", [1000], m=1024, k=512, n=256)
 
+  def test_flydsl_balanced(self):
+    self._check("flydsl", [256] * 8, m=2048, k=256, n=512)
+
+  def test_flydsl_empty_groups_and_padding(self):
+    self._check("flydsl", [0, 300, 17, 0, 512, 1, 200, 0], m=1536, k=256, n=384)
+
+  def test_flydsl_single_group(self):
+    self._check("flydsl", [1000], m=1024, k=512, n=256)
+
+  def test_flydsl_skewed_many_groups(self):
+    sizes = [0] * 31 + [3000] + [1] * 32
+    self._check("flydsl", sizes, m=3200, k=192, n=640)
+
   def test_rejects_float32(self):
     x = jnp.zeros((16, 8), jnp.float32)
     w = jnp.zeros((2, 8, 8), jnp.float32)
