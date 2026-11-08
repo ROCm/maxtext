@@ -1487,7 +1487,7 @@ class MoEKernels(BaseModel):
       "Requires sparse_matmul=True and megablox=False. "
       "Requires the primus_turbo package to be installed.",
   )
-  turbo_grouped_gemm_quant: Literal["none", "fp8"] = Field(
+  turbo_grouped_gemm_quant: Literal["bf16", "fp8"] = Field(
       "none",
       description="Quantise the Primus-Turbo grouped GEMM operands to per-tensor float8 (e4m3): fp8 forward, dA and dW. "
       "Backends flydsl and hipblaslt on gfx950.",

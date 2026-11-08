@@ -76,7 +76,7 @@ def _fp8_gmm(lhs, rhs, group_sizes, backend):
   return fn(lhs, rhs, group_sizes.astype(jnp.int32))
 
 
-def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "ck", exact_rows: bool = False, quant: str = "none") -> jax.Array:
+def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "ck", exact_rows: bool = False, quant: str = "bf16") -> jax.Array:
   """Grouped matmul with `jax.lax.ragged_dot` semantics.
 
   Args:
