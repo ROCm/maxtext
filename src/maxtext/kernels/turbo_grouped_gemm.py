@@ -89,6 +89,9 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "
   Returns:
     [m, n] in lhs.dtype. Rows past sum(group_sizes) are zero.
   """
+  if group_sizes.shape[0] > rhs.shape[0]:
+    # ring-of-experts EP: local experts first (roll_to_expert_id), global sizes passed
+    group_sizes = group_sizes[: rhs.shape[0]]
   if backend not in BACKENDS:
     raise ValueError(f"Unknown turbo grouped GEMM backend {backend!r}; expected one of {BACKENDS}.")
   if quant == "fp8":
