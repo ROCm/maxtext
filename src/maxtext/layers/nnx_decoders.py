@@ -1272,6 +1272,7 @@ class NNXDecoder(nnx.Module):
         "mlpwi_1",
         "mlpwi",
         "mlpwo",
+        "moe_routing_maps",
     ]
     if with_context:
       names.append("context")

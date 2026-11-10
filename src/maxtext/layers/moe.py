@@ -1347,6 +1347,10 @@ class RoutedMoE(nnx.Module):
         top_k_weights = jnp.take_along_axis(router_probs, top_k_indices, axis=-1).astype(self.dtype)
       else:
         top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
+        # moe_routing_maps_topk: tagged so that the minimal* remat policies SAVE the ids instead of recomputing them (a recomputed bf16 top-k can differ from the forward's);
+        # the weights are re-gathered with the saved ids so ids and weights stay consistent
+        top_k_indices = adc.checkpoint_name(top_k_indices, "moe_routing_maps")
+        top_k_weights = jnp.take_along_axis(gate_logits, top_k_indices, axis=-1)
 
     if self.config.decoder_block in (ctypes.DecoderBlockType.DEEPSEEK, ctypes.DecoderBlockType.DEEPSEEK4):
       top_k_weights = self.deepseek_scale_weights(top_k_weights)
