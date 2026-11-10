@@ -108,3 +108,20 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "
     # exact_rows: sum(group_sizes) == m, so there are no padding rows to zero (flydsl skips a memset).
     return fn(lhs, rhs, group_sizes.astype(jnp.int32), not exact_rows)
   return fn(lhs, rhs, group_sizes)
+
+
+
+
+def gmm_window(lhs, rhs, group_sizes, group_offset, backend="ck", exact_rows=False, quant="bf16"):
+  """megablox-style group_offset: rhs holds experts [group_offset, group_offset + rhs.shape[0]) of the global group_sizes and the rows of those experts sit at
+  [sum(group_sizes[:group_offset]), ...) of lhs (ring + ragged sort). Slice the window, run the gmm, write the result back at the same rows (zeros elsewhere)."""
+  m = lhs.shape[0]
+  e_local = rhs.shape[0]
+  gs = group_sizes.astype(jnp.int32)
+  row_start = jnp.sum(jax.lax.dynamic_slice_in_dim(jnp.cumsum(gs) - gs, group_offset, 1))
+  lhs_pad = jnp.concatenate([lhs, jnp.zeros_like(lhs)], axis=0)
+  lhs_loc = jax.lax.dynamic_slice_in_dim(lhs_pad, row_start, m, axis=0)
+  gs_loc = jax.lax.dynamic_slice_in_dim(gs, group_offset, e_local)
+  out_loc = gmm(lhs_loc, rhs, gs_loc, backend, False, quant)
+  out_pad = jax.lax.dynamic_update_slice(jnp.zeros((2 * m, out_loc.shape[1]), out_loc.dtype), out_loc, (row_start, 0))
+  return out_pad[:m]
