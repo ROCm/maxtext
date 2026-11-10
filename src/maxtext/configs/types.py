@@ -5342,8 +5342,6 @@ class MaxTextConfig(
         raise ValueError("use_turbo_grouped_gemm requires use_tokamax_gmm=False.")
       if self.dtype not in (DType.BFLOAT16, DType.FLOAT16):
         raise ValueError(f"use_turbo_grouped_gemm requires dtype bfloat16 or float16, got {self.dtype}.")
-      if self.use_ring_of_experts and self.use_ragged_sort:
-        raise ValueError("use_turbo_grouped_gemm does not support use_ring_of_experts with use_ragged_sort.")
       try:
         if self.turbo_grouped_gemm_backend == "hipblaslt":
           import primus_turbo.jax.lax.grouped_gemm_hipblaslt  # pylint: disable=import-outside-toplevel,unused-import

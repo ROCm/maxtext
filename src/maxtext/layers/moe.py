@@ -2456,15 +2456,19 @@ class RoutedMoE(nnx.Module):
         )
       elif self.config.use_turbo_grouped_gemm:
         if not (isinstance(group_offset, int) and group_offset == 0):
-          raise NotImplementedError("use_turbo_grouped_gemm does not support a non-zero group_offset.")
-        output = turbo_grouped_gemm.gmm(
-            inputs,
-            kernel,
-            group_sizes,
-            backend=self.config.turbo_grouped_gemm_backend,
-            exact_rows=self.get_expert_parallelism_size() == 1,
-            quant=self.config.turbo_grouped_gemm_quant,
-        )
+          # ring-of-experts + ragged sort: rhs holds the local experts, group_sizes are global, the local rows start at sum(group_sizes[:group_offset])
+          output = turbo_grouped_gemm.gmm_window(
+              inputs, kernel, group_sizes, group_offset, backend=self.config.turbo_grouped_gemm_backend, quant=self.config.turbo_grouped_gemm_quant
+          )
+        else:
+          output = turbo_grouped_gemm.gmm(
+              inputs,
+              kernel,
+              group_sizes,
+              backend=self.config.turbo_grouped_gemm_backend,
+              exact_rows=self.get_expert_parallelism_size() == 1,
+              quant=self.config.turbo_grouped_gemm_quant,
+          )
       else:
         # jax.lax.ragged_dot
         output = jax_ragged_dot_gmm(
