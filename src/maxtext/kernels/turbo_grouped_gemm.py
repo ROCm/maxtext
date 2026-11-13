@@ -112,16 +112,21 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, backend: str = "
 
 
 
-def gmm_window(lhs, rhs, group_sizes, group_offset, backend="ck", exact_rows=False, quant="bf16"):
-  """megablox-style group_offset: rhs holds experts [group_offset, group_offset + rhs.shape[0]) of the global group_sizes and the rows of those experts sit at
-  [sum(group_sizes[:group_offset]), ...) of lhs (ring + ragged sort). Slice the window, run the gmm, write the result back at the same rows (zeros elsewhere)."""
+def window_apply(lhs, e_local, group_sizes, group_offset, run):
+  """megablox-style group_offset for any grouped matmul `run(lhs_window, group_sizes_window)`: the local experts are [group_offset, group_offset + e_local) of the
+  global group_sizes and their rows sit at [sum(group_sizes[:group_offset]), ...) of lhs (ring + ragged sort). Slice the window, run it, write the result back at the
+  same rows (zeros elsewhere)."""
   m = lhs.shape[0]
-  e_local = rhs.shape[0]
   gs = group_sizes.astype(jnp.int32)
   row_start = jnp.sum(jax.lax.dynamic_slice_in_dim(jnp.cumsum(gs) - gs, group_offset, 1))
   lhs_pad = jnp.concatenate([lhs, jnp.zeros_like(lhs)], axis=0)
   lhs_loc = jax.lax.dynamic_slice_in_dim(lhs_pad, row_start, m, axis=0)
   gs_loc = jax.lax.dynamic_slice_in_dim(gs, group_offset, e_local)
-  out_loc = gmm(lhs_loc, rhs, gs_loc, backend, False, quant)
+  out_loc = run(lhs_loc, gs_loc)
   out_pad = jax.lax.dynamic_update_slice(jnp.zeros((2 * m, out_loc.shape[1]), out_loc.dtype), out_loc, (row_start, 0))
   return out_pad[:m]
+
+
+def gmm_window(lhs, rhs, group_sizes, group_offset, backend="ck", exact_rows=False, quant="bf16"):
+  """Grouped GEMM over the local expert window (see window_apply): rhs holds experts [group_offset, group_offset + rhs.shape[0])."""
+  return window_apply(lhs, rhs.shape[0], group_sizes, group_offset, lambda l, g: gmm(l, rhs, g, backend, False, quant))

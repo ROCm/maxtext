@@ -2471,14 +2471,24 @@ class RoutedMoE(nnx.Module):
           )
       else:
         # jax.lax.ragged_dot
-        output = jax_ragged_dot_gmm(
-            inputs,
-            kernel,
-            tiling,
-            group_sizes,
-            expert_assignments,
-            padding_amount,
-        )
+        if not (isinstance(group_offset, int) and group_offset == 0):
+          # ring-of-experts + ragged sort: kernel holds the local experts only and group_sizes are global (same window as gmm_window above)
+          output = turbo_grouped_gemm.window_apply(
+              inputs,
+              kernel.shape[0],
+              group_sizes,
+              group_offset,
+              lambda lhs, gs: jax_ragged_dot_gmm(lhs, kernel, tiling, gs, expert_assignments, padding_amount),
+          )
+        else:
+          output = jax_ragged_dot_gmm(
+              inputs,
+              kernel,
+              tiling,
+              group_sizes,
+              expert_assignments,
+              padding_amount,
+          )
 
       def unpad(t):
         if padding_amount == 0:
