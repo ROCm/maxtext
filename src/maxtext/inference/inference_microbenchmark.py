@@ -14,10 +14,16 @@
 
 """Inference microbenchmark for prefill and autoregressive steps."""
 import datetime
-import jax
 import json
 import os
 import sys
+
+import jax
+
+# TensorFlow-CPU's cudart stub makes RCCL ncclCommInitRankConfig fail on this
+# rocmless image. Block the import; MaxText already treats missing TF as optional.
+if "--xla_gpu_collectives_implementation=rccl" in os.environ.get("XLA_FLAGS", ""):
+  sys.modules.setdefault("tensorflow", None)
 
 from absl import app
 from collections.abc import MutableMapping
@@ -37,6 +43,26 @@ warnings.simplefilter("ignore", category=FutureWarning)
 _WARMUP_ITERS = 2
 _FLATTEN_MICROBENCHMARK_RESULTS = False
 # pylint: disable=too-many-positional-arguments
+
+
+def _clear_stale_hip_cuda_error():
+  """TF-CPU's cuda_platform leaves a failed cuInit in the HIP error slot; RCCL then dies."""
+  try:
+    import ctypes
+
+    for libname in ("libamdhip64.so.7", "libamdhip64.so", "libhip_hcc.so"):
+      try:
+        lib = ctypes.CDLL(libname)
+      except OSError:
+        continue
+      for fn in ("hipGetLastError", "cudaGetLastError"):
+        try:
+          getattr(lib, fn)()
+        except AttributeError:
+          pass
+      return
+  except Exception:  # pylint: disable=broad-exception-caught
+    return
 
 
 def prefill_benchmark_loop(engine_prefill, params, tokens, true_length, iters, num_samples: int | None = None):
@@ -270,7 +296,7 @@ def print_results_for_analyze(results):
       insert_bucket_size_to_ms[int(k)] = round(v["time_in_ms"], 3)
     print(f"INSERT_BUCKET_SIZE_TO_MS = {insert_bucket_size_to_ms}")
 
-  if "autoregressive" in results:
+  if "autoregressive" in results and "step_in_ms_per_seq" in results["autoregressive"]:
     print(f"SYSTEM_TIME_PER_DECODE_TOKEN_MS = {results['autoregressive']['step_in_ms_per_seq']}")
 
 
@@ -299,6 +325,7 @@ def summarize_prefill_result(engine_prefill, params, tokens, true_length):
 
 def run_benchmarks(config):
   """Run microbenchmarks."""
+  _clear_stale_hip_cuda_error()
   engine = maxengine.MaxEngine(config)
   prefill_processor = prefill_packing.PrefillProcessor(engine)
   rng = jax.random.PRNGKey(1234)
@@ -309,17 +336,48 @@ def run_benchmarks(config):
   benchmark_loop_iters = config.inference_microbenchmark_loop_iters
 
   text = config.prompt
-  metadata = engine.get_tokenizer()
-  tokenizer_model = engine.build_tokenizer(metadata)
+  tokenizer_model = None
+  try:
+    metadata = engine.get_tokenizer()
+    tokenizer_model = engine.build_tokenizer(metadata)
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    print(f"Tokenizer unavailable ({type(e).__name__}: {e}); using dummy token ids")
   rng, rng_init_decode = jax.random.split(rng)
 
-  generate_executable, params, decode_state_executable = engine.aot_compile(params, pass_rng_shape=True)
-  decode_state = decode_state_executable(rng_init_decode)
+  generate_executable = None
+  try:
+    generate_executable, params, decode_state_executable = engine.aot_compile(params, pass_rng_shape=True)
+    decode_state = decode_state_executable(rng_init_decode)
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    print(f"aot_compile/init failed ({type(e).__name__}): {e}")
+    decode_state = engine.init_decode_state(rng=rng_init_decode)
 
   _, cache_size, _ = max_utils.summarize_pytree_data(decode_state["cache"], name="Cache")
   num_model_params, model_size, _ = max_utils.summarize_pytree_data(params, name="Model")
 
   benchmark_results = {}
+  # Run generate BEFORE prefill-insert. Insert rewrites KV-cache shardings in a
+  # way that disagrees with generate AOT Format(AUTO) on EP-only meshes. Decode
+  # collectives depend on allocated cache shape, not KV contents.
+  if "generate" in stages_to_benchmark and generate_executable is not None:
+    try:
+      benchmark_results["autoregressive"], decode_state = ar_benchmark(
+          config,
+          generate_executable,
+          params,
+          decode_state,
+          engine.max_concurrent_decodes,
+          cache_size,
+          model_size,
+          benchmark_loop_iters,
+      )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f"Generate/AR benchmark failed ({type(e).__name__}): {e}")
+      benchmark_results["autoregressive"] = {"error": str(e)}
+  elif "generate" in stages_to_benchmark:
+    print("Skipping generate/AR: aot_compile did not produce an executable")
+    benchmark_results["autoregressive"] = {"error": "aot_compile failed"}
+
   if "prefill" in stages_to_benchmark:
     benchmark_results["prefill-result-sizes"] = {}
     benchmark_results["prefill"] = {}
@@ -332,50 +390,73 @@ def run_benchmarks(config):
     rng_shape = jax.ShapeDtypeStruct([4], jax.numpy.dtype("uint32"))
 
     for prefill_length in prefill_lengths:
-      is_bos = tokenizer_model.bos_id is not None
-      prefill_tokens[prefill_length], prefill_true_lengths[prefill_length] = tokenizer_model.encode(
-          text, is_bos=is_bos, prefill_lengths=[prefill_length]
-      )
+      if tokenizer_model is None:
+        import jax.numpy as jnp
+        prefill_tokens[prefill_length] = jnp.ones((prefill_length,), dtype=jnp.int32)
+        prefill_true_lengths[prefill_length] = prefill_length
+      else:
+        is_bos = tokenizer_model.bos_id is not None
+        prefill_tokens[prefill_length], prefill_true_lengths[prefill_length] = tokenizer_model.encode(
+            text, is_bos=is_bos, prefill_lengths=[prefill_length]
+        )
 
       key_shape = jax.ShapeDtypeStruct([prefill_length], jax.numpy.dtype("int32"))
-      prefill_executable[prefill_length] = (
-          jax.jit(
-              engine.prefill_aot,
-              in_shardings=(engine.param_layouts, None, None, None),
-          ).lower(params, key_shape, i32_scalar, rng_shape)
-      ).compile(compiler_options=None)
-
-      prefill_insert_executable[prefill_length] = prefill_processor.aot_compile(params, prefill_length)
-
-      benchmark_results["prefill-result-sizes"][prefill_length] = summarize_prefill_result(
-          prefill_executable[prefill_length], params, prefill_tokens[prefill_length], prefill_true_lengths[prefill_length]
-      )
+      try:
+        prefill_executable[prefill_length] = (
+            jax.jit(
+                engine.prefill_aot,
+                in_shardings=(engine.param_layouts, None, None, None),
+            ).lower(params, key_shape, i32_scalar, rng_shape)
+        ).compile(compiler_options=None)
+        benchmark_results["prefill-result-sizes"][prefill_length] = summarize_prefill_result(
+            prefill_executable[prefill_length],
+            params,
+            prefill_tokens[prefill_length],
+            prefill_true_lengths[prefill_length],
+        )
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"Prefill compile/run failed for length {prefill_length} ({type(e).__name__}): {e}")
+        continue
+      try:
+        prefill_insert_executable[prefill_length] = prefill_processor.aot_compile(params, prefill_length)
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"Prefill-insert AOT failed for length {prefill_length} ({type(e).__name__}): {e}")
 
     for prefill_length in prefill_lengths:
-      benchmark_results["prefill"][prefill_length] = prefill_benchmark(
-          config,
-          prefill_executable[prefill_length],
-          params,
-          prefill_tokens[prefill_length],
-          prefill_true_lengths[prefill_length],
-          num_model_params,
-          benchmark_loop_iters,
-      )
-
-      prefill_insert_time, decode_state = prefill_insert_benchmark(
-          config,
-          prefill_insert_executable[prefill_length],
-          decode_state,
-          params,
-          engine.max_concurrent_decodes,
-          prefill_tokens[prefill_length],
-          prefill_true_lengths[prefill_length],
-          benchmark_loop_iters,
-      )
-      benchmark_results["insert"][prefill_length] = {}
-      benchmark_results["insert"][prefill_length]["time_in_ms"] = (
-          prefill_insert_time["time_in_ms"] - benchmark_results["prefill"][prefill_length]["time_in_ms"]
-      )
+      if prefill_length not in prefill_executable:
+        continue
+      try:
+        benchmark_results["prefill"][prefill_length] = prefill_benchmark(
+            config,
+            prefill_executable[prefill_length],
+            params,
+            prefill_tokens[prefill_length],
+            prefill_true_lengths[prefill_length],
+            num_model_params,
+            benchmark_loop_iters,
+        )
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"Prefill benchmark failed for length {prefill_length} ({type(e).__name__}): {e}")
+        continue
+      if prefill_length not in prefill_insert_executable:
+        continue
+      try:
+        prefill_insert_time, decode_state = prefill_insert_benchmark(
+            config,
+            prefill_insert_executable[prefill_length],
+            decode_state,
+            params,
+            engine.max_concurrent_decodes,
+            prefill_tokens[prefill_length],
+            prefill_true_lengths[prefill_length],
+            benchmark_loop_iters,
+        )
+        benchmark_results["insert"][prefill_length] = {}
+        benchmark_results["insert"][prefill_length]["time_in_ms"] = (
+            prefill_insert_time["time_in_ms"] - benchmark_results["prefill"][prefill_length]["time_in_ms"]
+        )
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"Prefill-insert benchmark failed for length {prefill_length} ({type(e).__name__}): {e}")
 
   if "prefill-multisampling" in stages_to_benchmark:
     benchmark_results["prefill-multisampling"] = {}
@@ -404,18 +485,6 @@ def run_benchmarks(config):
           prefill_true_lengths[prefill_length],  # pyrefly: ignore[unbound-name]
           benchmark_loop_iters,
       )
-
-  if "generate" in stages_to_benchmark:
-    benchmark_results["autoregressive"], decode_state = ar_benchmark(
-        config,
-        generate_executable,
-        params,
-        decode_state,
-        engine.max_concurrent_decodes,
-        cache_size,
-        model_size,
-        benchmark_loop_iters,
-    )
 
   results = collate_results(config, benchmark_results, model_size, cache_size, num_model_params)
   print_results_for_analyze(results)

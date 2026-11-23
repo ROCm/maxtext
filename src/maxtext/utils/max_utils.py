@@ -243,6 +243,32 @@ def _uses_checkpoints(raw_keys):
   )
 
 
+def maybe_initialize_mori_shmem(raw_keys):
+  """Initialize MORI's symmetric-memory runtime for the EP dispatch/combine FFI.
+
+  Only runs when `moe_use_mori_ep` is set. MORI's FFI routes/caches handles by a static
+  per-process rank, so this uses `jax.process_index()` / `jax.process_count()` (one GPU per
+  process, pure single-node EP). Must run after `jax.distributed.initialize()` (it exchanges
+  MORI's unique id over the JAX distributed client) and before any MoE FFI call. On import
+  failure or non-distributed single-process runs it logs and no-ops so non-MORI runs are
+  unaffected.
+  """
+  if not raw_keys.get("moe_use_mori_ep", False):
+    return
+  if not jax.distributed.is_initialized():
+    max_logging.log("MORI EP: jax.distributed is not initialized; skipping MORI shmem init.")
+    return
+  try:
+    import mori  # pylint: disable=import-outside-toplevel
+
+    rank = jax.process_index()
+    world_size = jax.process_count()
+    mori.jax.shmem_init_attr(rank, world_size)
+    max_logging.log(f"MORI EP: shmem initialized (rank={rank}/{world_size}).")
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    max_logging.log(f"Warning: MORI shmem initialization skipped or failed: {e}")
+
+
 def maybe_initialize_jax_distributed_system(raw_keys):
   """The best recipe to initialize the Jax Distributed System has varied over time. We keep a layer of
   indirection in MaxText to avoid breaking the call sites unnecessarily.

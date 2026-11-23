@@ -41,6 +41,30 @@ def get_global_batch_size(per_device_batch_size: float) -> int:
   return int(num_devices * per_device_batch_size)
 
 
+def maybe_initialize_mori_shmem(raw_keys: dict[str, Any]) -> None:
+  """Initialize MORI's symmetric-memory runtime for the EP dispatch/combine FFI.
+
+  Only runs when `moe_use_mori_ep` is set. MORI's FFI routes/caches handles by a static
+  per-process rank, so this uses `jax.process_index()` / `jax.process_count()` (one GPU per
+  process, pure single-node EP). Must run after `jax.distributed.initialize()` and before any
+  MoE FFI call. On import failure or non-distributed single-process runs it logs and no-ops.
+  """
+  if not raw_keys.get("moe_use_mori_ep", False):
+    return
+  if not jax.distributed.is_initialized():
+    max_logging.log("MORI EP: jax.distributed is not initialized; skipping MORI shmem init.")
+    return
+  try:
+    import mori  # pylint: disable=import-outside-toplevel
+
+    rank = jax.process_index()
+    world_size = jax.process_count()
+    mori.jax.shmem_init_attr(rank, world_size)
+    max_logging.log(f"MORI EP: shmem initialized (rank={rank}/{world_size}).")
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    max_logging.log(f"Warning: MORI shmem initialization skipped or failed: {e}")
+
+
 def maybe_initialize_jax_distributed_system(raw_keys: dict[str, Any]) -> None:
   """Initializes the JAX distributed cluster if needed.
 
@@ -611,6 +635,7 @@ def process_config(
   #    initializes the backends; `jax.distributed.initialize()` must come first on multi-process jobs).
   if not kwargs.get("unittest", False):
     maybe_initialize_jax_distributed_system(raw_dict)
+    maybe_initialize_mori_shmem(raw_dict)
 
   # 6. Post-process batch sizes
   per_device_batch_size = raw_dict.get("per_device_batch_size", 1.0)

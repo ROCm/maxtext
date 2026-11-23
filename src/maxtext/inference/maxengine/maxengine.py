@@ -266,14 +266,30 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
     """Optimal memory layout for params and decode_state."""
 
     param_layout = Format(DLL.AUTO)
-    decode_state_layout = Format(DLL.AUTO)
+    # Pin decode_state to explicit NamedShardings. eval_shape often leaves
+    # UnspecifiedValue, and Format(DLL.AUTO) is free to shard cache_batch onto
+    # 'expert'/'tensor', which disagrees with init/insert (replicated P()).
+    replicated = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+
+    def _decode_state_sharding(x):
+      if not hasattr(x, "shape"):
+        return None
+      sh = getattr(x, "sharding", None)
+      if isinstance(sh, jax.sharding.NamedSharding):
+        return sh
+      return replicated
+
+    decode_state_layout = jax.tree.map(_decode_state_sharding, decode_state)
+    if isinstance(decode_state_layout, dict) and self.kv_cache_shardings is not None:
+      decode_state_layout = {**decode_state_layout, "cache": self.kv_cache_shardings}
     # Keyword arguments are not yet supported in JAX for specifying shardings. Therefore, all AOT
     # compiled functions use arguments instead.
     compiled_generate = (
         jax.jit(
             self.generate_aot,
             in_shardings=(param_layout, decode_state_layout, None),
-            out_shardings=(Format(DLL.AUTO), Format(DLL.AUTO)),
+            # generate returns (decode_state, ResultTokens); pin only decode_state.
+            out_shardings=(decode_state_layout, Format(DLL.AUTO)),
             donate_argnames=("decode_state",),
         ).lower(params, decode_state, rng_shape)
     ).compile(compiler_options=xla_flags)
@@ -323,15 +339,20 @@ class MaxEngine(_BaseEngine):  # pyrefly: ignore[invalid-inheritance]
       rng_shape = None
     self.decode_state_shapes = jax.eval_shape(self.init_decode_state, rng_shape)
 
-    generate_executable, self.param_layouts, _, self.decode_state_layouts = self._compile_generate_and_get_layouts(
-        self.abstract_params, self.decode_state_shapes, rng_shape, xla_flags
+    generate_executable, self.param_layouts, decode_in_layouts, self.decode_state_layouts = (
+        self._compile_generate_and_get_layouts(
+            self.abstract_params, self.decode_state_shapes, rng_shape, xla_flags
+        )
     )
+    del decode_in_layouts  # generate input_formats != executable required shardings under AUTO
+    # Do not overlay generate's input_formats onto init: those Format objects can
+    # carry P(..., 'expert') while the executable requires P() (or vice versa).
+    # init_decode_state already emits kv_cache_shardings, which generate is now
+    # compiled against.
     return (
         generate_executable,
         self._iterated_layout(params, self.param_layouts),
-        jax.jit(self.init_decode_state, in_shardings=(None), out_shardings=self.decode_state_layouts)
-        .lower(rng_shape)
-        .compile(),
+        jax.jit(self.init_decode_state, in_shardings=(None)).lower(rng_shape).compile(),
     )
 
   def load_params(self, *args, params=None, rng: PRNGKeyType | None = None, **kwargs) -> Params:

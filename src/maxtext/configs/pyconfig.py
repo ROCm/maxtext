@@ -631,6 +631,7 @@ def _initialize_pydantic(argv: list[str] | None = None, config_class: type[Any] 
   # Do not initialize jax distributed system during pytest runs.
   if "pytest" not in sys.modules:
     max_utils.maybe_initialize_jax_distributed_system(pydantic_kwargs)
+    max_utils.maybe_initialize_mori_shmem(pydantic_kwargs)
   if pydantic_kwargs.get("jax_cache_dir"):
     if pydantic_kwargs.get("dump_hlo"):
       max_logging.warning(

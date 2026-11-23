@@ -105,6 +105,29 @@ def _jetstream_stubs():
       self.log_prob = log_prob
       self.samples_per_slot = samples_per_slot
 
+  # generate() returns ResultTokens from a jitted function; it must be a pytree.
+  try:
+    import jax  # pylint: disable=import-outside-toplevel
+
+    def _result_tokens_flatten(r):
+      return (r.data, r.log_prob), (r.tokens_idx, r.valid_idx, r.length_idx, r.samples_per_slot)
+
+    def _result_tokens_unflatten(aux, children):
+      data, log_prob = children
+      tokens_idx, valid_idx, length_idx, samples_per_slot = aux
+      return ResultTokens(
+          data=data,
+          tokens_idx=tokens_idx,
+          valid_idx=valid_idx,
+          length_idx=length_idx,
+          log_prob=log_prob,
+          samples_per_slot=samples_per_slot,
+      )
+
+    jax.tree_util.register_pytree_node(ResultTokens, _result_tokens_flatten, _result_tokens_unflatten)
+  except Exception:  # pylint: disable=broad-exception-caught
+    pass
+
   # Tokenizer placeholders (unused in decoupled tests due to runtime guard).
   class TokenizerParameters:  # pragma: no cover - placeholder
 

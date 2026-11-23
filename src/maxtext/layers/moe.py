@@ -5322,6 +5322,138 @@ class RoutedMoE(nnx.Module):
         ),
     )
 
+  def _mori_ep_matmul(
+      self,
+      inputs,
+      gate_logits,
+      pre_bias_logits,
+      w0_kernel,
+      w1_kernel,
+      wo_kernel,
+  ):
+    """Inference-only routed-MoE path backed by MORI's EP dispatch/combine FFI.
+
+    Replaces the ragged_all_to_all token exchange of the sparse-matmul path with MORI's
+    `dispatch` (scatter each token to the rank owning its selected experts) and `combine`
+    (sum the per-rank partial results back to the source token order). The per-expert SwiGLU
+    runs locally on each rank's received tokens, mirroring the validated standalone prototype.
+
+    MORI bakes the rank into the FFI config as a static attribute (used to pick the device and
+    cache the handle), so rank cannot come from a runtime `jax.lax.axis_index`. We therefore
+    require one GPU per process and a pure expert-parallel axis spanning every process, and use
+    the static `jax.process_index()` as the MORI rank (matching `maybe_initialize_mori_shmem`).
+    This path is forward-only (no custom_vjp) and does not support quantized kernels.
+    """
+    try:
+      import mori  # pylint: disable=import-outside-toplevel
+    except ImportError as e:
+      raise RuntimeError("moe_use_mori_ep=True but the 'mori' package is not importable.") from e
+
+    dtype = self.dtype
+    num_experts = self.num_experts
+    top_k = self.num_experts_per_tok
+
+    ep_size = int(self.get_expert_parallelism_size())
+    world_size = int(jax.process_count())
+    ep_rank = int(jax.process_index())
+    if ep_size != world_size:
+      raise ValueError(
+          "moe_use_mori_ep requires a pure expert-parallel axis spanning all processes "
+          f"(EP size {ep_size} != process count {world_size})."
+      )
+    if len(jax.local_devices()) != 1:
+      raise ValueError(
+          f"moe_use_mori_ep requires exactly one local device per process (got {len(jax.local_devices())})."
+      )
+    if num_experts % ep_size != 0:
+      raise ValueError(f"num_experts ({num_experts}) must be divisible by EP size ({ep_size}).")
+    if any(isinstance(w, (qpl.QArray, aqt.QTensor)) for w in (w0_kernel, w1_kernel, wo_kernel)):
+      raise NotImplementedError("moe_use_mori_ep does not support quantized expert kernels yet.")
+
+    batch, seq, emb = inputs.shape
+    local_batch = batch // ep_size
+    tokens_per_rank = local_batch * seq
+    num_experts_per_rank = num_experts // ep_size
+
+    ep_config = mori.cpp.EpDispatchCombineConfig(
+        rank=ep_rank,
+        world_size=world_size,
+        hidden_dim=emb,
+        scale_dim=0,
+        scale_type_size=1,
+        max_token_type_size=jnp.dtype(jnp.float32).itemsize,
+        max_num_inp_token_per_rank=tokens_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=top_k,
+        warp_num_per_block=8,
+        block_num=80,
+        use_external_inp_buf=True,
+        kernel_type=mori.cpp.EpDispatchCombineKernelType.IntraNode,
+        gpu_per_node=world_size,
+        rdma_block_num=16,
+        num_qp_per_pe=1,
+        quant_type=mori.cpp.EpDispatchCombineQuantType.None_,
+    )
+    op = mori.jax.EpDispatchCombineOp(ep_config)
+    max_recv = ep_config.max_num_tokens_to_recv()
+
+    # Gemma 4's per-expert router scale lives on explicit mesh axes; a shard_map body cannot
+    # close over it, so thread it in as a (replicated) argument like the sparse path does.
+    per_expert_scale = None if self.per_expert_scale is None else self.per_expert_scale[...]
+
+    batch_pspec = self._logical_to_mesh_axes(("activation_batch", "activation_norm_length_routed", None))
+    expert_pspec = self._logical_to_mesh_axes(("exp", None, None))
+    scale_pspec = P() if per_expert_scale is not None else None
+
+    def _body(inputs, gate_logits, pre_bias_logits, w0, w1, wo, per_expert_scale):
+      x = inputs.reshape(tokens_per_rank, emb).astype(dtype)
+      weights, selected = self.get_topk(
+          gate_logits,
+          pre_bias_logits,
+          rngs=None,
+          input_ids=None,
+          forced_routed_experts=None,
+          per_expert_scale=per_expert_scale,
+      )
+      selected = selected.reshape(tokens_per_rank, top_k).astype(jnp.int32)
+      weights = weights.reshape(tokens_per_rank, top_k).astype(jnp.float32)
+
+      disp_out, disp_idx, num_recv, disp_w, _ = op.dispatch(x, weights, None, selected)
+      valid = (jnp.arange(max_recv) < num_recv)[:, None]
+
+      y = jnp.zeros((max_recv, emb), jnp.float32)
+      for le in range(num_experts_per_rank):
+        e = ep_rank * num_experts_per_rank + le
+        sel = disp_idx == e  # [max_recv, top_k]
+        w_e = jnp.sum(disp_w * sel, axis=-1)  # [max_recv]
+        layer_w0 = disp_out @ w0[le]
+        layer_w1 = disp_out @ w1[le]
+        intermediate = self.apply_ffn_activation(layer_w0, layer_w1)
+        out_e = (intermediate @ wo[le]).astype(jnp.float32)
+        y = y + w_e[:, None] * out_e
+      y = (y * valid).astype(dtype)
+
+      combine_out, _ = op.combine(y, None, disp_idx)
+      return combine_out.reshape(local_batch, seq, emb).astype(dtype)
+
+    in_specs = (
+        batch_pspec,
+        batch_pspec,
+        batch_pspec if pre_bias_logits is not None else None,
+        expert_pspec,
+        expert_pspec,
+        expert_pspec,
+        scale_pspec,
+    )
+    output = jax.shard_map(
+        _body,
+        mesh=self.mesh,
+        in_specs=in_specs,
+        out_specs=batch_pspec,
+        check_vma=False,
+    )(inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, per_expert_scale)
+    return output, None, None
+
   def __call__(
       self,
       inputs: jax.Array,
@@ -5505,6 +5637,15 @@ class RoutedMoE(nnx.Module):
           forced_routed_experts=forced_routed_experts,
           native_w1_scale=wi_native_scale,
           native_w2_scale=wo_native_scale,
+      )
+    elif cfg.moe_use_mori_ep:
+      output, lb_loss, bias_updates = self._mori_ep_matmul(
+          inputs,
+          gate_logits,
+          pre_bias_logits,
+          w0_kernel,
+          w1_kernel,
+          wo_kernel,
       )
     elif cfg.sparse_matmul:
       if quantizations.in_serve_mode(self.quant):

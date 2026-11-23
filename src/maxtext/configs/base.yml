@@ -303,6 +303,7 @@ fp8_moe: false
 fp8_moe_fake_quant: false
 megablox: true
 sparse_matmul: true
+moe_use_mori_ep: false # use MORI's EP dispatch/combine FFI for routed MoE (inference-only, single-node expert parallelism; requires the 'mori' package on ROCm, one GPU per process, and a pure EP axis spanning all processes).
 capacity_factor: -1.0 # a factor to decide expert capacity for token dropping, and no dropping by default
 num_moe_token_chunks: 1 # split routed-MoE tokens into N chunks (ring-of-experts path) so each chunk's EP all-gather / reduce-scatter overlaps the previous chunk's GMM compute. 1 = disabled (identical to baseline).
 moe_accumulate_chunk_wgrad: false # with num_moe_token_chunks>1, gather/quantize MoE weights once and accumulate their gradients in place across chunks via tgmm_v2 partial_sum. requires use_tokamax_gmm=true, use_gmm_v2=true, num_moe_emb_chunks=0, prefuse_moe_weights=false.
