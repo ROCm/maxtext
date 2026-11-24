@@ -44,9 +44,14 @@ _WORKER_TIMEOUT = int(os.environ.get("MORI_TEST_TIMEOUT", "600"))
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
 
-pytestmark = pytest.mark.skipif(
-    not _RUN, reason="Set MORI_MAXTEXT_TEST=1 (needs ROCm + the mori package) to run."
-)
+# gpu_only is required: tests with no hardware marker are auto-marked cpu_only
+# and skipped on accelerator testbeds (tests/conftest.py).
+pytestmark = [
+    pytest.mark.gpu_only,
+    pytest.mark.skipif(
+        not _RUN, reason="Set MORI_MAXTEXT_TEST=1 (needs ROCm + the mori package) to run."
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -63,21 +68,28 @@ def _get_free_port():
 def _worker(rank, world_size, coordinator_port, total_gpus, result_queue):
     """One GPU per process: init distributed + MORI shmem, run the parity check."""
     gpus_per_proc = total_gpus // world_size
-    os.environ["HIP_VISIBLE_DEVICES"] = ",".join(
-        str(rank * gpus_per_proc + i) for i in range(gpus_per_proc)
-    )
+    local_devices = [rank * gpus_per_proc + i for i in range(gpus_per_proc)]
 
     try:
         import jax
 
+        # Every process sees every GPU and JAX takes its own. RCCL on ROCm cannot
+        # build its intra-node graph ("TopoPreset: Local rank N not found") when
+        # HIP_VISIBLE_DEVICES leaves each process one GPU, and the first XLA
+        # collective (the parity allgather) then fails.
         jax.distributed.initialize(
             coordinator_address=f"localhost:{coordinator_port}",
             num_processes=world_size,
             process_id=rank,
+            local_device_ids=local_devices,
         )
 
         import mori
+        from mori.jit.hip_driver import _check, _get_hip_lib
 
+        # mori runs on the calling thread's HIP device; with every GPU visible,
+        # that has to be this process's own.
+        _check(_get_hip_lib().hipSetDevice(local_devices[0]), "hipSetDevice")
         mori.jax.shmem_init_attr(rank, world_size)
 
         _run_parity(rank, world_size)
@@ -103,11 +115,25 @@ def _run_parity(rank, world_size):
     from flax import nnx
     from flax.linen import partitioning as nn_partitioning
 
+    from jax.experimental.multihost_utils import process_allgather
+
     from maxtext.configs import pyconfig
     from maxtext.layers import moe
     from maxtext.layers.initializers import nd_dense_init
     from maxtext.utils import maxtext_utils
     from tests.utils.test_helpers import get_test_config_path
+
+    def _to_host(x):
+        """Full numpy value of x.
+
+        With one GPU per process the MoE output and expert weights are global
+        arrays: this process only owns its shard, so np.asarray raises.
+        process_allgather(tiled=True) reshardes to replicated and returns the
+        whole array. Fully local arrays are copied as-is.
+        """
+        if isinstance(x, jax.Array) and not x.is_fully_addressable:
+            return np.asarray(process_allgather(x, tiled=True))
+        return np.asarray(x)
 
     seq = 8
     emb = 256
@@ -158,18 +184,23 @@ def _run_parity(rank, world_size):
 
     with mesh, nn_partitioning.axis_rules(cfg.logical_axis_rules):
         output, _, _ = model(inputs)
-    mori_out = np.asarray(output).astype(np.float32)
+        # Same global inputs the forward used. A single-device copy of full_x
+        # cannot be dotted with the expert-sharded gate kernel.
+        gate_logits, pre_bias_logits = model.gate(inputs)
+    mori_out = _to_host(output).astype(np.float32)
 
     # -- Reference: full MoE computed locally from the same routing + weights --
     x2 = jnp.asarray(full_x).reshape(batch * seq, emb)
-    gate_logits, pre_bias_logits = model.gate(jnp.asarray(full_x).astype(cfg.dtype))
+    gate_logits = jnp.asarray(_to_host(gate_logits))
+    if pre_bias_logits is not None:
+        pre_bias_logits = jnp.asarray(_to_host(pre_bias_logits))
     weights, indices = model.get_topk(gate_logits, pre_bias_logits, rngs=None)
-    weights = weights.reshape(batch * seq, top_k).astype(jnp.float32)
-    indices = indices.reshape(batch * seq, top_k)
+    weights = _to_host(weights).reshape(batch * seq, top_k).astype(np.float32)
+    indices = _to_host(indices).reshape(batch * seq, top_k)
 
-    wi0 = jnp.asarray(model.wi_0[...])  # [E, emb, mlp]
-    wi1 = jnp.asarray(model.wi_1[...])
-    wo = jnp.asarray(model.wo[...])  # [E, mlp, emb]
+    wi0 = jnp.asarray(_to_host(model.wi_0[...]))  # [E, emb, mlp]
+    wi1 = jnp.asarray(_to_host(model.wi_1[...]))
+    wo = jnp.asarray(_to_host(model.wo[...]))  # [E, mlp, emb]
 
     ref = jnp.zeros((batch * seq, emb), jnp.float32)
     for e in range(num_experts):

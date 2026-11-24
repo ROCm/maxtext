@@ -5638,7 +5638,12 @@ class RoutedMoE(nnx.Module):
           native_w1_scale=wi_native_scale,
           native_w2_scale=wo_native_scale,
       )
-    elif cfg.moe_use_mori_ep:
+    elif cfg.moe_use_mori_ep and inputs.shape[0] % max(1, int(self.get_expert_parallelism_size())) == 0:
+      # MORI EP dispatch shards the batch across the expert axis, so it needs
+      # batch % ep_size == 0 (batch_pspec = P('expert', ...)). Decode satisfies
+      # this (global batch is a multiple of EP), but prefill feeds batch=1 (a
+      # single sequence), which an 8-way EP cannot split. Fall through to the
+      # ragged-all-to-all sparse path for any batch the EP axis can't divide.
       output, lb_loss, bias_updates = self._mori_ep_matmul(
           inputs,
           gate_logits,
