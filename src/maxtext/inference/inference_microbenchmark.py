@@ -19,6 +19,7 @@ import os
 import sys
 
 import jax
+import numpy as np
 
 # TensorFlow-CPU's cudart stub makes RCCL ncclCommInitRankConfig fail on this
 # rocmless image. Block the import; MaxText already treats missing TF as optional.
@@ -199,9 +200,18 @@ def ar_benchmark_loop(config, engine_generate, params, decode_state, iters, prof
 def ar_benchmark(config, engine_generate, params, decode_state, global_batch_size, cache_size, model_size, iters):
   """Handles warmup, running ar benchmark, and printing results."""
   rng = jax.random.PRNGKey(1234)
-  for _ in range(_WARMUP_ITERS):
+  # Opt-in logits parity dump (MORI_LOGITS_DUMP=<path>). The decode state entering
+  # here is identical across a moe_use_mori_ep true/false pair (prefill is batch=1,
+  # so both take the sparse path), and rng is fixed, so the first decode-step logits
+  # differ only by the MoE collective path. Capture them before sampling diverges.
+  dump_path = os.environ.get("MORI_LOGITS_DUMP")
+  for i in range(_WARMUP_ITERS):
     rng, rng_generate = jax.random.split(rng)
     decode_state, _ = engine_generate(params, decode_state, rng_generate)
+    if i == 0 and dump_path and jax.process_index() == 0:
+      logits = np.asarray(decode_state["logits"], dtype=np.float32)
+      np.save(dump_path, logits)
+      print(f"MORI_LOGITS_DUMP: saved first decode-step logits {logits.shape} to {dump_path}")
   jax.block_until_ready(decode_state)
 
   time_in_s, decode_state = ar_benchmark_loop(
